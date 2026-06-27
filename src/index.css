@@ -28,6 +28,118 @@ body {
 .app-container {
   display: flex;
   height: 100%;
+  position: relative;
+}
+
+.workspace-home-btn {
+  position: absolute;
+  top: 12px;
+  left: 12px;
+  z-index: 20;
+  width: 34px;
+  height: 34px;
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+  background: #2b2c2f;
+  color: #c5c5d2;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+}
+
+.workspace-home-btn:hover {
+  color: #ffffff;
+  background: #343541;
+}
+
+.workspace-home-btn-floating {
+  position: absolute;
+  top: 12px;
+  left: 12px;
+}
+
+.workspace-shell {
+  min-height: 100%;
+  width: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--bg-main);
+  color: var(--text-main);
+}
+
+.workspace-home-shell,
+.workspace-ai-shell {
+  padding: 32px 24px;
+  box-sizing: border-box;
+}
+
+.workspace-home-panel {
+  width: min(720px, calc(100vw - 48px));
+  border: 1px solid var(--border-color);
+  border-radius: 16px;
+  background: rgba(0, 0, 0, 0.16);
+  padding: 28px;
+  box-sizing: border-box;
+}
+
+.workspace-home-eyebrow {
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  font-size: 0.75em;
+  color: #8f90a0;
+  margin-bottom: 10px;
+}
+
+.workspace-home-panel h1 {
+  margin: 0;
+  font-size: 2rem;
+  font-weight: 700;
+}
+
+.workspace-home-panel p {
+  margin: 12px 0 0;
+  max-width: 52ch;
+  color: #c5c5d2;
+  line-height: 1.5;
+}
+
+.workspace-choice-list {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 14px;
+  margin-top: 24px;
+}
+
+.workspace-choice-card {
+  border: 1px solid var(--border-color);
+  border-radius: 14px;
+  background: #2b2c2f;
+  color: #ececf1;
+  padding: 18px;
+  text-align: left;
+  cursor: pointer;
+  min-height: 112px;
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+}
+
+.workspace-choice-card:hover {
+  background: #343541;
+  border-color: rgba(255, 255, 255, 0.12);
+}
+
+.workspace-choice-card-title {
+  font-size: 1.3rem;
+  font-weight: 700;
+}
+
+.workspace-choice-card-subtitle {
+  font-size: 0.95rem;
+  color: #c5c5d2;
+  margin-top: 10px;
 }
 
 .sidebar {
@@ -109,6 +221,35 @@ body {
   overflow: hidden;
 }
 
+.conv-item-leading {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  flex: 1;
+}
+
+.conversation-marker {
+  width: 14px;
+  min-width: 14px;
+  text-align: center;
+  font-weight: 700;
+  font-size: 0.95em;
+  opacity: 0;
+}
+
+.conversation-marker.visible {
+  opacity: 1;
+}
+
+.conversation-marker-uncached {
+  color: #ef4444;
+}
+
+.conversation-marker-dirty {
+  color: #fbbf24;
+}
+
 .conv-title {
   white-space: nowrap;
   overflow: hidden;
@@ -125,31 +266,6 @@ body {
   text-transform: uppercase;
   font-weight: 700;
   flex-shrink: 0;
-}
-
-.delete-conv-btn {
-  opacity: 0;
-  background: transparent;
-  border: none;
-  color: #c5c5d2;
-  cursor: pointer;
-  padding: 4px;
-  border-radius: 4px;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  transition: all 0.2s;
-  flex-shrink: 0;
-}
-
-.conversation-item:hover .delete-conv-btn,
-.conversation-item.active .delete-conv-btn {
-  opacity: 1;
-}
-
-.delete-conv-btn:hover {
-  background: rgba(239, 68, 68, 0.2);
-  color: #ef4444;
 }
 
 .conversation-item.local-only .conv-title {
@@ -519,6 +635,7 @@ body {
 .markdown-body {
   font-size: 1em;
   word-wrap: break-word;
+  overflow-wrap: anywhere;
   display: flex;
   flex-direction: column;
   gap: 0.75em;
@@ -555,6 +672,16 @@ body {
 
 .markdown-body > * {
   margin: 0;
+  min-width: 0;
+}
+
+.markdown-body a,
+.markdown-body p,
+.markdown-body li,
+.markdown-body td,
+.markdown-body th {
+  overflow-wrap: anywhere;
+  word-break: break-word;
 }
 
 .plain-latex-text {
@@ -1176,6 +1303,35 @@ body {
   background: rgba(255, 255, 255, 0.12);
 }
 
+.conversation-context-menu {
+  position: fixed;
+  transform: translateY(2px);
+  background: rgba(22, 22, 28, 0.98);
+  border: 1px solid rgba(255, 255, 255, 0.2);
+  border-radius: 8px;
+  min-width: 150px;
+  padding: 4px;
+  box-shadow: 0 10px 28px rgba(0, 0, 0, 0.45);
+  z-index: 3200;
+}
+
+.conversation-context-menu-item {
+  width: 100%;
+  background: transparent;
+  border: none;
+  color: #fff;
+  text-align: left;
+  padding: 8px 10px;
+  border-radius: 6px;
+  cursor: pointer;
+  font-size: 13px;
+}
+
+.conversation-context-menu-item:hover {
+  background: rgba(239, 68, 68, 0.2);
+  color: #ffb4b4;
+}
+
 .settings-modal {
   background: var(--bg-main);
   border: 1px solid var(--border-color);
@@ -1249,6 +1405,12 @@ body {
 .settings-action-btn:disabled {
   opacity: 0.6;
   cursor: default;
+}
+
+.settings-note {
+  font-size: 0.9em;
+  line-height: 1.4;
+  color: #c5c5d2;
 }
 
 .setting-value {

@@ -30,6 +30,7 @@ const MIN_PLAIN_LATEX_LINES = 8;
 const MAX_CODE_HIGHLIGHT_CHARS = 8000;
 const MAX_CODE_HIGHLIGHT_LINES = 400;
 const MAX_SAFE_FALLBACK_CHARS = 120000;
+const AI_MODE_TAKEOUT_DEFAULT_PATH = '/home/lewis/Desktop/backups/Google/Google 9lewis9 3/Takeout/My Activity/AI Mode/MyActivity.json';
 const FONT_SIZE_MIN = 8;
 const FONT_SIZE_MAX = 20;
 const FONT_SIZE_DEFAULT = 12;
@@ -39,6 +40,7 @@ const SIDEBAR_WIDTH_DEFAULT = 216;
 const MAP_WIDTH_MIN = 180;
 const MAP_WIDTH_MAX = 520;
 const MAP_WIDTH_DEFAULT = 250;
+type WorkspaceMode = 'home' | 'chatgpt' | 'aimode';
 const clampFontSize = (value: number) =>
   Math.max(FONT_SIZE_MIN, Math.min(FONT_SIZE_MAX, Math.round(value)));
 const clampPanelWidth = (value: number, min: number, max: number) =>
@@ -173,6 +175,18 @@ class MarkdownErrorBoundary extends React.Component<
       stack: error instanceof Error ? error.stack : undefined,
       componentStack: info?.componentStack,
     });
+  }
+
+  componentDidUpdate(prevProps: { children: React.ReactNode; rawContent: string; conversationId?: string }) {
+    if (
+      this.state.hasError
+      && (
+        prevProps.rawContent !== this.props.rawContent
+        || prevProps.conversationId !== this.props.conversationId
+      )
+    ) {
+      this.setState({ hasError: false, message: '' });
+    }
   }
 
   render() {
@@ -559,8 +573,8 @@ const countNeedleHits = (text: string, needleLower: string) => {
 };
 
 const sanitizeMapSearchQuery = (raw: string) => {
-  const value = String(raw || '').replace(/\s+/g, ' ').trim();
-  if (!value) return '';
+  const value = String(raw || '').replace(/\s+/g, ' ');
+  if (!value.trim()) return '';
   return value.slice(0, MAX_MAP_SEARCH_QUERY_LEN);
 };
 
@@ -572,6 +586,22 @@ const countLines = (text: string) => {
 const countRegexMatches = (text: string, pattern: RegExp) => {
   const matches = text.match(pattern);
   return matches ? matches.length : 0;
+};
+
+const CHAT_IMAGE_MARKDOWN_PATTERN = /!\[([^\]]*?)\]\((chatgpt-image:\/\/[^)\s]+)\)/g;
+const HAS_CHAT_IMAGE_MARKDOWN_PATTERN = /!\[[^\]]*?\]\(chatgpt-image:\/\/[^)\s]+\)/;
+
+const stripRedundantChatImageText = (value: string) => {
+  const lines = String(value || '').split('\n');
+  const kept = [];
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (trimmed === 'Chat Image') continue;
+    kept.push(line);
+  }
+  return kept.join('\n')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
 };
 
 const ChatImage = ({ src, alt, conversationId, onOpenImage, ...props }: any) => {
@@ -628,12 +658,138 @@ const MarkdownMessage = memo(({ content, highlightQuery, conversationId, onOpenI
   }, [rawContent]);
   const renderedContent = useMemo(() => {
     try {
-      return normalizeMathDelimiters(normalizeCitationMarkers(normalizeProductsMarkers(rawContent)));
+      const normalized = normalizeMathDelimiters(normalizeCitationMarkers(normalizeProductsMarkers(rawContent)));
+      if (!HAS_CHAT_IMAGE_MARKDOWN_PATTERN.test(normalized)) return normalized;
+      return stripRedundantChatImageText(normalized);
     } catch (error) {
       console.error('Markdown preprocessing failed:', error);
       return rawContent;
     }
   }, [rawContent]);
+  const hasChatImages = useMemo(() => HAS_CHAT_IMAGE_MARKDOWN_PATTERN.test(renderedContent), [renderedContent]);
+
+  const markdownComponents = {
+    a: ({ href, children, ...props }: any) => {
+      if (typeof href === 'string' && href.startsWith('productref://')) {
+        const id = decodeURIComponent(href.replace('productref://', ''));
+        const entry = citationRegistry[id];
+        if (entry?.url) {
+          return <a href={entry.url} target="_blank" rel="noreferrer" title={entry.title || id} {...props}>{children}</a>;
+        }
+        return <span title={id}>{children}</span>;
+      }
+      if (typeof href === 'string' && href.startsWith('citation://')) {
+        const id = decodeURIComponent(href.replace('citation://', ''));
+        const entry = citationRegistry[id];
+        if (entry?.url) {
+          return (
+            <sup className="citation-ref">
+              <a href={entry.url} target="_blank" rel="noreferrer" title={entry.title || id}>
+                {children}
+              </a>
+            </sup>
+          );
+        }
+        return <sup className="citation-ref" title={id}>{children}</sup>;
+      }
+      return <a href={href} target="_blank" rel="noreferrer" {...props}>{children}</a>;
+    },
+    p: ({ children, ...props }: any) => <p {...props}><HighlightText query={effectiveQuery}>{children}</HighlightText></p>,
+    li: ({ children, ...props }: any) => <li {...props}><HighlightText query={effectiveQuery}>{children}</HighlightText></li>,
+    h1: ({ children, ...props }: any) => <h1 {...props}><HighlightText query={effectiveQuery}>{children}</HighlightText></h1>,
+    h2: ({ children, ...props }: any) => <h2 {...props}><HighlightText query={effectiveQuery}>{children}</HighlightText></h2>,
+    h3: ({ children, ...props }: any) => <h3 {...props}><HighlightText query={effectiveQuery}>{children}</HighlightText></h3>,
+    img: ({ src, alt, ...props }: any) => (
+      <ChatImage src={src} alt={alt} conversationId={conversationId} onOpenImage={onOpenImage} {...props} />
+    ),
+    code({ inline, className, children, ...props }: any) {
+      const match = /language-(\w+)/.exec(className || '');
+      const codeText = String(children).replace(/\n$/, '');
+      const codeLineCount = countLines(codeText);
+      const codeTooLarge = codeText.length > MAX_CODE_HIGHLIGHT_CHARS || codeLineCount > MAX_CODE_HIGHLIGHT_LINES;
+      return !inline && match ? (
+        codeTooLarge ? (
+          <pre className="large-code-fallback">
+            <code>{codeText.length <= MAX_SAFE_FALLBACK_CHARS ? codeText : `${codeText.slice(0, MAX_SAFE_FALLBACK_CHARS)}\n\n[truncated for performance]`}</code>
+          </pre>
+        ) : (
+          <SyntaxHighlighter
+            style={vscDarkPlus as any}
+            language={match[1]}
+            PreTag="div"
+            codeTagProps={{ style: { fontSize: 'inherit' } }}
+            customStyle={{ margin: 0, padding: 0, background: 'transparent', fontSize: 'inherit' }}
+            {...props}
+          >
+            {codeText}
+          </SyntaxHighlighter>
+        )
+      ) : (
+        <code className={className} {...props}>
+          {children}
+        </code>
+      );
+    },
+  };
+
+  const renderMarkdownChunk = (chunk: string, key: string) => (
+    <ReactMarkdown
+      key={key}
+      urlTransform={(value: string) => value}
+      remarkPlugins={[remarkGfm, remarkMath]}
+      rehypePlugins={[rehypeKatex]}
+      components={markdownComponents}
+    >
+      {chunk}
+    </ReactMarkdown>
+  );
+
+  const renderContentWithImages = () => {
+    if (!hasChatImages) {
+      return renderMarkdownChunk(renderedContent, 'markdown-full');
+    }
+
+    const nodes: React.ReactNode[] = [];
+    let lastIndex = 0;
+    let match: RegExpExecArray | null;
+    let imageIndex = 0;
+    const chatImagePattern = new RegExp(CHAT_IMAGE_MARKDOWN_PATTERN);
+
+    while ((match = chatImagePattern.exec(renderedContent)) !== null) {
+      const before = renderedContent.slice(lastIndex, match.index);
+      if (before.trim()) {
+        nodes.push(renderMarkdownChunk(before, `markdown-${imageIndex}-before`));
+      }
+
+      nodes.push(
+        <ChatImage
+          key={`chat-image-${imageIndex}`}
+          src={match[2]}
+          alt={match[1] || 'Chat Image'}
+          conversationId={conversationId}
+          onOpenImage={onOpenImage}
+        />
+      );
+
+      lastIndex = match.index + match[0].length;
+      imageIndex += 1;
+    }
+
+    const after = renderedContent.slice(lastIndex);
+    if (after.trim()) {
+      nodes.push(renderMarkdownChunk(after, `markdown-${imageIndex}-after`));
+    }
+
+    return nodes.length > 0 ? nodes : renderMarkdownChunk(renderedContent, 'markdown-fallback');
+  };
+
+  if (hasChatImages) {
+    return (
+      <MarkdownErrorBoundary rawContent={content} conversationId={conversationId}>
+        {renderContentWithImages()}
+      </MarkdownErrorBoundary>
+    );
+  }
 
   if (safeRenderMode) {
     return (
@@ -654,76 +810,7 @@ const MarkdownMessage = memo(({ content, highlightQuery, conversationId, onOpenI
 
   return (
     <MarkdownErrorBoundary rawContent={content} conversationId={conversationId}>
-      <ReactMarkdown
-        urlTransform={(value: string) => value}
-        remarkPlugins={[remarkGfm, remarkMath]}
-        rehypePlugins={[rehypeKatex]}
-        components={{
-          a: ({ href, children, ...props }) => {
-            if (typeof href === 'string' && href.startsWith('productref://')) {
-              const id = decodeURIComponent(href.replace('productref://', ''));
-              const entry = citationRegistry[id];
-              if (entry?.url) {
-                return <a href={entry.url} target="_blank" rel="noreferrer" title={entry.title || id} {...props}>{children}</a>;
-              }
-              return <span title={id}>{children}</span>;
-            }
-            if (typeof href === 'string' && href.startsWith('citation://')) {
-              const id = decodeURIComponent(href.replace('citation://', ''));
-              const entry = citationRegistry[id];
-              if (entry?.url) {
-                return (
-                  <sup className="citation-ref">
-                    <a href={entry.url} target="_blank" rel="noreferrer" title={entry.title || id}>
-                      {children}
-                    </a>
-                  </sup>
-                );
-              }
-              return <sup className="citation-ref" title={id}>{children}</sup>;
-            }
-            return <a href={href} target="_blank" rel="noreferrer" {...props}>{children}</a>;
-          },
-          p: ({ children, ...props }) => <p {...props}><HighlightText query={effectiveQuery}>{children}</HighlightText></p>,
-          li: ({ children, ...props }) => <li {...props}><HighlightText query={effectiveQuery}>{children}</HighlightText></li>,
-          h1: ({ children, ...props }) => <h1 {...props}><HighlightText query={effectiveQuery}>{children}</HighlightText></h1>,
-          h2: ({ children, ...props }) => <h2 {...props}><HighlightText query={effectiveQuery}>{children}</HighlightText></h2>,
-          h3: ({ children, ...props }) => <h3 {...props}><HighlightText query={effectiveQuery}>{children}</HighlightText></h3>,
-          img: ({ src, alt, ...props }: any) => {
-            return <ChatImage src={src} alt={alt} conversationId={conversationId} onOpenImage={onOpenImage} {...props} />;
-          },
-          code({ inline, className, children, ...props }: any) {
-            const match = /language-(\w+)/.exec(className || '');
-            const codeText = String(children).replace(/\n$/, '');
-            const codeLineCount = countLines(codeText);
-            const codeTooLarge = codeText.length > MAX_CODE_HIGHLIGHT_CHARS || codeLineCount > MAX_CODE_HIGHLIGHT_LINES;
-            return !inline && match ? (
-              codeTooLarge ? (
-                <pre className="large-code-fallback">
-                  <code>{codeText.length <= MAX_SAFE_FALLBACK_CHARS ? codeText : `${codeText.slice(0, MAX_SAFE_FALLBACK_CHARS)}\n\n[truncated for performance]`}</code>
-                </pre>
-              ) : (
-                <SyntaxHighlighter
-                  style={vscDarkPlus as any}
-                  language={match[1]}
-                  PreTag="div"
-                  codeTagProps={{ style: { fontSize: 'inherit' } }}
-                  customStyle={{ margin: 0, padding: 0, background: 'transparent', fontSize: 'inherit' }}
-                  {...props}
-                >
-                  {codeText}
-                </SyntaxHighlighter>
-              )
-            ) : (
-              <code className={className} {...props}>
-                {children}
-              </code>
-            );
-          },
-        }}
-      >
-        {renderedContent}
-      </ReactMarkdown>
+      {renderContentWithImages()}
     </MarkdownErrorBoundary>
   );
 });
@@ -792,32 +879,47 @@ const MessageRow = memo(({ msg, highlightQuery, isTarget, onOpenImage, citationR
   );
 });
 
-const ConversationItem = memo(({ conv, active, onClick, onDelete }: { conv: Conversation, active: boolean, onClick: () => void, onDelete: (e: React.MouseEvent) => void }) => {
+type ConversationMarkerState = 'none' | 'uncached' | 'dirty';
+
+const ConversationItem = memo(({ conv, active, markerState, onClick, onContextMenu }: { conv: Conversation, active: boolean, markerState: ConversationMarkerState, onClick: () => void, onContextMenu: (e: React.MouseEvent) => void }) => {
+  const markerTitle = markerState === 'uncached'
+    ? 'Not cached yet'
+    : markerState === 'dirty'
+      ? 'Cached copy needs a full sync'
+      : '';
   return (
     <div 
       className={`conversation-item ${active ? 'active' : ''} ${conv.is_deleted_on_web ? 'local-only' : ''}`}
       onClick={onClick}
+      onContextMenu={onContextMenu}
     >
       <div className="conv-item-content">
-        <span className="conv-title">{conv.title || 'New Chat'}</span>
+        <div className="conv-item-leading">
+          <span className="conv-title">{conv.title || 'New Chat'}</span>
+          <span
+            className={`conversation-marker conversation-marker-${markerState} ${markerState !== 'none' ? 'visible' : ''}`}
+            title={markerTitle}
+            aria-hidden={markerState === 'none'}
+          >
+            !
+          </span>
+        </div>
         {conv.is_deleted_on_web ? <span className="local-badge" title="This chat was deleted on the web but is preserved locally">Local</span> : null}
-        <button className="delete-conv-btn" onClick={onDelete} title="Delete locally">
-          <svg viewBox="0 0 24 24" fill="currentColor" width="14" height="14">
-            <path d="M6 19c0 1.1.9 2 2 2h8c1.1 0 2-.9 2-2V7H6v12zM19 4h-3.5l-1-1h-5l-1 1H5v2h14V4z"/>
-          </svg>
-        </button>
       </div>
     </div>
   );
 });
 
-function App() {
+function ChatGPTApp({ onGoHome, workspaceMode }: { onGoHome: () => void; workspaceMode: Exclude<WorkspaceMode, 'home'> }) {
+  const isAiMode = workspaceMode === 'aimode';
+  const lastConvStorageKey = isAiMode ? 'lastConvId:aimode' : 'lastConvId';
+  const selectedModelStorageKey = isAiMode ? 'selectedModel:aimode' : 'selectedModel';
   const [conversations, setConversations] = useState<Conversation[]>([]);
-  const [activeConvId, setActiveConvId] = useState<string | null>(localStorage.getItem('lastConvId'));
+  const [activeConvId, setActiveConvId] = useState<string | null>(localStorage.getItem(lastConvStorageKey));
   const [messages, setMessages] = useState<Message[]>([]);
-  const [isAuth, setIsAuth] = useState<boolean | null>(null);
+  const [isAuth, setIsAuth] = useState<boolean | null>(isAiMode ? true : null);
   const [isSyncing, setIsSyncing] = useState(false);
-  const [selectedModel, setSelectedModel] = useState<string>(localStorage.getItem('selectedModel') || 'Auto');
+  const [selectedModel, setSelectedModel] = useState<string>(localStorage.getItem(selectedModelStorageKey) || 'Auto');
   const [pastedImage, setPastedImage] = useState<string | null>(null);
   const [attachedFiles, setAttachedFiles] = useState<Array<{ id: string; name: string; mimeType: string; dataUrl: string; sizeBytes: number }>>([]);
   const [inputValue, setInputValue] = useState('');
@@ -840,10 +942,12 @@ function App() {
   const [chatWidth, setChatWidth] = useState<number>(Number(localStorage.getItem('chatWidth')) || 800);
   const [showSettings, setShowSettings] = useState(false);
   const [showModelMenu, setShowModelMenu] = useState(false);
-  const [showSearch, setShowSearch] = useState(false);
-  const [searchQuery, setSearchQuery] = useState('');
-  const [mapSearchQuery, setMapSearchQuery] = useState('');
-  const [searchResults, setSearchResults] = useState<any[]>([]);
+	  const [showSearch, setShowSearch] = useState(false);
+		  const [searchQuery, setSearchQuery] = useState('');
+		  const [mapSearchQuery, setMapSearchQuery] = useState('');
+		  const [searchResults, setSearchResults] = useState<any[]>([]);
+		  const [searchTotalCount, setSearchTotalCount] = useState(0);
+		  const [searchTotalIsLowerBound, setSearchTotalIsLowerBound] = useState(false);
   const [targetMessageId, setTargetMessageId] = useState<string | null>(null);
   const [activeHighlightQuery, setActiveHighlightQuery] = useState('');
   const [isSidebarOpen, setIsSidebarOpen] = useState<boolean>(() => localStorage.getItem('sidebarOpen') !== '0');
@@ -853,8 +957,12 @@ function App() {
   const [hasMoreConvs, setHasMoreConvs] = useState(true);
   const [isLoadingMoreConvs, setIsLoadingMoreConvs] = useState(false);
   const [cacheStats, setCacheStats] = useState({ localCount: 0, cachedCount: 0 });
-  const [cacheDiagnostics, setCacheDiagnostics] = useState({ uncachedCount: 0, failedCount: 0, unknownCount: 0 });
+  const [cacheDiagnostics, setCacheDiagnostics] = useState({ uncachedCount: 0, failedCount: 0, unknownCount: 0, dirtyCount: 0 });
+  const [uncachedConversationIds, setUncachedConversationIds] = useState<Set<string>>(new Set());
+  const [dirtyConversationIds, setDirtyConversationIds] = useState<Set<string>>(new Set());
   const [isCachingAll, setIsCachingAll] = useState(false);
+  const [cacheRunStatus, setCacheRunStatus] = useState('');
+  const [conversationContextMenu, setConversationContextMenu] = useState<{ x: number; y: number; conversationId: string } | null>(null);
 
   const [isPanning, setIsPanning] = useState(false);
   const [panPosition, setPanPosition] = useState({ x: 0, y: 0 });
@@ -886,20 +994,35 @@ function App() {
     displayCount: 0,
     displayViewCount: 0,
   });
+  const lastConversationListSyncAtRef = useRef(0);
+  const conversationListSyncInFlightRef = useRef(false);
+  const updateCacheDiagnosticsRef = useRef<() => Promise<void>>(async () => {});
+	  const conversationSelectionTokenRef = useRef(0);
+	  const searchDebounceRef = useRef<number | null>(null);
+	  const searchRequestTokenRef = useRef(0);
+	  const selectConversationRef = useRef<(id: string, forceSync?: boolean, shouldSync?: boolean) => Promise<void>>(async () => {});
+  const initializationStartedRef = useRef(false);
 
   const virtuosoRef = useRef<VirtuosoHandle>(null);
-  const activeConvIdRef = useRef<string | null>(localStorage.getItem('lastConvId'));
+  const activeConvIdRef = useRef<string | null>(localStorage.getItem(lastConvStorageKey));
   const bridgeComposerStatusRef = useRef<BridgeComposerStatus | null>(null);
   const hasScrolledToBottomRef = useRef<Record<string, boolean>>({});
   const virtuosoStateByConversationRef = useRef<Record<string, any>>({});
   const [restoreVirtuosoState, setRestoreVirtuosoState] = useState<any | null>(null);
+  const [isNearBottom, setIsNearBottom] = useState(true);
+  const isNearBottomRef = useRef(true);
+  const invokeMode = useCallback((channel: string, payload: Record<string, unknown> = {}) => (
+    window.electronAPI.invoke(channel, { ...payload, mode: workspaceMode })
+  ), [workspaceMode]);
   const displayMessages = useMemo(() => buildDisplayMessages(messages), [messages]);
   const citationRegistry = useMemo(() => buildCitationRegistry(messages), [messages]);
   const isBridgeReadyForActiveConversation = useMemo(() => {
+    if (isAiMode) return false;
     if (!bridgeComposerStatus?.ready) return false;
     return (bridgeComposerStatus.conversationId || null) === (activeConvId || null);
-  }, [activeConvId, bridgeComposerStatus]);
+  }, [activeConvId, bridgeComposerStatus, isAiMode]);
   const bridgeActivityLabel = useMemo(() => {
+    if (isAiMode) return '';
     const status = bridgeComposerStatus;
     if (!status) return '';
     const sameConversation = (status.conversationId || null) === (activeConvId || null);
@@ -910,17 +1033,19 @@ function App() {
     if (status.state === 'ready') return 'Ready';
     if (status.state === 'error' && status.reason) return status.reason;
     return '';
-  }, [activeConvId, bridgeComposerStatus]);
+  }, [activeConvId, bridgeComposerStatus, isAiMode]);
   const bridgeMessageStatus = useMemo(() => {
+    if (isAiMode) return null;
     const status = bridgeComposerStatus;
     if (!status) return null;
+    if (!isNearBottom) return null;
     const sameConversation = (status.conversationId || null) === (activeConvId || null);
     if (!sameConversation) return null;
     if (status.state === 'sending') return { state: status.state, text: 'Thinking...' };
     if (status.state === 'thinking') return { state: status.state, text: status.reason?.trim() || 'Thinking...' };
     // Intentionally exclude "warming" so "Preparing chat..." is not injected into the message list.
     return null;
-  }, [activeConvId, bridgeComposerStatus]);
+  }, [activeConvId, bridgeComposerStatus, isNearBottom]);
   const displayMessagesForView = useMemo(() => {
     if (!bridgeMessageStatus) return displayMessages;
     const bridgeStatusMessage: DisplayMessage = {
@@ -1015,6 +1140,15 @@ function App() {
   const resetFontSize = useCallback(() => {
     setFontSize(FONT_SIZE_DEFAULT);
   }, []);
+  const updateNearBottom = useCallback(() => {
+    const scroller = scrollerRef.current;
+    if (!scroller) return;
+    const distanceToBottom = scroller.scrollHeight - (scroller.scrollTop + scroller.clientHeight);
+    const nextIsNearBottom = distanceToBottom <= 120;
+    if (isNearBottomRef.current === nextIsNearBottom) return;
+    isNearBottomRef.current = nextIsNearBottom;
+    setIsNearBottom(nextIsNearBottom);
+  }, []);
   const scheduleViewportHighlightUpdate = useCallback(() => {
     if (!mapOpenRef.current) return;
     if (viewportHighlightRafRef.current !== null) return;
@@ -1023,17 +1157,21 @@ function App() {
       updateViewportNavHighlightRef.current();
     });
   }, []);
+  const handleMessageScroll = useCallback(() => {
+    scheduleViewportHighlightUpdate();
+    updateNearBottom();
+  }, [scheduleViewportHighlightUpdate, updateNearBottom]);
   const handleMessageScrollerRef = useCallback((el: HTMLElement | null) => {
     if (scrollerRef.current === el) return;
     if (scrollerRef.current) {
-      scrollerRef.current.removeEventListener('scroll', scheduleViewportHighlightUpdate);
+      scrollerRef.current.removeEventListener('scroll', handleMessageScroll);
     }
     scrollerRef.current = el;
     if (el) {
-      el.addEventListener('scroll', scheduleViewportHighlightUpdate, { passive: true });
+      el.addEventListener('scroll', handleMessageScroll, { passive: true });
     }
-    scheduleViewportHighlightUpdate();
-  }, [scheduleViewportHighlightUpdate]);
+    handleMessageScroll();
+  }, [handleMessageScroll]);
   const handleConversationsScrollerRef = useCallback((el: HTMLElement | null) => {
     conversationsScrollerRef.current = el;
   }, []);
@@ -1062,24 +1200,30 @@ function App() {
   }, []);
 
   const loadConversations = useCallback(async () => {
-    const localConvs = await window.electronAPI.invoke('db:getConversations');
+    const localConvs = await invokeMode('db:getConversations');
     setConversations(localConvs);
     try {
-      const result = await window.electronAPI.invoke('api:syncConversations', { offset: 0, limit: 20 });
+      const result = await invokeMode('api:syncConversations', { offset: 0, limit: 20 });
       setConversations(result.conversations);
       setHasMoreConvs(result.hasMore);
+      lastConversationListSyncAtRef.current = Date.now();
     } catch (e) {
       console.error('Failed to sync conversations', e);
     }
-  }, []);
+  }, [invokeMode]);
 
   const checkAuth = useCallback(async () => {
+    if (isAiMode) {
+      setIsAuth(true);
+      await loadConversations();
+      return;
+    }
     const authed = await window.electronAPI.invoke('auth:check');
     setIsAuth(authed);
     if (authed) {
       loadConversations();
     }
-  }, [loadConversations]);
+  }, [isAiMode, loadConversations]);
 
   const handleLogin = async () => {
     const success = await window.electronAPI.invoke('auth:login');
@@ -1093,9 +1237,9 @@ function App() {
     if (isLoadingMoreConvs || !hasMoreConvs) return;
     setIsLoadingMoreConvs(true);
     try {
-      const result = await window.electronAPI.invoke('api:syncConversations', { 
-        offset: conversations.length, 
-        limit: 20 
+      const result = await invokeMode('api:syncConversations', {
+        offset: conversations.length,
+        limit: 20
       });
       setConversations(result.conversations);
       setHasMoreConvs(result.hasMore);
@@ -1104,44 +1248,109 @@ function App() {
     } finally {
       setIsLoadingMoreConvs(false);
     }
-  }, [conversations.length, hasMoreConvs, isLoadingMoreConvs]);
+  }, [conversations.length, hasMoreConvs, invokeMode, isLoadingMoreConvs]);
+
+  const clearUncachedConversationMarker = useCallback((conversationId: string) => {
+    setUncachedConversationIds((prev) => {
+      if (!prev.has(conversationId)) return prev;
+      const next = new Set(prev);
+      next.delete(conversationId);
+      return next;
+    });
+  }, []);
+
+  const clearDirtyConversationMarker = useCallback((conversationId: string) => {
+    setDirtyConversationIds((prev) => {
+      if (!prev.has(conversationId)) return prev;
+      const next = new Set(prev);
+      next.delete(conversationId);
+      return next;
+    });
+  }, []);
+
+  const refreshConversationListOnSwitch = useCallback(() => {
+    if (isAiMode || conversationListSyncInFlightRef.current) return;
+    if (Date.now() - lastConversationListSyncAtRef.current < 30000) return;
+
+    conversationListSyncInFlightRef.current = true;
+    lastConversationListSyncAtRef.current = Date.now();
+    invokeMode('api:syncConversations', { offset: 0, limit: 20 })
+      .then(async (result) => {
+        if (Array.isArray(result?.conversations)) {
+          setConversations(result.conversations);
+        }
+        setHasMoreConvs(!!result?.hasMore);
+        await updateCacheDiagnosticsRef.current();
+      })
+      .catch((error) => console.error('Failed to refresh conversation list after switching chats', error))
+      .finally(() => {
+        conversationListSyncInFlightRef.current = false;
+      });
+  }, [invokeMode, isAiMode]);
 
   const selectConversation = useCallback(async (id: string, forceSync = false, shouldSync = false) => {
-    if (id === activeConvIdRef.current && !forceSync) return;
+    if (id === activeConvIdRef.current && !forceSync && !dirtyConversationIds.has(id)) return;
+    const selectionToken = ++conversationSelectionTokenRef.current;
 
     if (activeConvIdRef.current && activeConvIdRef.current !== id) {
       saveVirtuosoState(activeConvIdRef.current);
+      refreshConversationListOnSwitch();
     }
 
     setRestoreVirtuosoState(virtuosoStateByConversationRef.current[id] || null);
     setActiveConvId(id);
     activeConvIdRef.current = id;
-    window.electronAPI.invoke('api:prewarmConversation', { conversationId: id })
-      .catch((error) => console.warn('Failed to prewarm bridge conversation', error));
-    const localMsgs = await window.electronAPI.invoke('db:getMessages', id);
+    const localMsgs = await invokeMode('db:getMessages', { conversationId: id });
+    if (activeConvIdRef.current !== id || conversationSelectionTokenRef.current !== selectionToken) return;
     setMessages(localMsgs);
-    const shouldSyncNow = shouldSync || localMsgs.length === 0;
+    if (Array.isArray(localMsgs) && localMsgs.length > 0) {
+      clearUncachedConversationMarker(id);
+    }
+    if (forceSync && localMsgs.length > 0) {
+      setTimeout(() => {
+        if (activeConvIdRef.current !== id) return;
+        virtuosoRef.current?.scrollToIndex({ index: localMsgs.length - 1, align: 'end', behavior: 'auto' });
+      }, 0);
+    }
+    const isDirty = dirtyConversationIds.has(id);
+    const shouldSyncNow = isAiMode || shouldSync || isDirty || localMsgs.length === 0;
+    if (!isAiMode) {
+      invokeMode('api:prewarmConversation', { conversationId: id })
+        .catch((error) => console.warn(`Failed to prewarm ${isAiMode ? 'AI Mode' : 'ChatGPT'} bridge conversation`, error));
+    }
     if (!shouldSyncNow) {
       setIsSyncing(false);
       return;
     }
     setIsSyncing(true);
-    window.electronAPI.invoke('api:syncMessages', { conversationId: id, force: forceSync })
-      .then((syncedMsgs: Message[]) => {
-        if (activeConvIdRef.current === id) {
-          setMessages(prev => {
-            if (JSON.stringify(prev) === JSON.stringify(syncedMsgs)) return prev;
-            return syncedMsgs;
-          });
+    try {
+      await invokeMode('api:syncMessages', { conversationId: id, force: forceSync || isDirty });
+      const syncedMsgs: Message[] = await invokeMode('db:getMessages', { conversationId: id });
+      if (activeConvIdRef.current === id && conversationSelectionTokenRef.current === selectionToken) {
+        setMessages(syncedMsgs);
+        if (Array.isArray(syncedMsgs) && syncedMsgs.length > 0) {
+          clearUncachedConversationMarker(id);
+          clearDirtyConversationMarker(id);
         }
-      })
-      .catch((error) => console.error('Failed to sync messages', error))
-      .finally(() => {
-        if (activeConvIdRef.current === id) setIsSyncing(false);
-      });
-  }, [saveVirtuosoState]);
+        if ((forceSync || isDirty) && syncedMsgs.length > 0) {
+          setTimeout(() => {
+            if (activeConvIdRef.current !== id) return;
+            virtuosoRef.current?.scrollToIndex({ index: syncedMsgs.length - 1, align: 'end', behavior: 'auto' });
+          }, 0);
+        }
+      }
+    } catch (error) {
+      console.error('Failed to sync messages', error);
+    } finally {
+      if (activeConvIdRef.current === id && conversationSelectionTokenRef.current === selectionToken) {
+        setIsSyncing(false);
+      }
+    }
+  }, [clearDirtyConversationMarker, clearUncachedConversationMarker, dirtyConversationIds, invokeMode, isAiMode, refreshConversationListOnSwitch, saveVirtuosoState]);
+  selectConversationRef.current = selectConversation;
 
   const handleReauth = useCallback(async () => {
+    if (isAiMode) return;
     if (isReauthenticating) return;
     setIsReauthenticating(true);
     try {
@@ -1161,9 +1370,19 @@ function App() {
     } finally {
       setIsReauthenticating(false);
     }
-  }, [checkAuth, isReauthenticating, selectConversation]);
+  }, [checkAuth, isAiMode, isReauthenticating, selectConversation]);
+
+  const handleRefreshCurrentChat = useCallback(async () => {
+    const conversationId = activeConvIdRef.current;
+    if (!conversationId) return;
+    await selectConversation(conversationId, true, true);
+  }, [selectConversation]);
 
   const handleSend = async () => {
+    if (isAiMode) {
+      setSendError('AI Mode imports are read-only in this app.');
+      return;
+    }
     if (isSending || (!inputValue.trim() && !pastedImage && attachedFiles.length === 0)) return;
     if (!isBridgeReadyForActiveConversation) {
       setSendError('Bridge chat is still loading. Wait for the send button to turn green.');
@@ -1202,7 +1421,7 @@ function App() {
     setMessages(prev => [...prev, optimisticMsg]);
 
     try {
-      await window.electronAPI.invoke('api:sendMessage', {
+      await invokeMode('api:sendMessage', {
         conversationId: activeConvId,
         content: outgoingContent,
         model: modelMap[selectedModel] || 'auto',
@@ -1223,7 +1442,7 @@ function App() {
         let lastAssistantFingerprint = '';
 
         while (Date.now() < syncDeadline) {
-          const synced = await window.electronAPI.invoke('api:syncMessages', { conversationId: activeConvId, force: true });
+          const synced = await invokeMode('api:syncMessages', { conversationId: activeConvId, force: true });
           latestMsgs = Array.isArray(synced) ? synced : [];
           setMessages((prev) => {
             if (JSON.stringify(prev) === JSON.stringify(latestMsgs)) return prev;
@@ -1308,15 +1527,41 @@ function App() {
     setAttachedFiles((prev) => [...prev, ...mapped]);
   }, []);
 
-  const handleSearch = async (q: string) => {
-    setSearchQuery(q);
-    if (!q.trim()) {
-      setSearchResults([]);
-      return;
-    }
-    const results = await window.electronAPI.invoke('db:searchMessages', q);
-    setSearchResults(results.filter((r: any) => r.role === 'user' || r.role === 'assistant'));
-  };
+	  const handleSearch = async (q: string) => {
+	    setSearchQuery(q);
+	    if (searchDebounceRef.current !== null) {
+	      window.clearTimeout(searchDebounceRef.current);
+	      searchDebounceRef.current = null;
+	    }
+		    const trimmed = q.trim();
+		    if (!trimmed) {
+		      searchRequestTokenRef.current += 1;
+		      setSearchResults([]);
+		      setSearchTotalCount(0);
+		      setSearchTotalIsLowerBound(false);
+		      return;
+		    }
+	    const requestToken = searchRequestTokenRef.current + 1;
+	    searchRequestTokenRef.current = requestToken;
+	    searchDebounceRef.current = window.setTimeout(async () => {
+	      try {
+		        const searchResponse = await invokeMode('db:searchMessages', { query: trimmed });
+		        if (searchRequestTokenRef.current !== requestToken) {
+		          return;
+		        }
+		        const responseResults = Array.isArray(searchResponse) ? searchResponse : searchResponse?.results;
+		        const filteredResults = (Array.isArray(responseResults) ? responseResults : [])
+		          .filter((r: any) => r.role === 'user' || r.role === 'assistant');
+		        setSearchResults(filteredResults);
+		        setSearchTotalCount(
+		          typeof searchResponse?.total === 'number' ? searchResponse.total : filteredResults.length
+		        );
+		        setSearchTotalIsLowerBound(searchResponse?.total_is_lower_bound === true);
+		      } catch (error) {
+		        console.warn('Search failed:', error);
+	      }
+	    }, 180);
+	  };
 
   const jumpToMessage = (e: React.MouseEvent, convId: string, msgId: string) => {
     e.stopPropagation();
@@ -1347,22 +1592,23 @@ function App() {
     setActiveHighlightQuery('');
   }, [mapSearchQuery.length, navigationMessages, pushOomDebug, viewportVisibleMessageIds.length]);
 
-  const handleDeleteConversation = async (e: React.MouseEvent, id: string) => {
-    e.stopPropagation();
+  const handleDeleteConversation = async (id: string) => {
     if (window.confirm('Permanently delete this chat from your local database?')) {
-      await window.electronAPI.invoke('db:deleteConversation', id);
+      await invokeMode('db:deleteConversation', { id });
       if (activeConvId === id) {
         setActiveConvId(null);
         setMessages([]);
       }
+      setConversationContextMenu(null);
       loadConversations();
     }
   };
 
   const handleAudit = async () => {
+    if (isAiMode) return;
     setIsSyncing(true);
     try {
-      const result = await window.electronAPI.invoke('api:auditDeletions');
+      const result = await invokeMode('api:auditDeletions');
       if (result.success) {
         loadConversations();
         updateStats();
@@ -1375,44 +1621,95 @@ function App() {
   };
 
   const updateStats = useCallback(async () => {
-    const stats = await window.electronAPI.invoke('db:getStats');
+    const stats = await invokeMode('db:getStats');
     setCacheStats(stats);
-  }, []);
+  }, [invokeMode]);
 
   const updateCacheDiagnostics = useCallback(async () => {
-    const diagnostics = await window.electronAPI.invoke('db:getCacheDiagnostics');
+    const diagnostics = await invokeMode('db:getCacheDiagnostics');
     if (diagnostics) {
       setCacheDiagnostics({
         uncachedCount: Number(diagnostics.uncachedCount || 0),
         failedCount: Number(diagnostics.failedCount || 0),
         unknownCount: Number(diagnostics.unknownCount || 0),
+        dirtyCount: Number(diagnostics.dirtyCount || 0),
       });
+      const uncachedIds = Array.isArray(diagnostics.uncachedRows)
+        ? diagnostics.uncachedRows.map((row: { id?: unknown }) => String(row?.id || '')).filter(Boolean)
+        : [];
+      const dirtyIds = Array.isArray(diagnostics.dirtyRows)
+        ? diagnostics.dirtyRows.map((row: { id?: unknown }) => String(row?.id || '')).filter(Boolean)
+        : [];
+      setUncachedConversationIds(new Set(uncachedIds));
+      setDirtyConversationIds(new Set(dirtyIds));
     }
-  }, []);
+  }, [invokeMode]);
+  updateCacheDiagnosticsRef.current = updateCacheDiagnostics;
 
   const handleCacheAll = async () => {
+    if (isAiMode) return;
     if (isCachingAll) return;
     setIsCachingAll(true);
     try {
-      await window.electronAPI.invoke('api:cacheAll');
-      updateStats();
-      updateCacheDiagnostics();
+      setCacheRunStatus('Starting cache run...');
+      const result = await invokeMode('api:cacheAll');
+      if (result?.cancelled) {
+        await updateStats();
+        await updateCacheDiagnostics();
+        setCacheRunStatus(`Cache run stopped: ${Number(result?.processed || 0)} synced, ${Number(result?.failed || 0)} failed.`);
+        return;
+      }
+      if (result && typeof result === 'object' && result.success === false) {
+        console.error('Cache All rejected:', result.reason || 'unknown reason');
+        setCacheRunStatus(`Cache rejected: ${result.reason || 'unknown reason'}`);
+        return;
+      }
+      await updateStats();
+      await updateCacheDiagnostics();
+      setCacheRunStatus(`Cache run complete: ${Number(result?.processed || 0)} cached, ${Number(result?.failed || 0)} failed.`);
     } catch (e) {
       console.error('Cache All failed', e);
+      setCacheRunStatus(`Cache run failed: ${e instanceof Error ? e.message : String(e)}`);
     } finally {
       setIsCachingAll(false);
     }
   };
 
+  const handleStopCache = async () => {
+    if (!isCachingAll) return;
+    setCacheRunStatus('Stopping cache run...');
+    try {
+      await invokeMode('api:cancelCache');
+    } catch (e) {
+      console.error('Failed to stop cache run', e);
+      setCacheRunStatus(`Could not stop cache run: ${e instanceof Error ? e.message : String(e)}`);
+    }
+  };
+
   const handleRetryFailedCache = async () => {
+    if (isAiMode) return;
     if (isCachingAll || cacheDiagnostics.failedCount === 0) return;
     setIsCachingAll(true);
     try {
-      await window.electronAPI.invoke('api:cacheFailed');
-      updateStats();
-      updateCacheDiagnostics();
+      setCacheRunStatus('Retrying failed chats...');
+      const result = await invokeMode('api:cacheFailed');
+      if (result?.cancelled) {
+        await updateStats();
+        await updateCacheDiagnostics();
+        setCacheRunStatus(`Retry stopped: ${Number(result?.processed || 0)} synced, ${Number(result?.failed || 0)} failed.`);
+        return;
+      }
+      if (result && typeof result === 'object' && result.success === false) {
+        console.error('Retry failed-cache rejected:', result.reason || 'unknown reason');
+        setCacheRunStatus(`Retry rejected: ${result.reason || 'unknown reason'}`);
+        return;
+      }
+      await updateStats();
+      await updateCacheDiagnostics();
+      setCacheRunStatus(`Retry complete: ${Number(result?.processed || 0)} cached, ${Number(result?.failed || 0)} failed.`);
     } catch (e) {
       console.error('Retry failed-cache pass failed', e);
+      setCacheRunStatus(`Retry failed: ${e instanceof Error ? e.message : String(e)}`);
     } finally {
       setIsCachingAll(false);
     }
@@ -1425,7 +1722,30 @@ function App() {
 
   useEffect(() => {
     if (window.electronAPI.onCacheProgress) {
-      window.electronAPI.onCacheProgress(() => {
+      window.electronAPI.onCacheProgress((payload?: any) => {
+        if (payload && typeof payload === 'object') {
+          const stage = String(payload.stage || '');
+          const processed = Number(payload.processed || 0);
+          const failed = Number(payload.failed || 0);
+          const inspected = Number(payload.inspected || 0);
+          const total = Number(payload.total || 0);
+          if (stage === 'run-start') {
+            setCacheRunStatus(`Cache run started: 0/${total} processed.`);
+          } else if (stage === 'chat-start') {
+            setCacheRunStatus(`Syncing chat ${inspected}/${total}...`);
+          } else if (stage === 'chat-success') {
+            setCacheRunStatus(`Synced ${processed}/${total} chats (${failed} failed).`);
+          } else if (stage === 'chat-fail') {
+            setCacheRunStatus(`Failed ${failed} chats so far (${processed}/${total} synced).`);
+          } else if (stage === 'chat-pause') {
+            const pauseMs = Number(payload.pauseMs || 0);
+            setCacheRunStatus(`Waiting ${(pauseMs / 1000).toFixed(1)}s before next chat...`);
+          } else if (stage === 'run-complete') {
+            setCacheRunStatus(`Cache run complete: ${processed} synced, ${failed} failed.`);
+          } else if (stage === 'run-cancelled') {
+            setCacheRunStatus(`Cache run stopped: ${processed} synced, ${failed} failed.`);
+          }
+        }
         updateStats();
         updateCacheDiagnostics();
       });
@@ -1433,8 +1753,8 @@ function App() {
   }, [updateStats, updateCacheDiagnostics]);
 
   useEffect(() => {
-    localStorage.setItem('selectedModel', selectedModel);
-  }, [selectedModel]);
+    localStorage.setItem(selectedModelStorageKey, selectedModel);
+  }, [selectedModel, selectedModelStorageKey]);
 
   useEffect(() => {
     if (activeConvId && displayMessages.length > 0) {
@@ -1447,12 +1767,6 @@ function App() {
           }, 150);
           return () => clearTimeout(timer);
         }
-      } else if (!hasScrolledToBottomRef.current[activeConvId] && !virtuosoStateByConversationRef.current[activeConvId]) {
-        const timer = setTimeout(() => {
-          virtuosoRef.current?.scrollToIndex({ index: displayMessages.length - 1, align: 'end', behavior: 'auto' });
-          hasScrolledToBottomRef.current[activeConvId] = true;
-        }, 100);
-        return () => clearTimeout(timer);
       }
     }
   }, [displayMessages, activeConvId, targetMessageId]);
@@ -1554,6 +1868,18 @@ function App() {
   }, [adjustFontSize, resetFontSize]);
 
   useEffect(() => {
+    const handleRefreshShortcut = (event: KeyboardEvent) => {
+      if (!(event.ctrlKey || event.metaKey)) return;
+      if (event.key.toLowerCase() !== 'r') return;
+      event.preventDefault();
+      event.stopPropagation();
+      void handleRefreshCurrentChat();
+    };
+    window.addEventListener('keydown', handleRefreshShortcut, true);
+    return () => window.removeEventListener('keydown', handleRefreshShortcut, true);
+  }, [handleRefreshCurrentChat]);
+
+  useEffect(() => {
     localStorage.setItem('chatWidth', chatWidth.toString());
     document.documentElement.style.setProperty('--message-max-width', `${chatWidth}px`);
   }, [chatWidth]);
@@ -1580,13 +1906,13 @@ function App() {
 
   useEffect(() => {
     if (activeConvId) {
-      localStorage.setItem('lastConvId', activeConvId);
+      localStorage.setItem(lastConvStorageKey, activeConvId);
       activeConvIdRef.current = activeConvId;
     } else {
-      localStorage.removeItem('lastConvId');
+      localStorage.removeItem(lastConvStorageKey);
       activeConvIdRef.current = null;
     }
-  }, [activeConvId]);
+  }, [activeConvId, lastConvStorageKey]);
 
   useEffect(() => {
     if (!isPanning) {
@@ -1650,6 +1976,10 @@ function App() {
 
   useEffect(() => {
     let unsubscribe: (() => void) | undefined;
+    if (isAiMode) {
+      setBridgeComposerStatus(null);
+      return;
+    }
     if (window.electronAPI.onBridgeComposerStatus) {
       const maybeUnsub = window.electronAPI.onBridgeComposerStatus((status: BridgeComposerStatus) => {
         setBridgeComposerStatus(status || null);
@@ -1662,24 +1992,46 @@ function App() {
     return () => {
       if (unsubscribe) unsubscribe();
     };
-  }, []);
+  }, [isAiMode]);
 
   useEffect(() => {
     bridgeComposerStatusRef.current = bridgeComposerStatus;
   }, [bridgeComposerStatus]);
 
   useEffect(() => {
+    if (initializationStartedRef.current) return;
+    initializationStartedRef.current = true;
+
     const init = async () => {
-      await checkAuth();
-      const savedId = localStorage.getItem('lastConvId');
-      if (savedId) {
-        selectConversation(savedId, true, true);
-      } else {
-        window.electronAPI.invoke('api:prewarmConversation', { conversationId: null })
-          .catch((error) => console.warn('Failed to prewarm new chat bridge', error));
+      try {
+        if (isAiMode) {
+          setIsSyncing(true);
+          try {
+            const existing = await invokeMode('db:getConversations');
+            if (!Array.isArray(existing) || existing.length === 0) {
+              await window.electronAPI.invoke('ai:importTakeout', { path: AI_MODE_TAKEOUT_DEFAULT_PATH });
+            }
+          } finally {
+            setIsSyncing(false);
+          }
+        }
+        await checkAuth();
+        const savedId = localStorage.getItem(lastConvStorageKey);
+        if (savedId) {
+          await selectConversationRef.current(savedId, true, true);
+        } else if (!isAiMode) {
+          window.electronAPI.invoke('api:prewarmConversation', { conversationId: null })
+            .catch((error) => console.warn('Failed to prewarm new chat bridge', error));
+        }
+      } catch (error) {
+        console.error('Workspace initialization failed', error);
+        setSendError(`Workspace initialization failed: ${String((error as Error)?.message || error)}`);
       }
     };
-    init();
+    void init();
+  }, [checkAuth, invokeMode, isAiMode, lastConvStorageKey]);
+
+  useEffect(() => {
     const handleGlobalPaste = (e: ClipboardEvent) => {
       const items = e.clipboardData?.items;
       if (items) {
@@ -1697,16 +2049,25 @@ function App() {
     };
     window.addEventListener('paste', handleGlobalPaste);
     const handleClickOutside = (e: MouseEvent) => {
-      if (showModelMenu && !(e.target as HTMLElement).closest('.model-picker-container')) {
+      const target = e.target as HTMLElement;
+      if (showModelMenu && !target.closest('.model-picker-container')) {
         setShowModelMenu(false);
       }
+      if (conversationContextMenu && !target.closest('.conversation-context-menu')) {
+        setConversationContextMenu(null);
+      }
+    };
+    const handleAnyScroll = () => {
+      setConversationContextMenu(null);
     };
     window.addEventListener('mousedown', handleClickOutside);
+    window.addEventListener('scroll', handleAnyScroll, true);
     return () => {
       window.removeEventListener('paste', handleGlobalPaste);
       window.removeEventListener('mousedown', handleClickOutside);
+      window.removeEventListener('scroll', handleAnyScroll, true);
     };
-  }, [showModelMenu, checkAuth, selectConversation]);
+  }, [showModelMenu, conversationContextMenu]);
 
   const startPanning = (e: React.MouseEvent, scrollTarget?: HTMLElement | null) => {
     if (e.button === 1) {
@@ -1796,9 +2157,13 @@ function App() {
       viewportHighlightRafRef.current = null;
     }
     if (scrollerRef.current) {
-      scrollerRef.current.removeEventListener('scroll', scheduleViewportHighlightUpdate);
+      scrollerRef.current.removeEventListener('scroll', handleMessageScroll);
     }
-  }, [scheduleViewportHighlightUpdate]);
+  }, [handleMessageScroll]);
+
+  useEffect(() => {
+    updateNearBottom();
+  }, [displayMessagesForView.length, updateNearBottom]);
 
   useEffect(() => {
     if (!isMessageMapOpen) return;
@@ -1941,8 +2306,8 @@ function App() {
     return () => window.clearInterval(id);
   }, [pushOomDebug]);
 
-  if (isAuth === null) return <div className="auth-overlay">Loading...</div>;
-  if (isAuth === false) return (
+  if (!isAiMode && isAuth === null) return <div className="auth-overlay">Loading...</div>;
+  if (!isAiMode && isAuth === false) return (
     <div className="auth-overlay">
       <h1>ChatGPT Desktop</h1>
       <p>Please log in to your ChatGPT Plus account</p>
@@ -1952,9 +2317,10 @@ function App() {
 
   const mapHighlightQuery = mapSearchQuery.trim().length >= 2 ? mapSearchQuery.trim() : '';
   const trimmedSearchQuery = searchQuery.trim();
-  const searchMatchCount = trimmedSearchQuery ? searchResults.length : 0;
+  const searchMatchCount = trimmedSearchQuery ? searchTotalCount : 0;
+  const searchMatchCountLabel = `${searchMatchCount}${searchTotalIsLowerBound ? '+' : ''}`;
   const hasSendableInput = !!inputValue.trim() || !!pastedImage || attachedFiles.length > 0;
-  const isSendDisabled = isSending || !hasSendableInput || !isBridgeReadyForActiveConversation;
+  const isSendDisabled = isAiMode || isSending || !hasSendableInput || !isBridgeReadyForActiveConversation;
   const toggleSidebar = () => {
     setIsSidebarOpen((prev) => {
       if (prev && activeResizer === 'sidebar') {
@@ -1980,7 +2346,16 @@ function App() {
         <div className="sidebar">
           <div className="sidebar-header">
             <div style={{ display: 'flex', gap: '8px' }}>
-              <button className="new-chat-btn" onClick={() => { saveVirtuosoState(activeConvIdRef.current); setActiveConvId(null); setMessages([]); activeConvIdRef.current = null; setRestoreVirtuosoState(null); window.electronAPI.invoke('api:prewarmConversation', { conversationId: null }).catch((error) => console.warn('Failed to prewarm new chat bridge', error)); }}>+ New Chat</button>
+              <button className="new-chat-btn" onClick={() => {
+                saveVirtuosoState(activeConvIdRef.current);
+                setActiveConvId(null);
+                setMessages([]);
+                activeConvIdRef.current = null;
+                setRestoreVirtuosoState(null);
+                if (!isAiMode) {
+                  window.electronAPI.invoke('api:prewarmConversation', { conversationId: null }).catch((error) => console.warn('Failed to prewarm new chat bridge', error));
+                }
+              }}>+ New Chat</button>
               <button className="search-trigger-btn" onClick={() => setShowSearch(true)} title="Search Chats">
                 <svg viewBox="0 0 24 24" fill="currentColor" width="20" height="20"><path d="M15.5 14h-.79l-.28-.27A6.471 6.471 0 0 0 16 9.5 6.5 6.5 0 1 0 9.5 16c1.61 0 3.09-.59 4.23-1.57l.27.28v.79l5 4.99L20.49 19l-4.99-5zm-6 0C7.01 14 5 11.99 5 9.5S7.01 5 9.5 5 14 7.01 14 9.5 11.99 14 9.5 14z"/></svg>
               </button>
@@ -1995,9 +2370,18 @@ function App() {
                 <ConversationItem 
                   key={conv.id} 
                   conv={conv} 
+                  markerState={uncachedConversationIds.has(conv.id) ? 'uncached' : !isAiMode && dirtyConversationIds.has(conv.id) ? 'dirty' : 'none'}
                   active={activeConvId === conv.id} 
                   onClick={() => selectConversation(conv.id)} 
-                  onDelete={(e) => handleDeleteConversation(e, conv.id)}
+                  onContextMenu={(e) => {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    setConversationContextMenu({
+                      x: e.clientX,
+                      y: e.clientY,
+                      conversationId: conv.id,
+                    });
+                  }}
                 />
               )}
               components={{ Footer: () => isLoadingMoreConvs ? <div style={{ padding: '10px', textAlign: 'center', fontSize: '12px', color: '#c5c5d2' }}>Loading more...</div> : null }}
@@ -2015,26 +2399,49 @@ function App() {
                   <span className="stats-value">{cacheDiagnostics.uncachedCount}</span>
                   <span className="stats-subvalue">fail {cacheDiagnostics.failedCount} · unknown {cacheDiagnostics.unknownCount}</span>
                 </div>
+                <div className="cache-stats-line" title="Cached chats that need a full sync">
+                  <span className="stats-label">Needs sync:</span>
+                  <span className="stats-value">{cacheDiagnostics.dirtyCount}</span>
+                </div>
+                {cacheRunStatus ? (
+                  <div className="cache-stats-line" title={cacheRunStatus}>
+                    <span className="stats-label">Status:</span>
+                    <span className="stats-subvalue">{cacheRunStatus}</span>
+                  </div>
+                ) : null}
               </div>
               <div style={{ display: 'flex', gap: '6px' }}>
-                <button
-                  className="cache-all-btn"
-                  onClick={handleRetryFailedCache}
-                  disabled={isCachingAll || cacheDiagnostics.failedCount === 0}
-                  title="Retry only conversations with known cache failures"
-                >
-                  Retry failed
-                </button>
-                <button 
-                  className={`cache-all-btn ${isCachingAll ? 'spinning' : ''}`} 
-                  onClick={handleCacheAll} 
-                  disabled={isCachingAll || cacheStats.cachedCount === cacheStats.localCount}
-                  title="Cache all missing chats locally"
-                >
-                  <svg viewBox="0 0 24 24" fill="currentColor" width="16" height="16">
-                    <path d="M19 9h-4V3H9v6H5l7 7 7-7zM5 18v2h14v-2H5z"/>
-                  </svg>
-                </button>
+                {!isAiMode ? (
+                  <>
+                    {isCachingAll ? (
+                      <button
+                        className="cache-all-btn"
+                        onClick={handleStopCache}
+                        title="Stop the active cache sync"
+                      >
+                        Stop
+                      </button>
+                    ) : null}
+                    <button
+                      className="cache-all-btn"
+                      onClick={handleRetryFailedCache}
+                      disabled={isCachingAll || cacheDiagnostics.failedCount === 0}
+                      title="Retry only conversations with known cache failures"
+                    >
+                      Retry failed
+                    </button>
+                    <button
+                      className={`cache-all-btn ${isCachingAll ? 'spinning' : ''}`}
+                      onClick={handleCacheAll}
+                      disabled={isCachingAll || (cacheDiagnostics.uncachedCount === 0 && cacheDiagnostics.dirtyCount === 0)}
+                      title="Cache missing chats and refresh chats that need a full sync"
+                    >
+                      <svg viewBox="0 0 24 24" fill="currentColor" width="16" height="16">
+                        <path d="M19 9h-4V3H9v6H5l7 7 7-7zM5 18v2h14v-2H5z"/>
+                      </svg>
+                    </button>
+                  </>
+                ) : null}
               </div>
             </div>
             <div className="footer-actions">
@@ -2060,6 +2467,16 @@ function App() {
       ) : null}
       <div className={`main-content ${isSidebarOpen ? 'sidebar-open' : 'sidebar-closed'} ${isMessageMapOpen ? 'map-open' : 'map-closed'}`}>
         <button
+          className="workspace-home-btn"
+          onClick={onGoHome}
+          title="Home"
+          aria-label="Home"
+        >
+          <svg viewBox="0 0 24 24" fill="currentColor" width="18" height="18" aria-hidden="true">
+            <path d="M12 3l9 8.5-1.4 1.5L18 11.4V21h-5v-6H11v6H6v-9.6L4.4 13 3 11.5 12 3z" />
+          </svg>
+        </button>
+        <button
           className={`sidebar-toggle ${isSidebarOpen ? 'open' : 'closed'}`}
           onClick={toggleSidebar}
           title={isSidebarOpen ? 'Hide chat list' : 'Show chat list'}
@@ -2071,7 +2488,7 @@ function App() {
           <div className="chat-pane">
             {isSyncing && <div className="sync-indicator">Syncing...</div>}
             <div className="messages-container" onMouseDown={(e) => startPanning(e, scrollerRef.current)}>
-              <Virtuoso key={activeConvId || '__new_chat__'} ref={virtuosoRef} scrollerRef={handleMessageScrollerRef as any} data={displayMessagesForView} initialTopMostItemIndex={displayMessagesForView.length > 0 ? displayMessagesForView.length - 1 : 0} restoreStateFrom={restoreVirtuosoState || undefined} followOutput={targetMessageId ? false : "auto"} defaultItemHeight={180} increaseViewportBy={{ top: mapSearchNeedle ? 420 : 1200, bottom: mapSearchNeedle ? 240 : 400 }} overscan={mapSearchNeedle ? { main: 260, reverse: 320 } : { main: 1000, reverse: 1400 }} isScrolling={(isScrolling) => { if (isScrolling) scheduleViewportHighlightUpdate(); else updateViewportNavHighlight(); }} rangeChanged={handleMessageRangeChanged}
+              <Virtuoso key={activeConvId || '__new_chat__'} ref={virtuosoRef} scrollerRef={handleMessageScrollerRef as any} data={displayMessagesForView} initialTopMostItemIndex={displayMessagesForView.length > 0 ? displayMessagesForView.length - 1 : 0} restoreStateFrom={restoreVirtuosoState || undefined} followOutput={false} defaultItemHeight={180} increaseViewportBy={{ top: mapSearchNeedle ? 420 : 1200, bottom: mapSearchNeedle ? 240 : 400 }} overscan={mapSearchNeedle ? { main: 260, reverse: 320 } : { main: 1000, reverse: 1400 }} isScrolling={(isScrolling) => { if (isScrolling) scheduleViewportHighlightUpdate(); else updateViewportNavHighlight(); }} rangeChanged={handleMessageRangeChanged}
                 itemContent={(_index, msg) => {
                   const isTarget = targetMessageId === msg.id;
                   const shouldMapHighlight = !!mapHighlightQuery && mapMatchMessageIds.has(msg.id);
@@ -2207,21 +2624,24 @@ function App() {
                   e.currentTarget.value = '';
                 }}
               />
-              <div className="input-wrapper">
-                <div className="model-picker-container">
-                  <button className={`model-picker-trigger ${showModelMenu ? 'active' : ''}`} onClick={() => setShowModelMenu(!showModelMenu)} title="Select Model"><svg viewBox="0 0 24 24" fill="currentColor" width="16" height="16"><path d="M7 14l5-5 5 5z"/></svg></button>
-                  <button className="attach-btn" onClick={() => fileInputRef.current?.click()} title="Attach files">
-                    <svg viewBox="0 0 24 24" fill="currentColor" width="16" height="16"><path d="M16.5 6.5l-7.79 7.79a2 2 0 1 0 2.83 2.83l7.08-7.08a4 4 0 1 0-5.66-5.66L5.17 12.17a6 6 0 1 0 8.49 8.49l6.36-6.36-1.41-1.41-6.36 6.36a4 4 0 1 1-5.66-5.66l7.79-7.79a2 2 0 1 1 2.83 2.83l-7.08 7.08-.71-.71 6.72-6.72 1.41 1.41-6.72 6.72a2 2 0 0 1-2.83-2.83l7.79-7.79 1.41 1.41z"/></svg>
-                  </button>
-                  {showModelMenu && <div className="model-picker-menu">{['Auto', 'Instant 5.3', 'Thinking 5.4 Standard', 'Thinking 5.4 Extended', 'Thinking 5.5 Standard', 'Thinking 5.5 Extended'].map(m => <button key={m} className={`model-picker-option ${selectedModel === m ? 'active' : ''}`} onClick={() => { setSelectedModel(m); setShowModelMenu(false); }}>{m}</button>)}</div>}
-                </div>
-		              <textarea
-		                ref={textareaRef}
-		                className="chat-input"
-		                placeholder="Send a message..."
+	              <div className="input-wrapper">
+	                {!isAiMode ? (
+	                  <div className="model-picker-container">
+	                    <button className={`model-picker-trigger ${showModelMenu ? 'active' : ''}`} onClick={() => setShowModelMenu(!showModelMenu)} title="Select Model"><svg viewBox="0 0 24 24" fill="currentColor" width="16" height="16"><path d="M7 14l5-5 5 5z"/></svg></button>
+	                    <button className="attach-btn" onClick={() => fileInputRef.current?.click()} title="Attach files">
+	                      <svg viewBox="0 0 24 24" fill="currentColor" width="16" height="16"><path d="M16.5 6.5l-7.79 7.79a2 2 0 1 0 2.83 2.83l7.08-7.08a4 4 0 1 0-5.66-5.66L5.17 12.17a6 6 0 1 0 8.49 8.49l6.36-6.36-1.41-1.41-6.36 6.36a4 4 0 1 1-5.66-5.66l7.79-7.79a2 2 0 1 1 2.83 2.83l-7.08 7.08-.71-.71 6.72-6.72 1.41 1.41-6.72 6.72a2 2 0 0 1-2.83-2.83l7.79-7.79 1.41 1.41z"/></svg>
+	                    </button>
+	                    {showModelMenu && <div className="model-picker-menu">{['Auto', 'Instant 5.3', 'Thinking 5.4 Standard', 'Thinking 5.4 Extended', 'Thinking 5.5 Standard', 'Thinking 5.5 Extended'].map(m => <button key={m} className={`model-picker-option ${selectedModel === m ? 'active' : ''}`} onClick={() => { setSelectedModel(m); setShowModelMenu(false); }}>{m}</button>)}</div>}
+	                  </div>
+	                ) : null}
+			              <textarea
+			                ref={textareaRef}
+			                className="chat-input"
+			                placeholder={isAiMode ? 'Imported AI Mode archive (read-only)' : 'Send a message...'}
 		                rows={1}
-		                value={inputValue}
-		                onChange={(e) => setInputValue(e.target.value)}
+			                value={inputValue}
+			                disabled={isAiMode}
+			                onChange={(e) => setInputValue(e.target.value)}
 		                onPointerDownCapture={(e) => {
 		                  if (e.button !== 1) return;
 		                  markMiddlePasteSuppressed();
@@ -2286,14 +2706,20 @@ function App() {
             <div className="setting-item">
               <label>Account & Sync</label>
               <div className="settings-action-list">
-                <button className="settings-action-btn" onClick={handleAudit} title="Check for chats deleted on web and mark local cache accordingly">
-                  Check for auto deletions
-                </button>
-                <button className="settings-action-btn" onClick={handleReauth} disabled={isReauthenticating} title="Clear ChatGPT session data and log in again">
-                  {isReauthenticating ? 'Re-authenticating...' : 'Re-authenticate'}
-                </button>
-              </div>
-            </div>
+	                {!isAiMode ? (
+	                  <>
+	                    <button className="settings-action-btn" onClick={handleAudit} title="Check for chats deleted on web and mark local cache accordingly">
+	                      Check for auto deletions
+	                    </button>
+	                    <button className="settings-action-btn" onClick={handleReauth} disabled={isReauthenticating} title="Clear ChatGPT session data and log in again">
+	                      {isReauthenticating ? 'Re-authenticating...' : 'Re-authenticate'}
+	                    </button>
+	                  </>
+	                ) : (
+	                  <div className="settings-note">AI Mode uses imported takeout plus live bridge sync from Google AI Mode history.</div>
+	                )}
+	              </div>
+	            </div>
           </div>
         </div>
       )}
@@ -2313,37 +2739,71 @@ function App() {
                 onChange={(e) => handleSearch(e.target.value)}
               />
             </div>
-            {trimmedSearchQuery && (
-              <div className="search-results-meta">
-                {searchMatchCount} match{searchMatchCount === 1 ? '' : 'es'}
-              </div>
-            )}
-            <div className="search-results">
-              {searchResults.length === 0 && trimmedSearchQuery !== '' && (
-                <div className="no-results">No messages found matching "{searchQuery}"</div>
-              )}
+	            {trimmedSearchQuery && (
+	              <div className="search-results-meta">
+	                {searchMatchCountLabel} match{searchMatchCount === 1 && !searchTotalIsLowerBound ? '' : 'es'}
+	              </div>
+	            )}
+	            <div className="search-results">
+	              {searchResults.length === 0 && trimmedSearchQuery !== '' && (
+	                <div className="no-results">No messages found matching "{searchQuery}"</div>
+	              )}
               {searchResults.map(res => (
                 <div key={res.id} className="search-result-item" onClick={(e) => jumpToMessage(e, res.conversation_id, res.id)}>
                   <div className="search-result-header">
                     <span className="search-result-title">{res.conversation_title}</span>
                     <span className="search-result-role">{res.role}</span>
                   </div>
-                  <div className="search-result-content">
-                    {(() => {
-                      const text = res.content;
-                      const idx = text.toLowerCase().indexOf(searchQuery.toLowerCase());
-                      const start = Math.max(0, idx - 60);
-                      const end = Math.min(text.length, idx + 100);
-                      const preview = (start > 0 ? '...' : '') + text.substring(start, end) + (end < text.length ? '...' : '');
-                      const escaped = escapeRegExp(searchQuery);
-                      const parts = preview.split(new RegExp(`(${escaped})`, 'gi'));
-                      return parts.map((part, i) => part.toLowerCase() === searchQuery.toLowerCase() ? <span key={i} className="search-highlight">{part}</span> : part);
-                    })()}
-                  </div>
+	                  <div className="search-result-content">
+	                    {(() => {
+		                      const text = res.content;
+		                      const terms = searchQuery
+		                        .toLowerCase()
+		                        .split(/\s+/)
+		                        .map(term => term.trim())
+		                        .filter(Boolean);
+		                      const lowered = text.toLowerCase();
+		                      const phraseTerms = terms.map(term => escapeRegExp(term));
+		                      const escapedTerms = terms
+		                        .map(term => escapeRegExp(term))
+		                        .sort((a, b) => b.length - a.length);
+		                      const phrasePattern = phraseTerms.length > 1
+		                        ? new RegExp(phraseTerms.map(term => `${term}[a-z0-9_-]*`).join('[^a-z0-9]+'), 'i')
+		                        : null;
+		                      const phraseMatch = phrasePattern ? lowered.match(phrasePattern) : null;
+		                      const indices = escapedTerms
+		                        .map(term => lowered.search(new RegExp(`${term}[a-z0-9_-]*`, 'i')))
+		                        .filter(idx => idx >= 0);
+		                      const idx = phraseMatch?.index ?? (indices.length > 0 ? Math.min(...indices) : lowered.indexOf(searchQuery.toLowerCase()));
+		                      const previewIndex = Math.max(0, idx);
+		                      const start = Math.max(0, previewIndex - 60);
+		                      const end = Math.min(text.length, previewIndex + 100);
+		                      const preview = (start > 0 ? '...' : '') + text.substring(start, end) + (end < text.length ? '...' : '');
+		                      if (terms.length === 0) {
+		                        return preview;
+		                      }
+		                      const parts = preview.split(new RegExp(`(${escapedTerms.map(term => `${term}[a-z0-9_-]*`).join('|')})`, 'gi'));
+		                      return parts.map((part, i) => terms.some(term => part.toLowerCase().startsWith(term)) ? <span key={i} className="search-highlight">{part}</span> : part);
+		                    })()}
+	                  </div>
                 </div>
               ))}
             </div>
           </div>
+        </div>
+      )}
+      {conversationContextMenu && (
+        <div
+          className="conversation-context-menu"
+          style={{ left: conversationContextMenu.x, top: conversationContextMenu.y }}
+          onContextMenu={(e) => e.preventDefault()}
+        >
+          <button
+            className="conversation-context-menu-item"
+            onClick={() => handleDeleteConversation(conversationContextMenu.conversationId)}
+          >
+            Delete locally
+          </button>
         </div>
       )}
       {fullscreenImage && (
@@ -2373,6 +2833,55 @@ function App() {
       )}
     </div>
   );
+}
+
+const WorkspaceHome = ({ onSelectChatGPT, onSelectAiMode }: { onSelectChatGPT: () => void; onSelectAiMode: () => void }) => {
+  return (
+    <div className="workspace-shell workspace-home-shell">
+      <div className="workspace-home-panel">
+        <div className="workspace-home-eyebrow">Home</div>
+        <h1>Choose a workspace</h1>
+        <p>ChatGPT uses the bridge-backed live chat. AI Mode shows imported takeout chats in the same interface.</p>
+        <div className="workspace-choice-list">
+          <button className="workspace-choice-card" onClick={onSelectChatGPT}>
+            <div className="workspace-choice-card-title">ChatGPT</div>
+            <div className="workspace-choice-card-subtitle">Current app</div>
+          </button>
+          <button className="workspace-choice-card" onClick={onSelectAiMode}>
+            <div className="workspace-choice-card-title">AI Mode</div>
+            <div className="workspace-choice-card-subtitle">Imported takeout chats</div>
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+};
+
+function App() {
+  const [workspaceMode, setWorkspaceMode] = useState<WorkspaceMode>('home');
+
+  useEffect(() => {
+    const rawFont = Number(localStorage.getItem('fontSize'));
+    const fontSize = Number.isFinite(rawFont) && rawFont > 0 ? clampFontSize(rawFont) : FONT_SIZE_DEFAULT;
+    const chatWidth = Number(localStorage.getItem('chatWidth')) || 800;
+    document.documentElement.style.setProperty('--app-font-size', `${fontSize}pt`);
+    document.documentElement.style.setProperty('--message-max-width', `${chatWidth}px`);
+  }, []);
+
+  if (workspaceMode === 'home') {
+    return (
+      <WorkspaceHome
+        onSelectChatGPT={() => setWorkspaceMode('chatgpt')}
+        onSelectAiMode={() => setWorkspaceMode('aimode')}
+      />
+    );
+  }
+
+  if (workspaceMode === 'aimode') {
+    return <ChatGPTApp workspaceMode="aimode" onGoHome={() => setWorkspaceMode('home')} />;
+  }
+
+  return <ChatGPTApp workspaceMode="chatgpt" onGoHome={() => setWorkspaceMode('home')} />;
 }
 
 export default App;

@@ -3,6 +3,7 @@ export interface Conversation {
   title: string;
   created_at: number;
   updated_at: number;
+  last_synced_updated_at?: number | null;
   is_deleted_on_web?: number;
 }
 

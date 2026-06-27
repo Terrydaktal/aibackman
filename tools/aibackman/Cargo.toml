@@ -1,0 +1,16 @@
+[package]
+name = "aibackman"
+version = "0.1.0"
+edition = "2024"
+description = "GUI for comparing an AI Mode Google Takeout backup with the current chat database"
+
+[dependencies]
+anyhow = "1.0"
+eframe = "0.32"
+html-escape = "0.2"
+regex = "1.11"
+rfd = "0.15"
+rusqlite = { version = "0.37", features = ["bundled"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+

@@ -11,7 +11,9 @@
     "electron:dev:oom:tracegc": "concurrently \"npm run dev\" \"wait-on http://localhost:5173 && CHATGPT_OOM_DEBUG=1 CHATGPT_TRACE_GC=1 CHATGPT_BRIDGE_VISIBLE=1 NODE_ENV=development electron .\"",
     "build": "tsc -b && vite build",
     "lint": "eslint .",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "aimode:reconcile-takeout": "node scripts/reconcile-aimode-takeout.cjs",
+    "aibackman": "cargo run --manifest-path tools/aibackman/Cargo.toml"
   },
   "dependencies": {
     "better-sqlite3": "^12.9.0",

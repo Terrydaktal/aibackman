@@ -4,6 +4,7 @@ export interface Conversation {
   created_at: number;
   updated_at: number;
   last_synced_updated_at?: number | null;
+  current_node_id?: string | null;
   is_deleted_on_web?: number;
 }
 

@@ -130,8 +130,19 @@ const normalizeProductsMarkers = (content: string) => {
 };
 
 type ThinkingPart = Pick<Message, 'id' | 'role' | 'content'>;
+type BranchOption = {
+  childId: string;
+  role: Message['role'];
+  preview: string;
+};
+type BranchInfo = {
+  parentId: string;
+  options: BranchOption[];
+  activeChildId: string;
+};
 type DisplayMessage = Message & {
   thinkingParts?: ThinkingPart[];
+  branchInfo?: BranchInfo;
   isBridgeStatus?: boolean;
   bridgeStatusState?: string;
 };
@@ -268,17 +279,6 @@ const summarizeMetadataOnlyStep = (msg: Message) => {
   } catch {
     return '';
   }
-};
-
-const assistantCandidateScore = (content: string) => {
-  const text = content.trim();
-  if (!text) return -Infinity;
-  let score = Math.min(text.length, 20000);
-  if (text.startsWith('{') && text.includes('"prompt"')) score -= 7000;
-  if (text.startsWith('{') && text.includes('"size"')) score -= 7000;
-  if (text.startsWith('```')) score -= 4000;
-  if (text.startsWith('[Download')) score -= 1500;
-  return score;
 };
 
 const buildCitationRegistry = (rawMessages: Message[]): Record<string, CitationEntry> => {
@@ -455,39 +455,196 @@ const buildCitationRegistry = (rawMessages: Message[]): Record<string, CitationE
   return registry;
 };
 
+const sortMessagesChronologically = (a: Message, b: Message) => {
+  const createdDelta = Number(a.created_at || 0) - Number(b.created_at || 0);
+  if (createdDelta !== 0) return createdDelta;
+  return String(a.id || '').localeCompare(String(b.id || ''));
+};
+
+const countVisibleTurnsInPath = (path: Message[]) => path.filter((msg) => (
+  (msg.role === 'user' || msg.role === 'assistant') && !!msg.content?.trim()
+)).length;
+
+const resolvePreferredCurrentNodeId = (allMessages: Message[], currentNodeId: string | null) => {
+  if (!currentNodeId) return null;
+  if (!Array.isArray(allMessages) || allMessages.length === 0) return currentNodeId;
+
+  const byId = new Map(allMessages.map((msg) => [msg.id, msg]));
+  const lineage: Message[] = [];
+  const seen = new Set<string>();
+  let nodeId: string | null = currentNodeId;
+  let guard = 0;
+  while (nodeId && byId.has(nodeId) && !seen.has(nodeId) && guard < 20000) {
+    seen.add(nodeId);
+    const node: Message = byId.get(nodeId)!;
+    lineage.push(node);
+    nodeId = node.parent_id || null;
+    guard += 1;
+  }
+  lineage.reverse();
+  const currentVisibleCount = countVisibleTurnsInPath(lineage);
+  const allVisibleCount = allMessages.filter((msg) => (
+    (msg.role === 'user' || msg.role === 'assistant') && !!msg.content?.trim()
+  )).length;
+
+  const currentLooksHealthy = currentVisibleCount > 0 && (
+    (allVisibleCount < 8 || currentVisibleCount >= Math.max(4, Math.floor(allVisibleCount * 0.55)))
+    && (allVisibleCount < 100 || (allVisibleCount - currentVisibleCount) < 20)
+  );
+  if (currentLooksHealthy) return currentNodeId;
+
+  const childIds = new Set(
+    allMessages
+      .map((msg) => msg.parent_id || null)
+      .filter((value): value is string => !!value)
+  );
+  const leafNodes = allMessages.filter((msg) => !childIds.has(msg.id));
+  if (leafNodes.length === 0) return currentNodeId;
+
+  let bestNodeId = currentNodeId;
+  let bestVisibleCount = currentVisibleCount;
+  let bestCreatedAt = Number(byId.get(currentNodeId)?.created_at || 0);
+  for (const leaf of leafNodes) {
+    const leafLineage: Message[] = [];
+    const visited = new Set<string>();
+    let leafNodeId: string | null = leaf.id;
+    let leafGuard = 0;
+    while (leafNodeId && byId.has(leafNodeId) && !visited.has(leafNodeId) && leafGuard < 20000) {
+      visited.add(leafNodeId);
+      const node: Message = byId.get(leafNodeId)!;
+      leafLineage.push(node);
+      leafNodeId = node.parent_id || null;
+      leafGuard += 1;
+    }
+    leafLineage.reverse();
+    const visibleCount = countVisibleTurnsInPath(leafLineage);
+    const createdAt = Number(leaf.created_at || 0);
+    if (
+      visibleCount > bestVisibleCount
+      || (visibleCount === bestVisibleCount && createdAt > bestCreatedAt)
+    ) {
+      bestNodeId = leaf.id;
+      bestVisibleCount = visibleCount;
+      bestCreatedAt = createdAt;
+    }
+  }
+
+  return bestNodeId;
+};
+
+const buildLinearConversationPath = (
+  rawMessages: Message[],
+  currentNodeId: string | null,
+  selectedChildByParent: Record<string, string> = {}
+) => {
+  const orderedMessages = [...rawMessages].sort(sortMessagesChronologically);
+  const byId = new Map(orderedMessages.map((msg) => [msg.id, msg]));
+  const childrenByParent = new Map<string, Message[]>();
+  for (const msg of orderedMessages) {
+    const parentId = msg.parent_id || '';
+    if (!parentId || !byId.has(parentId)) continue;
+    if (!childrenByParent.has(parentId)) childrenByParent.set(parentId, []);
+    childrenByParent.get(parentId)!.push(msg);
+  }
+  for (const children of childrenByParent.values()) {
+    children.sort(sortMessagesChronologically);
+  }
+
+  const effectiveCurrentNodeId = resolvePreferredCurrentNodeId(orderedMessages, currentNodeId);
+  const activeLineage = new Set<string>();
+  let walkerId: string | null = effectiveCurrentNodeId;
+  let guard = 0;
+  while (walkerId && byId.has(walkerId) && !activeLineage.has(walkerId) && guard < 20000) {
+    activeLineage.add(walkerId);
+    walkerId = byId.get(walkerId)?.parent_id || null;
+    guard += 1;
+  }
+
+  const rootCandidates = orderedMessages.filter((msg) => !msg.parent_id || !byId.has(msg.parent_id));
+  const root = rootCandidates.find((msg) => activeLineage.has(msg.id)) || rootCandidates[0] || null;
+  const branchInfoByMessageId = new Map<string, BranchInfo>();
+  const path: Message[] = [];
+  const visited = new Set<string>();
+  let current = root;
+
+  while (current && !visited.has(current.id)) {
+    visited.add(current.id);
+    path.push(current);
+    const children = childrenByParent.get(current.id) || [];
+    if (children.length === 0) break;
+
+    let activeChild = children.find((child) => child.id === selectedChildByParent[current.id]) || null;
+    if (!activeChild) {
+      activeChild = children.find((child) => activeLineage.has(child.id)) || null;
+    }
+    if (!activeChild) {
+      activeChild = children[children.length - 1] || null;
+    }
+
+    if (children.length > 1 && activeChild) {
+      branchInfoByMessageId.set(current.id, {
+        parentId: current.id,
+        options: children.map((child) => ({
+          childId: child.id,
+          role: child.role,
+          preview: getMessagePreview(child.content || child.role),
+        })),
+        activeChildId: activeChild.id,
+      });
+    }
+
+    current = activeChild;
+  }
+
+  return {
+    pathMessages: path.map((msg) => {
+      const branchInfo = branchInfoByMessageId.get(msg.id);
+      return branchInfo ? { ...msg, branchInfo } : msg;
+    }),
+    effectiveCurrentNodeId,
+  };
+};
+
 const buildDisplayMessages = (rawMessages: Message[]): DisplayMessage[] => {
   const output: DisplayMessage[] = [];
   const segmentable = rawMessages.filter((m) => (m.content && m.content.trim()) || !!m.metadata_json);
 
   const flushSegment = (segment: Message[]) => {
     if (segment.length === 0) return;
-    const userMessages = segment.filter((m) => m.role === 'user' && m.content && m.content.trim());
-    const assistantMessages = segment.filter((m) => m.role === 'assistant' && m.content && m.content.trim());
+    const pendingThinkingParts: ThinkingPart[] = [];
+    let lastAssistantIndex = -1;
 
-    userMessages.forEach((m) => output.push({ ...m }));
-    if (assistantMessages.length === 0) return;
+    const flushPendingThinkingToLastAssistant = () => {
+      if (pendingThinkingParts.length === 0 || lastAssistantIndex < 0) return;
+      const lastAssistant = output[lastAssistantIndex];
+      const existing = lastAssistant.thinkingParts || [];
+      lastAssistant.thinkingParts = existing.concat(pendingThinkingParts.splice(0));
+    };
 
-    const lastAssistant = assistantMessages[assistantMessages.length - 1];
-    const strongestAssistant = assistantMessages.reduce((best, current) => {
-      return assistantCandidateScore(current.content) > assistantCandidateScore(best.content) ? current : best;
-    }, assistantMessages[0]);
-    const finalAssistant =
-      assistantCandidateScore(lastAssistant.content) >= assistantCandidateScore(strongestAssistant.content) * 0.55
-        ? lastAssistant
-        : strongestAssistant;
-    const thinkingParts = segment
-      .filter((m) => m.id !== finalAssistant.id && m.role !== 'user')
-      .map((m) => {
-        const visible = (m.content || '').trim();
-        const content = visible ? m.content : summarizeMetadataOnlyStep(m);
-        return { id: m.id, role: m.role, content };
-      })
-      .filter((m) => !!m.content?.trim());
+    for (const message of segment) {
+      const visible = (message.content || '').trim();
 
-    output.push({
-      ...finalAssistant,
-      thinkingParts: thinkingParts.length > 0 ? thinkingParts : undefined,
-    });
+      if (message.role === 'user') {
+        flushPendingThinkingToLastAssistant();
+        if (visible) output.push({ ...message });
+        continue;
+      }
+
+      if (message.role === 'assistant' && visible) {
+        output.push({
+          ...message,
+          thinkingParts: pendingThinkingParts.length > 0 ? pendingThinkingParts.splice(0) : undefined,
+        });
+        lastAssistantIndex = output.length - 1;
+        continue;
+      }
+
+      const content = visible ? message.content : summarizeMetadataOnlyStep(message);
+      if (!content?.trim()) continue;
+      pendingThinkingParts.push({ id: message.id, role: message.role, content });
+    }
+
+    flushPendingThinkingToLastAssistant();
   };
 
   let segment: Message[] = [];
@@ -583,6 +740,50 @@ const countLines = (text: string) => {
   return 1 + (text.match(/\n/g)?.length || 0);
 };
 
+const findTextOccurrenceRect = (root: Element, query: string, occurrenceIndex: number): DOMRect | null => {
+  const needle = typeof query === 'string' ? query.trim().toLowerCase() : '';
+  if (!needle || occurrenceIndex < 0) return null;
+
+  let seen = 0;
+  const walker = document.createTreeWalker(
+    root,
+    NodeFilter.SHOW_TEXT,
+    {
+      acceptNode(node) {
+        const value = node.nodeValue || '';
+        if (!value.trim()) return NodeFilter.FILTER_REJECT;
+        const parent = node.parentElement;
+        if (!parent || parent.closest('script, style')) return NodeFilter.FILTER_REJECT;
+        return NodeFilter.FILTER_ACCEPT;
+      },
+    }
+  );
+
+  let node = walker.nextNode();
+  while (node) {
+    const value = node.nodeValue || '';
+    const lowerValue = value.toLowerCase();
+    let cursor = 0;
+    while (cursor < lowerValue.length) {
+      const idx = lowerValue.indexOf(needle, cursor);
+      if (idx === -1) break;
+      if (seen === occurrenceIndex) {
+        const range = document.createRange();
+        range.setStart(node, idx);
+        range.setEnd(node, idx + needle.length);
+        const rect = range.getClientRects()[0] || range.getBoundingClientRect();
+        range.detach();
+        return rect || null;
+      }
+      seen += 1;
+      cursor = idx + needle.length;
+    }
+    node = walker.nextNode();
+  }
+
+  return null;
+};
+
 const countRegexMatches = (text: string, pattern: RegExp) => {
   const matches = text.match(pattern);
   return matches ? matches.length : 0;
@@ -634,7 +835,7 @@ const ChatImage = ({ src, alt, conversationId, onOpenImage, ...props }: any) => 
   return <img src={resolvedSrc} alt={alt || 'Image'} loading="lazy" onError={handleError} onClick={handleClick} {...props} />;
 };
 
-const MarkdownMessage = memo(({ content, highlightQuery, conversationId, onOpenImage, citationRegistry }: { content: string, highlightQuery?: string, conversationId?: string, onOpenImage?: (src: string) => void, citationRegistry: Record<string, CitationEntry> }) => {
+const MarkdownMessage = memo(({ content, highlightQuery, highlightCodeBlocks, conversationId, onOpenImage, citationRegistry }: { content: string, highlightQuery?: string, highlightCodeBlocks?: boolean, conversationId?: string, onOpenImage?: (src: string) => void, citationRegistry: Record<string, CitationEntry> }) => {
   const query = highlightQuery || '';
   const rawContent = typeof content === 'string' ? content : String(content || '');
   const rawLineCount = useMemo(() => countLines(rawContent), [rawContent]);
@@ -652,6 +853,7 @@ const MarkdownMessage = memo(({ content, highlightQuery, conversationId, onOpenI
     && (rawLineCount >= MIN_PLAIN_LATEX_LINES || rawContent.length > 800);
   const safeRenderMode = rawContent.length > MAX_MARKDOWN_RENDER_CHARS || rawLineCount > MAX_MARKDOWN_RENDER_LINES;
   const effectiveQuery = mathComplexityHigh ? '' : query;
+  const codeSearchQuery = highlightCodeBlocks ? effectiveQuery : '';
   const safeFallbackContent = useMemo(() => {
     if (rawContent.length <= MAX_SAFE_FALLBACK_CHARS) return rawContent;
     return `${rawContent.slice(0, MAX_SAFE_FALLBACK_CHARS)}\n\n[truncated for performance]`;
@@ -707,10 +909,17 @@ const MarkdownMessage = memo(({ content, highlightQuery, conversationId, onOpenI
       const codeText = String(children).replace(/\n$/, '');
       const codeLineCount = countLines(codeText);
       const codeTooLarge = codeText.length > MAX_CODE_HIGHLIGHT_CHARS || codeLineCount > MAX_CODE_HIGHLIGHT_LINES;
+      const shouldHighlightCode = !!codeSearchQuery && !codeTooLarge;
       return !inline && match ? (
         codeTooLarge ? (
           <pre className="large-code-fallback">
             <code>{codeText.length <= MAX_SAFE_FALLBACK_CHARS ? codeText : `${codeText.slice(0, MAX_SAFE_FALLBACK_CHARS)}\n\n[truncated for performance]`}</code>
+          </pre>
+        ) : shouldHighlightCode ? (
+          <pre className={className}>
+            <code>
+              <HighlightText query={codeSearchQuery}>{codeText}</HighlightText>
+            </code>
           </pre>
         ) : (
           <SyntaxHighlighter
@@ -815,9 +1024,13 @@ const MarkdownMessage = memo(({ content, highlightQuery, conversationId, onOpenI
   );
 });
 
-const MessageRow = memo(({ msg, highlightQuery, isTarget, onOpenImage, citationRegistry }: { msg: DisplayMessage, highlightQuery?: string, isTarget?: boolean, onOpenImage?: (src: string) => void, citationRegistry: Record<string, CitationEntry> }) => {
+const MessageRow = memo(({ msg, highlightQuery, highlightCodeBlocks, isTarget, onOpenImage, citationRegistry, onSwitchBranch }: { msg: DisplayMessage, highlightQuery?: string, highlightCodeBlocks?: boolean, isTarget?: boolean, onOpenImage?: (src: string) => void, citationRegistry: Record<string, CitationEntry>, onSwitchBranch?: (parentId: string, childId: string) => void }) => {
   const hasThinking = msg.role === 'assistant' && !!msg.thinkingParts && msg.thinkingParts.length > 0;
   const [thinkingOpen, setThinkingOpen] = useState(false);
+  const branchInfo = msg.branchInfo;
+  const activeBranchIndex = branchInfo ? Math.max(0, branchInfo.options.findIndex((option) => option.childId === branchInfo.activeChildId)) : -1;
+  const canMoveBranchBackward = !!branchInfo && activeBranchIndex > 0;
+  const canMoveBranchForward = !!branchInfo && activeBranchIndex >= 0 && activeBranchIndex < branchInfo.options.length - 1;
 
   useEffect(() => {
     setThinkingOpen(false);
@@ -872,8 +1085,40 @@ const MessageRow = memo(({ msg, highlightQuery, isTarget, onOpenImage, citationR
           </div>
         ) : null}
         <div className="markdown-body">
-          <MarkdownMessage content={msg.content} highlightQuery={highlightQuery} conversationId={msg.conversation_id} onOpenImage={onOpenImage} citationRegistry={citationRegistry} />
+          <MarkdownMessage content={msg.content} highlightQuery={highlightQuery} highlightCodeBlocks={highlightCodeBlocks} conversationId={msg.conversation_id} onOpenImage={onOpenImage} citationRegistry={citationRegistry} />
         </div>
+        {branchInfo ? (
+          <div className="branch-switcher" aria-label="Branch switcher">
+            <button
+              type="button"
+              className="branch-switcher-btn"
+              onClick={() => {
+                if (!branchInfo || !canMoveBranchBackward || !onSwitchBranch) return;
+                onSwitchBranch(branchInfo.parentId, branchInfo.options[activeBranchIndex - 1].childId);
+              }}
+              disabled={!canMoveBranchBackward}
+              aria-label="Previous branch"
+            >
+              ‹
+            </button>
+            <div className="branch-switcher-label" title={branchInfo.options[activeBranchIndex]?.preview || ''}>
+              <span className="branch-switcher-count">Branch {activeBranchIndex + 1} of {branchInfo.options.length}</span>
+              <span className="branch-switcher-preview">{branchInfo.options[activeBranchIndex]?.preview || ''}</span>
+            </div>
+            <button
+              type="button"
+              className="branch-switcher-btn"
+              onClick={() => {
+                if (!branchInfo || !canMoveBranchForward || !onSwitchBranch) return;
+                onSwitchBranch(branchInfo.parentId, branchInfo.options[activeBranchIndex + 1].childId);
+              }}
+              disabled={!canMoveBranchForward}
+              aria-label="Next branch"
+            >
+              ›
+            </button>
+          </div>
+        ) : null}
       </div>
     </div>
   );
@@ -917,6 +1162,8 @@ function ChatGPTApp({ onGoHome, workspaceMode }: { onGoHome: () => void; workspa
   const [conversations, setConversations] = useState<Conversation[]>([]);
   const [activeConvId, setActiveConvId] = useState<string | null>(localStorage.getItem(lastConvStorageKey));
   const [messages, setMessages] = useState<Message[]>([]);
+  const [conversationCurrentNodeId, setConversationCurrentNodeId] = useState<string | null>(null);
+  const [branchSelectionsByConversation, setBranchSelectionsByConversation] = useState<Record<string, Record<string, string>>>({});
   const [isAuth, setIsAuth] = useState<boolean | null>(isAiMode ? true : null);
   const [isSyncing, setIsSyncing] = useState(false);
   const [selectedModel, setSelectedModel] = useState<string>(localStorage.getItem(selectedModelStorageKey) || 'Auto');
@@ -945,10 +1192,11 @@ function ChatGPTApp({ onGoHome, workspaceMode }: { onGoHome: () => void; workspa
 	  const [showSearch, setShowSearch] = useState(false);
 		  const [searchQuery, setSearchQuery] = useState('');
 		  const [mapSearchQuery, setMapSearchQuery] = useState('');
-		  const [searchResults, setSearchResults] = useState<any[]>([]);
-		  const [searchTotalCount, setSearchTotalCount] = useState(0);
-		  const [searchTotalIsLowerBound, setSearchTotalIsLowerBound] = useState(false);
+  const [searchResults, setSearchResults] = useState<any[]>([]);
+  const [searchTotalCount, setSearchTotalCount] = useState(0);
+  const [searchTotalIsLowerBound, setSearchTotalIsLowerBound] = useState(false);
   const [targetMessageId, setTargetMessageId] = useState<string | null>(null);
+  const [targetMatchOccurrenceInMessage, setTargetMatchOccurrenceInMessage] = useState<number | null>(null);
   const [activeHighlightQuery, setActiveHighlightQuery] = useState('');
   const [isSidebarOpen, setIsSidebarOpen] = useState<boolean>(() => localStorage.getItem('sidebarOpen') !== '0');
   const [isMessageMapOpen, setIsMessageMapOpen] = useState<boolean>(() => localStorage.getItem('messageMapOpen') !== '0');
@@ -1014,8 +1262,14 @@ function ChatGPTApp({ onGoHome, workspaceMode }: { onGoHome: () => void; workspa
   const invokeMode = useCallback((channel: string, payload: Record<string, unknown> = {}) => (
     window.electronAPI.invoke(channel, { ...payload, mode: workspaceMode })
   ), [workspaceMode]);
-  const displayMessages = useMemo(() => buildDisplayMessages(messages), [messages]);
-  const citationRegistry = useMemo(() => buildCitationRegistry(messages), [messages]);
+  const activeBranchSelections = useMemo(() => (
+    activeConvId ? (branchSelectionsByConversation[activeConvId] || {}) : {}
+  ), [activeConvId, branchSelectionsByConversation]);
+  const { pathMessages } = useMemo(() => (
+    buildLinearConversationPath(messages, conversationCurrentNodeId, activeBranchSelections)
+  ), [messages, conversationCurrentNodeId, activeBranchSelections]);
+  const displayMessages = useMemo(() => buildDisplayMessages(pathMessages), [pathMessages]);
+  const citationRegistry = useMemo(() => buildCitationRegistry(pathMessages), [pathMessages]);
   const isBridgeReadyForActiveConversation = useMemo(() => {
     if (isAiMode) return false;
     if (!bridgeComposerStatus?.ready) return false;
@@ -1128,6 +1382,30 @@ function ChatGPTApp({ onGoHome, workspaceMode }: { onGoHome: () => void; workspa
     }
     return matches;
   }, [mapSearchRegex, navigationMessages]);
+  const matchingNavigationMessages = useMemo(() => (
+    navigationMessages.filter((msg) => mapMatchMessageIds.has(msg.id))
+  ), [navigationMessages, mapMatchMessageIds]);
+  const matchingOccurrences = useMemo(() => {
+    if (!mapSearchNeedleActive) return [] as Array<{ messageId: string; occurrenceInMessage: number }>;
+    const needleLower = mapSearchNeedleActive.toLowerCase();
+    const occurrences: Array<{ messageId: string; occurrenceInMessage: number }> = [];
+    for (const msg of matchingNavigationMessages) {
+      const count = countNeedleHits(msg.content || '', needleLower);
+      for (let occurrenceIndex = 0; occurrenceIndex < count; occurrenceIndex += 1) {
+        occurrences.push({ messageId: msg.id, occurrenceInMessage: occurrenceIndex });
+      }
+    }
+    return occurrences;
+  }, [mapSearchNeedleActive, matchingNavigationMessages]);
+  const currentMatchIndex = useMemo(() => {
+    if (!targetMessageId) return -1;
+    const targetOccurrence = targetMatchOccurrenceInMessage ?? 0;
+    return matchingOccurrences.findIndex((entry) => (
+      entry.messageId === targetMessageId && entry.occurrenceInMessage === targetOccurrence
+    ));
+  }, [matchingOccurrences, targetMatchOccurrenceInMessage, targetMessageId]);
+  const mapMatchCount = matchingOccurrences.length;
+  const mapMatchPosition = currentMatchIndex >= 0 ? currentMatchIndex + 1 : (mapMatchCount > 0 ? 1 : 0);
   const activeMapMessageIds = useMemo(() => (
     isMessageMapOpen
       ? new Set(viewportVisibleMessageIds)
@@ -1268,25 +1546,44 @@ function ChatGPTApp({ onGoHome, workspaceMode }: { onGoHome: () => void; workspa
     });
   }, []);
 
-  const refreshConversationListOnSwitch = useCallback(() => {
+  const loadConversationState = useCallback(async (conversationId: string) => {
+    return invokeMode('db:getConversationState', { conversationId });
+  }, [invokeMode]);
+
+  const handleSwitchBranch = useCallback((parentId: string, childId: string) => {
+    if (!activeConvId) return;
+    setBranchSelectionsByConversation((prev) => ({
+      ...prev,
+      [activeConvId]: {
+        ...(prev[activeConvId] || {}),
+        [parentId]: childId,
+      },
+    }));
+  }, [activeConvId]);
+
+  const refreshConversationList = useCallback(async (force = false) => {
     if (isAiMode || conversationListSyncInFlightRef.current) return;
-    if (Date.now() - lastConversationListSyncAtRef.current < 30000) return;
+    if (!force && Date.now() - lastConversationListSyncAtRef.current < 30000) return;
 
     conversationListSyncInFlightRef.current = true;
     lastConversationListSyncAtRef.current = Date.now();
-    invokeMode('api:syncConversations', { offset: 0, limit: 20 })
-      .then(async (result) => {
-        if (Array.isArray(result?.conversations)) {
-          setConversations(result.conversations);
-        }
-        setHasMoreConvs(!!result?.hasMore);
-        await updateCacheDiagnosticsRef.current();
-      })
-      .catch((error) => console.error('Failed to refresh conversation list after switching chats', error))
-      .finally(() => {
-        conversationListSyncInFlightRef.current = false;
-      });
+    try {
+      const result = await invokeMode('api:syncConversations', { offset: 0, limit: 20 });
+      if (Array.isArray(result?.conversations)) {
+        setConversations(result.conversations);
+      }
+      setHasMoreConvs(!!result?.hasMore);
+      await updateCacheDiagnosticsRef.current();
+    } catch (error) {
+      console.error('Failed to refresh conversation list', error);
+    } finally {
+      conversationListSyncInFlightRef.current = false;
+    }
   }, [invokeMode, isAiMode]);
+
+  const refreshConversationListOnSwitch = useCallback(() => {
+    void refreshConversationList(false);
+  }, [refreshConversationList]);
 
   const selectConversation = useCallback(async (id: string, forceSync = false, shouldSync = false) => {
     if (id === activeConvIdRef.current && !forceSync && !dirtyConversationIds.has(id)) return;
@@ -1300,16 +1597,19 @@ function ChatGPTApp({ onGoHome, workspaceMode }: { onGoHome: () => void; workspa
     setRestoreVirtuosoState(virtuosoStateByConversationRef.current[id] || null);
     setActiveConvId(id);
     activeConvIdRef.current = id;
-    const localMsgs = await invokeMode('db:getMessages', { conversationId: id });
+    const localState = await loadConversationState(id);
+    const localMsgs: Message[] = Array.isArray(localState?.allMessages) ? localState.allMessages : [];
+    const localCurrentMsgs: Message[] = Array.isArray(localState?.currentMessages) ? localState.currentMessages : [];
     if (activeConvIdRef.current !== id || conversationSelectionTokenRef.current !== selectionToken) return;
     setMessages(localMsgs);
+    setConversationCurrentNodeId(localState?.currentNodeId || null);
     if (Array.isArray(localMsgs) && localMsgs.length > 0) {
       clearUncachedConversationMarker(id);
     }
-    if (forceSync && localMsgs.length > 0) {
+    if (forceSync && localCurrentMsgs.length > 0) {
       setTimeout(() => {
         if (activeConvIdRef.current !== id) return;
-        virtuosoRef.current?.scrollToIndex({ index: localMsgs.length - 1, align: 'end', behavior: 'auto' });
+        virtuosoRef.current?.scrollToIndex({ index: localCurrentMsgs.length - 1, align: 'end', behavior: 'auto' });
       }, 0);
     }
     const isDirty = dirtyConversationIds.has(id);
@@ -1325,17 +1625,20 @@ function ChatGPTApp({ onGoHome, workspaceMode }: { onGoHome: () => void; workspa
     setIsSyncing(true);
     try {
       await invokeMode('api:syncMessages', { conversationId: id, force: forceSync || isDirty });
-      const syncedMsgs: Message[] = await invokeMode('db:getMessages', { conversationId: id });
+      const syncedState = await loadConversationState(id);
+      const syncedMsgs: Message[] = Array.isArray(syncedState?.allMessages) ? syncedState.allMessages : [];
+      const syncedCurrentMsgs: Message[] = Array.isArray(syncedState?.currentMessages) ? syncedState.currentMessages : [];
       if (activeConvIdRef.current === id && conversationSelectionTokenRef.current === selectionToken) {
         setMessages(syncedMsgs);
+        setConversationCurrentNodeId(syncedState?.currentNodeId || null);
         if (Array.isArray(syncedMsgs) && syncedMsgs.length > 0) {
           clearUncachedConversationMarker(id);
           clearDirtyConversationMarker(id);
         }
-        if ((forceSync || isDirty) && syncedMsgs.length > 0) {
+        if ((forceSync || isDirty) && syncedCurrentMsgs.length > 0) {
           setTimeout(() => {
             if (activeConvIdRef.current !== id) return;
-            virtuosoRef.current?.scrollToIndex({ index: syncedMsgs.length - 1, align: 'end', behavior: 'auto' });
+            virtuosoRef.current?.scrollToIndex({ index: syncedCurrentMsgs.length - 1, align: 'end', behavior: 'auto' });
           }, 0);
         }
       }
@@ -1346,7 +1649,7 @@ function ChatGPTApp({ onGoHome, workspaceMode }: { onGoHome: () => void; workspa
         setIsSyncing(false);
       }
     }
-  }, [clearDirtyConversationMarker, clearUncachedConversationMarker, dirtyConversationIds, invokeMode, isAiMode, refreshConversationListOnSwitch, saveVirtuosoState]);
+  }, [clearDirtyConversationMarker, clearUncachedConversationMarker, dirtyConversationIds, invokeMode, isAiMode, loadConversationState, refreshConversationListOnSwitch, saveVirtuosoState]);
   selectConversationRef.current = selectConversation;
 
   const handleReauth = useCallback(async () => {
@@ -1375,8 +1678,17 @@ function ChatGPTApp({ onGoHome, workspaceMode }: { onGoHome: () => void; workspa
   const handleRefreshCurrentChat = useCallback(async () => {
     const conversationId = activeConvIdRef.current;
     if (!conversationId) return;
+    if (!isAiMode) {
+      try {
+        await invokeMode('api:prewarmConversation', { conversationId, forceReload: true });
+      } catch (error) {
+        console.warn('Bridge refresh prewarm failed:', error);
+      }
+    }
+    await refreshConversationList(true);
     await selectConversation(conversationId, true, true);
-  }, [selectConversation]);
+    await updateCacheDiagnosticsRef.current();
+  }, [invokeMode, isAiMode, refreshConversationList, selectConversation]);
 
   const handleSend = async () => {
     if (isAiMode) {
@@ -1396,7 +1708,7 @@ function ChatGPTApp({ onGoHome, workspaceMode }: { onGoHome: () => void; workspa
       'Auto': 'auto', 'Instant 5.3': 'gpt-4o', 'Thinking 5.4 Standard': 'o1-mini',
       'Thinking 5.4 Extended': 'o1', 'Thinking 5.5 Standard': 'o3-mini', 'Thinking 5.5 Extended': 'o1',
     };
-    const baselineMessageIds = new Set(messages.map((m) => m.id));
+    const baselineMessageIds = new Set(pathMessages.map((m) => m.id));
     
     setSendError(null);
     setIsSending(true);
@@ -1414,7 +1726,7 @@ function ChatGPTApp({ onGoHome, workspaceMode }: { onGoHome: () => void; workspa
       role: 'user',
       content: outgoingContent,
       created_at: Date.now() / 1000,
-      parent_id: messages.length > 0 ? messages[messages.length - 1].id : undefined,
+      parent_id: pathMessages.length > 0 ? pathMessages[pathMessages.length - 1].id : undefined,
     };
     
     // Add to list immediately
@@ -1442,12 +1754,15 @@ function ChatGPTApp({ onGoHome, workspaceMode }: { onGoHome: () => void; workspa
         let lastAssistantFingerprint = '';
 
         while (Date.now() < syncDeadline) {
-          const synced = await invokeMode('api:syncMessages', { conversationId: activeConvId, force: true });
-          latestMsgs = Array.isArray(synced) ? synced : [];
+          await invokeMode('api:syncMessages', { conversationId: activeConvId, force: true });
+          const syncedState = await loadConversationState(activeConvId);
+          latestMsgs = Array.isArray(syncedState?.currentMessages) ? syncedState.currentMessages : [];
           setMessages((prev) => {
-            if (JSON.stringify(prev) === JSON.stringify(latestMsgs)) return prev;
-            return latestMsgs;
+            const nextRawMessages = Array.isArray(syncedState?.allMessages) ? syncedState.allMessages : [];
+            if (JSON.stringify(prev) === JSON.stringify(nextRawMessages)) return prev;
+            return nextRawMessages;
           });
+          setConversationCurrentNodeId(syncedState?.currentNodeId || null);
 
           const lastAssistant = [...latestMsgs].reverse().find((m) => m.role === 'assistant');
           const assistantFingerprint = lastAssistant
@@ -1566,18 +1881,20 @@ function ChatGPTApp({ onGoHome, workspaceMode }: { onGoHome: () => void; workspa
   const jumpToMessage = (e: React.MouseEvent, convId: string, msgId: string) => {
     e.stopPropagation();
     setTargetMessageId(msgId);
+    setTargetMatchOccurrenceInMessage(0);
     setActiveHighlightQuery(searchQuery);
     selectConversation(convId);
     setShowSearch(false);
   };
 
-  const jumpToMessageInCurrentChat = useCallback((msgId: string) => {
+  const jumpToMessageInCurrentChat = useCallback((msgId: string, occurrenceInMessage = 0) => {
     const rowIndex = navigationMessages.findIndex((msg) => msg.id === msgId);
     const target = rowIndex >= 0 ? navigationMessages[rowIndex] : null;
     const targetContent = target?.content || '';
     const scrollerTop = scrollerRef.current ? Math.round(scrollerRef.current.scrollTop) : null;
     pushOomDebug('map-jump-click', {
       msgId,
+      occurrenceInMessage,
       rowIndex,
       scrollerTop,
       mapQueryLen: mapSearchQuery.length,
@@ -1589,8 +1906,21 @@ function ChatGPTApp({ onGoHome, workspaceMode }: { onGoHome: () => void; workspa
     pendingJumpRef.current = { msgId, startedAt: Date.now() };
     setViewportVisibleMessageIds([msgId]);
     setTargetMessageId(msgId);
+    setTargetMatchOccurrenceInMessage(occurrenceInMessage);
     setActiveHighlightQuery('');
   }, [mapSearchQuery.length, navigationMessages, pushOomDebug, viewportVisibleMessageIds.length]);
+  const jumpToRelativeMapMatch = useCallback((direction: 1 | -1) => {
+    if (matchingOccurrences.length === 0) return;
+    if (currentMatchIndex === -1) {
+      const fallbackIndex = direction > 0 ? 0 : matchingOccurrences.length - 1;
+      const fallback = matchingOccurrences[fallbackIndex];
+      jumpToMessageInCurrentChat(fallback.messageId, fallback.occurrenceInMessage);
+      return;
+    }
+    const nextIndex = (currentMatchIndex + direction + matchingOccurrences.length) % matchingOccurrences.length;
+    const next = matchingOccurrences[nextIndex];
+    jumpToMessageInCurrentChat(next.messageId, next.occurrenceInMessage);
+  }, [currentMatchIndex, jumpToMessageInCurrentChat, matchingOccurrences]);
 
   const handleDeleteConversation = async (id: string) => {
     if (window.confirm('Permanently delete this chat from your local database?')) {
@@ -1598,6 +1928,7 @@ function ChatGPTApp({ onGoHome, workspaceMode }: { onGoHome: () => void; workspa
       if (activeConvId === id) {
         setActiveConvId(null);
         setMessages([]);
+        setConversationCurrentNodeId(null);
       }
       setConversationContextMenu(null);
       loadConversations();
@@ -1762,7 +2093,11 @@ function ChatGPTApp({ onGoHome, workspaceMode }: { onGoHome: () => void; workspa
         const index = displayMessages.findIndex(m => m.id === targetMessageId);
         if (index !== -1) {
           const timer = setTimeout(() => {
-            virtuosoRef.current?.scrollToIndex({ index, align: 'start', behavior: 'auto' });
+            const escapedId = typeof CSS !== 'undefined' && typeof CSS.escape === 'function'
+              ? CSS.escape(targetMessageId)
+              : targetMessageId.replace(/"/g, '\\"');
+            if (document.querySelector(`.message-row[data-message-id="${escapedId}"]`)) return;
+            virtuosoRef.current?.scrollToIndex({ index, align: 'center', behavior: 'auto' });
             hasScrolledToBottomRef.current[activeConvId] = true;
           }, 150);
           return () => clearTimeout(timer);
@@ -1772,12 +2107,64 @@ function ChatGPTApp({ onGoHome, workspaceMode }: { onGoHome: () => void; workspa
   }, [displayMessages, activeConvId, targetMessageId]);
 
   useEffect(() => {
+    if (!targetMessageId || targetMatchOccurrenceInMessage == null) return;
+    let cancelled = false;
+    let timer: number | null = null;
+    const startedAt = Date.now();
+    const scrollToActiveMark = () => {
+      if (cancelled) return;
+      const escapedId = typeof CSS !== 'undefined' && typeof CSS.escape === 'function'
+        ? CSS.escape(targetMessageId)
+        : targetMessageId.replace(/"/g, '\\"');
+      const row = document.querySelector(`.message-row[data-message-id="${escapedId}"]`);
+      if (!row) {
+        if (Date.now() - startedAt < 1000) timer = window.setTimeout(scrollToActiveMark, 60);
+        return;
+      }
+      document.querySelectorAll('mark.chat-highlight.active-match').forEach((node) => {
+        node.classList.remove('active-match');
+      });
+      const marks = row.querySelectorAll('mark.chat-highlight');
+      const targetMark = marks.item(targetMatchOccurrenceInMessage) as HTMLElement | null;
+      const messageBody = row.querySelector('.message-content > .markdown-body') || row;
+      const textRect = mapSearchNeedleActive
+        ? findTextOccurrenceRect(messageBody, mapSearchNeedleActive, targetMatchOccurrenceInMessage)
+        : null;
+      const targetRect = textRect || targetMark?.getBoundingClientRect() || null;
+      if (!targetRect) {
+        if (Date.now() - startedAt < 1000) timer = window.setTimeout(scrollToActiveMark, 60);
+        return;
+      }
+      if (targetMark) targetMark.classList.add('active-match');
+      const scroller = scrollerRef.current;
+      if (scroller) {
+        const scrollerRect = scroller.getBoundingClientRect();
+        const nextTop = scroller.scrollTop
+          + (targetRect.top - scrollerRect.top)
+          - (scroller.clientHeight / 2)
+          + (targetRect.height / 2);
+        scroller.scrollTo({ top: Math.max(0, nextTop), behavior: 'auto' });
+      } else {
+        targetMark?.scrollIntoView({ block: 'center', inline: 'nearest', behavior: 'auto' });
+      }
+    };
+    timer = window.setTimeout(scrollToActiveMark, 40);
+    return () => {
+      cancelled = true;
+      if (timer != null) window.clearTimeout(timer);
+    };
+  }, [displayMessages, mapSearchNeedleActive, targetMatchOccurrenceInMessage, targetMessageId]);
+
+  useEffect(() => {
     let timer: number;
     const clearHighlight = (e: MouseEvent) => {
-      if (e.button === 0) {
-        setTargetMessageId(null);
-        setActiveHighlightQuery('');
-      }
+      if (e.button !== 0) return;
+      const target = e.target as Element | null;
+      if (target?.closest('.content-nav-item')) return;
+      if (target?.closest('.content-nav-search')) return;
+      setTargetMessageId(null);
+      setTargetMatchOccurrenceInMessage(null);
+      setActiveHighlightQuery('');
     };
     if (targetMessageId) {
       timer = window.setTimeout(() => {
@@ -2350,6 +2737,7 @@ function ChatGPTApp({ onGoHome, workspaceMode }: { onGoHome: () => void; workspa
                 saveVirtuosoState(activeConvIdRef.current);
                 setActiveConvId(null);
                 setMessages([]);
+                setConversationCurrentNodeId(null);
                 activeConvIdRef.current = null;
                 setRestoreVirtuosoState(null);
                 if (!isAiMode) {
@@ -2496,14 +2884,17 @@ function ChatGPTApp({ onGoHome, workspaceMode }: { onGoHome: () => void; workspa
                     ? countNeedleHits(msg.content || '', mapHighlightQuery.toLowerCase()) <= MAX_MESSAGE_HIGHLIGHT_HITS
                     : true;
                   const highlightQuery = (shouldMapHighlight && messageIsHighlightSafe) ? mapHighlightQuery : (isTarget ? activeHighlightQuery : '');
+                  const highlightCodeBlocks = isTarget && shouldMapHighlight && messageIsHighlightSafe;
                   return (
                     <MessageRow
                       key={msg.id}
                       msg={msg}
                       highlightQuery={highlightQuery}
+                      highlightCodeBlocks={highlightCodeBlocks}
                       isTarget={isTarget}
                       onOpenImage={setFullscreenImage}
                       citationRegistry={citationRegistry}
+                      onSwitchBranch={handleSwitchBranch}
                     />
                   );
                 }}
@@ -2546,52 +2937,90 @@ function ChatGPTApp({ onGoHome, workspaceMode }: { onGoHome: () => void; workspa
               ))}
             </div>
             <div className="content-nav-search">
-              <input
-                type="text"
-                className="content-nav-search-input"
-                placeholder="Find in this chat..."
-                value={mapSearchQuery}
-                onMouseDown={(e) => {
-                  if (e.button === 1) e.preventDefault();
-                }}
-                onAuxClick={(e) => {
-                  if (e.button === 1) e.preventDefault();
-                }}
-                onPaste={(e) => {
-                  const text = e.clipboardData?.getData('text') || '';
-                  if (!text) return;
-                  e.preventDefault();
-                  const next = sanitizeMapSearchQuery(text);
-                  if (text.length > MAX_MAP_SEARCH_QUERY_LEN) {
-                    pushOomDebug('map-search-truncated', {
-                      rawLen: text.length,
-                      keptLen: next.length,
+              <div className="content-nav-search-row">
+                <input
+                  type="text"
+                  className="content-nav-search-input"
+                  placeholder="Find in this chat..."
+                  value={mapSearchQuery}
+                  onMouseDown={(e) => {
+                    if (e.button === 1) e.preventDefault();
+                  }}
+                  onAuxClick={(e) => {
+                    if (e.button === 1) e.preventDefault();
+                  }}
+                  onPaste={(e) => {
+                    const text = e.clipboardData?.getData('text') || '';
+                    if (!text) return;
+                    e.preventDefault();
+                    const next = sanitizeMapSearchQuery(text);
+                    if (text.length > MAX_MAP_SEARCH_QUERY_LEN) {
+                      pushOomDebug('map-search-truncated', {
+                        rawLen: text.length,
+                        keptLen: next.length,
+                        source: 'paste',
+                      });
+                    }
+                    pushOomDebug('map-search-change', {
+                      queryLen: next.length,
+                      navCount: navigationMessages.length,
                       source: 'paste',
                     });
-                  }
-                  pushOomDebug('map-search-change', {
-                    queryLen: next.length,
-                    navCount: navigationMessages.length,
-                    source: 'paste',
-                  });
-                  setMapSearchQuery(next);
-                }}
-                onChange={(e) => {
-                  const rawNext = e.target.value;
-                  const next = sanitizeMapSearchQuery(rawNext);
-                  if (rawNext.length > MAX_MAP_SEARCH_QUERY_LEN) {
-                    pushOomDebug('map-search-truncated', {
-                      rawLen: rawNext.length,
-                      keptLen: next.length,
+                    setMapSearchQuery(next);
+                    setTargetMessageId(null);
+                    setTargetMatchOccurrenceInMessage(null);
+                  }}
+                  onChange={(e) => {
+                    const rawNext = e.target.value;
+                    const next = sanitizeMapSearchQuery(rawNext);
+                    if (rawNext.length > MAX_MAP_SEARCH_QUERY_LEN) {
+                      pushOomDebug('map-search-truncated', {
+                        rawLen: rawNext.length,
+                        keptLen: next.length,
+                      });
+                    }
+                    pushOomDebug('map-search-change', {
+                      queryLen: next.length,
+                      navCount: navigationMessages.length,
                     });
-                  }
-                  pushOomDebug('map-search-change', {
-                    queryLen: next.length,
-                    navCount: navigationMessages.length,
-                  });
-                  setMapSearchQuery(next);
-                }}
-              />
+                    setMapSearchQuery(next);
+                    setTargetMessageId(null);
+                    setTargetMatchOccurrenceInMessage(null);
+                  }}
+                  onKeyDown={(e) => {
+                    if (e.key !== 'Enter') return;
+                    e.preventDefault();
+                    jumpToRelativeMapMatch(e.shiftKey ? -1 : 1);
+                  }}
+                />
+                <div className="content-nav-search-tools">
+                  <span className="content-nav-search-count" title={mapSearchQuery.trim() ? 'Current match / total matching messages' : 'Enter at least 2 characters to search'}>
+                    {mapSearchQuery.trim().length >= 2 ? `${mapMatchPosition}/${mapMatchCount}` : '0/0'}
+                  </span>
+                  <div className="content-nav-search-nav-stack">
+                    <button
+                      type="button"
+                      className="content-nav-search-nav"
+                      onClick={() => jumpToRelativeMapMatch(-1)}
+                      disabled={mapMatchCount === 0}
+                      title="Previous match"
+                      aria-label="Previous match"
+                    >
+                      ▲
+                    </button>
+                    <button
+                      type="button"
+                      className="content-nav-search-nav"
+                      onClick={() => jumpToRelativeMapMatch(1)}
+                      disabled={mapMatchCount === 0}
+                      title="Next match"
+                      aria-label="Next match"
+                    >
+                      ▼
+                    </button>
+                  </div>
+                </div>
+              </div>
             </div>
           </aside>
         </div>

@@ -586,13 +586,27 @@ async function ensureBridgeWindow() {
   return bridgeWindow;
 }
 
-async function navigateBridgeTo(url) {
+async function navigateBridgeTo(url, options = {}) {
   const win = await ensureBridgeWindow();
   const homeUrl = 'https://chatgpt.com/';
   const targetUrl = url || homeUrl;
   const currentUrl = win.webContents.getURL();
+  const forceReload = !!options.forceReload;
 
   if (currentUrl && normalizeChatgptUrl(currentUrl) === normalizeChatgptUrl(targetUrl)) {
+    if (forceReload) {
+      try {
+        await new Promise((resolve) => {
+          const done = () => resolve();
+          const timer = setTimeout(done, 12000);
+          win.webContents.once('did-finish-load', () => {
+            clearTimeout(timer);
+            done();
+          });
+          win.webContents.reloadIgnoringCache();
+        });
+      } catch {}
+    }
     await installBridgeFastMode(win);
     return win;
   }
@@ -1153,7 +1167,7 @@ async function waitForBridgeSendReady(win) {
   return { ok: false, reason: 'Send button stayed disabled/busy after attachments/text update' };
 }
 
-async function prewarmBridgeConversation(conversationId) {
+async function prewarmBridgeConversation(conversationId, options = {}) {
   const normalizedConversationId = conversationId || null;
   const warmToken = ++bridgeWarmRequestToken;
   publishBridgeComposerStatus({
@@ -1168,7 +1182,7 @@ async function prewarmBridgeConversation(conversationId) {
     : 'https://chatgpt.com/';
 
   try {
-    const win = await navigateBridgeTo(targetUrl);
+    const win = await navigateBridgeTo(targetUrl, options);
     if (shouldShowBridgeWindow()) {
       try {
         if (win.isMinimized()) win.restore();
@@ -1786,13 +1800,121 @@ function createWindow() {
 
 function getLinearMessages(conversationId, dbInstance = db) {
   const conv = dbInstance.getConversation(conversationId);
+  const allMessages = dbInstance.getMessages(conversationId);
 
   if (!conv || !conv.current_node_id) {
-    return dbInstance.getMessages(conversationId);
+    return allMessages;
   }
 
   const path = dbInstance.getLinearPath(conv.current_node_id);
+  const isVisibleMessage = (msg) => (
+    msg
+    && (msg.role === 'user' || msg.role === 'assistant')
+    && typeof msg.content === 'string'
+    && msg.content.trim()
+  );
+  const visibleAllCount = allMessages.filter(isVisibleMessage).length;
+  const visiblePathCount = path.filter(isVisibleMessage).length;
+  if (
+    visibleAllCount >= 8
+    && visiblePathCount > 0
+    && visiblePathCount < Math.max(4, Math.floor(visibleAllCount * 0.55))
+  ) {
+    return allMessages;
+  }
+  if (
+    visibleAllCount >= 100
+    && visiblePathCount > 0
+    && (visibleAllCount - visiblePathCount) >= 20
+  ) {
+    return allMessages;
+  }
   return path;
+}
+
+function normalizeComparableMessageContent(value) {
+  return String(value || '')
+    .toLowerCase()
+    .replace(/\u00a0/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function buildOrderedVisibleTurnsFromConversationData(data, conversationId) {
+  if (!data || typeof data !== 'object' || !data.mapping || typeof data.mapping !== 'object' || !data.current_node) {
+    return [];
+  }
+  const mapping = data.mapping;
+  const chain = [];
+  const visited = new Set();
+  let nodeId = data.current_node;
+  let guard = 0;
+  while (nodeId && mapping[nodeId] && !visited.has(nodeId) && guard < 12000) {
+    visited.add(nodeId);
+    chain.push(mapping[nodeId]);
+    nodeId = mapping[nodeId]?.parent || null;
+    guard += 1;
+  }
+  chain.reverse();
+  return chain
+    .filter((node) => node && node.message)
+    .map((node) => {
+      const role = node.message.author?.role || 'assistant';
+      const content = renderMessageContent(node.message, conversationId);
+      return {
+        role: role === 'assistant' ? 'assistant' : 'user',
+        content: String(content || '').trim(),
+      };
+    })
+    .filter((turn) => turn.content);
+}
+
+function shouldPreserveCachedConversationSnapshot(existingMessages, remoteTurns) {
+  const existingVisible = (Array.isArray(existingMessages) ? existingMessages : [])
+    .filter((m) => m && (m.role === 'user' || m.role === 'assistant') && String(m.content || '').trim());
+  const remoteVisible = (Array.isArray(remoteTurns) ? remoteTurns : [])
+    .filter((m) => m && (m.role === 'user' || m.role === 'assistant') && String(m.content || '').trim());
+
+  if (remoteVisible.length === 0) return existingVisible.length > 0;
+
+  const existingFingerprints = new Set(
+    existingVisible.map((m) => `${m.role}|${normalizeComparableMessageContent(m.content)}`)
+      .filter((fp) => fp && !fp.endsWith('|'))
+  );
+  const remoteFingerprints = new Set(
+    remoteVisible.map((m) => `${m.role}|${normalizeComparableMessageContent(m.content)}`)
+      .filter((fp) => fp && !fp.endsWith('|'))
+  );
+  const existingCount = existingFingerprints.size;
+  const remoteCount = remoteFingerprints.size;
+  const existingLinearCount = existingVisible.length;
+  const duplicateBloatRatio = existingCount > 0 ? (existingLinearCount / existingCount) : 1;
+  const hasDuplicateBloat = duplicateBloatRatio >= 1.5;
+
+  if (!hasDuplicateBloat && existingCount >= 6 && remoteCount > 0 && remoteCount < Math.max(4, Math.floor(existingCount * 0.55))) {
+    return true;
+  }
+
+  if (remoteCount <= 2 && existingCount > 2) return true;
+
+  const interruptedMarker = 'connection interrupted. waiting for the complete answer';
+  const hasInterruptedMarker = remoteVisible.some((m) => normalizeComparableMessageContent(m.content).includes(interruptedMarker));
+  if (hasInterruptedMarker && existingCount >= remoteCount) return true;
+
+  const recentExistingTail = existingVisible.slice(-Math.min(12, existingVisible.length));
+  const remotePrefixMatchesExistingTail = (
+    remoteVisible.length >= 3
+    && recentExistingTail.length >= remoteVisible.length
+    && remoteVisible.every((remoteTurn, idx) => {
+      const existingTurn = recentExistingTail[idx];
+      return existingTurn
+        && existingTurn.role === remoteTurn.role
+        && normalizeComparableMessageContent(existingTurn.content) === normalizeComparableMessageContent(remoteTurn.content);
+    })
+  );
+  if (remotePrefixMatchesExistingTail && existingCount > remoteCount) return true;
+
+  return false;
 }
 
 function sleep(ms) {
@@ -3012,9 +3134,16 @@ function setupIpc() {
         }
 
         const data = await response.json();
-        if (!data.mapping) {
+        if (!data.mapping || !data.current_node) {
           db.upsertCacheFailure(conv.id, 'Conversation has no mapping payload', response.status);
           return { success: false, status: response.status };
+        }
+
+        const existingMessages = getLinearMessages(conv.id);
+        const remoteTurns = buildOrderedVisibleTurnsFromConversationData(data, conv.id);
+        if (shouldPreserveCachedConversationSnapshot(existingMessages, remoteTurns)) {
+          db.upsertCacheFailure(conv.id, 'Preserved cached conversation because remote snapshot looked partial or interrupted', 200);
+          return { success: false, status: 200, preservedCached: true };
         }
 
         let wroteAnyMessage = false;
@@ -3226,11 +3355,28 @@ function setupIpc() {
     return getLinearMessages(conversationId, targetDb);
   });
 
+  ipcMain.handle('db:getConversationState', async (event, arg1, arg2) => {
+    const conversationId = typeof arg1 === 'object' ? arg1?.conversationId : arg1;
+    const mode = typeof arg1 === 'object' ? arg1?.mode : arg2;
+    if (!conversationId) throw new Error('Missing conversationId');
+    const targetDb = getDatabaseForMode(mode);
+    const conversation = targetDb.getConversation(conversationId) || null;
+    const allMessages = targetDb.getMessages(conversationId);
+    const currentMessages = getLinearMessages(conversationId, targetDb);
+    return {
+      conversation,
+      currentNodeId: conversation?.current_node_id || null,
+      allMessages,
+      currentMessages,
+    };
+  });
+
   ipcMain.handle('api:prewarmConversation', async (event, payload) => {
     const conversationId = typeof payload === 'string'
       ? payload
       : (payload?.conversationId || null);
     const mode = typeof payload === 'object' ? payload?.mode : undefined;
+    const forceReload = typeof payload === 'object' ? !!payload?.forceReload : false;
     if (normalizeWorkspaceMode(mode) === 'aimode') {
       if (!conversationId) {
         return { success: false, reason: 'Missing AI Mode conversation id' };
@@ -3250,7 +3396,7 @@ function setupIpc() {
         return { success: false, reason: String(error?.message || error) };
       }
     }
-    return prewarmBridgeConversation(conversationId);
+    return prewarmBridgeConversation(conversationId, { forceReload });
   });
 
   ipcMain.handle('api:getBridgeComposerStatus', async () => {
@@ -3676,7 +3822,13 @@ function setupIpc() {
     try {
       const response = await auth.fetchWithAuth(`https://chatgpt.com/backend-api/conversation/${conversationId}`);
       const data = await response.json();
-      if (data.mapping) {
+      if (data.mapping && data.current_node) {
+        const existingMessages = getLinearMessages(conversationId);
+        const remoteTurns = buildOrderedVisibleTurnsFromConversationData(data, conversationId);
+        if (shouldPreserveCachedConversationSnapshot(existingMessages, remoteTurns)) {
+          lastSync.set(conversationId, now);
+          return existingMessages;
+        }
         db.db.transaction(() => {
           const existingConv = db.getConversation(conversationId);
           if (existingConv) {
@@ -3705,8 +3857,8 @@ function setupIpc() {
       }
       return getLinearMessages(conversationId);
     } catch (error) {
-      console.error('Message sync failed:', error);
-      throw error;
+      console.warn('Message sync failed; using cached messages:', error);
+      return getLinearMessages(conversationId);
     }
   });
 }

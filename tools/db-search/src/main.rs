@@ -2,9 +2,11 @@ use std::collections::{HashMap, HashSet};
 use std::env;
 use std::io::{self, BufRead, Write};
 
-use db_search::query::SearchQuery;
-use db_search::sqlite_fts::{FtsIndexConfig, SearchMode, prepare_fts_query};
-use fuzzy_rank::message::{MessageCandidate, MessageQuery, sort_matches};
+mod db_search;
+
+use crate::db_search::query::SearchQuery;
+use crate::db_search::sqlite_fts::{FtsIndexConfig, SearchMode, prepare_fts_query};
+use fuzzy_rank::fields::literal::{MessageCandidate, MessageField, MessageQuery, select_top_k};
 use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
 
@@ -48,7 +50,6 @@ struct ServerResponse {
 struct RankedSearchRow {
     row: SearchRow,
     score: f64,
-    searchable_text: String,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -230,49 +231,43 @@ fn search_messages(
         });
     };
 
-    let key_strings = raw_rows
-        .iter()
-        .map(|item| item.row.id.clone())
-        .collect::<Vec<_>>();
-    let index_by_key = key_strings
+    let index_by_key = raw_rows
         .iter()
         .enumerate()
-        .map(|(idx, key)| (key.clone(), idx))
+        .map(|(idx, item)| (item.row.id.as_str(), idx))
         .collect::<HashMap<_, _>>();
 
     let mut ranked = raw_rows
         .iter()
         .enumerate()
-        .filter_map(|(idx, item)| {
+        .filter_map(|(_, item)| {
+            let fields = [
+                MessageField {
+                    priority: 0,
+                    value: item.row.conversation_title.as_str(),
+                },
+                MessageField {
+                    priority: 1,
+                    value: item.row.content.as_str(),
+                },
+            ];
             message_query.search_rank(MessageCandidate {
-                key: key_strings[idx].as_str(),
-                text: item.searchable_text.as_str(),
+                key: item.row.id.as_str(),
+                fields: &fields,
                 score: item.score,
             })
         })
         .collect::<Vec<_>>();
 
-    sort_matches(&mut ranked);
+    select_top_k(&mut ranked, output_limit);
 
-    let mut ordered = Vec::with_capacity(raw_rows.len());
-    let mut used = vec![false; raw_rows.len()];
+    let mut ordered = Vec::with_capacity(ranked.len());
 
     for ranked_match in ranked {
         if let Some(&idx) = index_by_key.get(ranked_match.key) {
-            if !used[idx] {
-                ordered.push(raw_rows[idx].row.clone());
-                used[idx] = true;
-            }
+            ordered.push(raw_rows[idx].row.clone());
         }
     }
-
-    for (idx, item) in raw_rows.into_iter().enumerate() {
-        if !used[idx] {
-            ordered.push(item.row);
-        }
-    }
-
-    ordered.truncate(output_limit);
     Ok(SearchOutput {
         total,
         total_is_lower_bound,
@@ -334,7 +329,6 @@ fn fetch_search_rows(
             conversation_title: sql_row.get::<_, Option<String>>(4)?.unwrap_or_default(),
         };
         Ok(RankedSearchRow {
-            searchable_text: row.content.clone(),
             score: sql_row.get::<_, Option<f64>>(5)?.unwrap_or_default(),
             row,
         })

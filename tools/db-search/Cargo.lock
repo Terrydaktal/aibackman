@@ -22,16 +22,11 @@ dependencies = [
 name = "chatgpt-db-search"
 version = "0.1.0"
 dependencies = [
- "db-search",
  "fuzzy-rank",
  "rusqlite",
  "serde",
  "serde_json",
 ]
-
-[[package]]
-name = "db-search"
-version = "0.1.0"
 
 [[package]]
 name = "fallible-iterator"
@@ -60,6 +55,9 @@ checksum = "d9c4f5dac5e15c24eb999c26181a6ca40b39fe946cbe4c263c7209467bc83af2"
 [[package]]
 name = "fuzzy-rank"
 version = "0.1.0"
+dependencies = [
+ "smallvec",
+]
 
 [[package]]
 name = "hashbrown"

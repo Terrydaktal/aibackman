@@ -7,19 +7,34 @@ const readline = require('readline');
 
 const DB_SEARCH_TOOL_DIR = path.resolve(__dirname, '..', 'tools', 'db-search');
 const DB_SEARCH_MANIFEST = path.join(DB_SEARCH_TOOL_DIR, 'Cargo.toml');
-const DB_SEARCH_REBUILD_INPUTS = [
-  DB_SEARCH_MANIFEST,
-  path.join(DB_SEARCH_TOOL_DIR, 'src', 'main.rs'),
-  path.resolve(__dirname, '..', '..', 'db-search', 'src', 'query.rs'),
-  path.resolve(__dirname, '..', '..', 'db-search', 'src', 'sqlite_fts.rs'),
-  path.resolve(__dirname, '..', '..', 'fuzzy-rank', 'src', 'message.rs'),
+const FUZZY_RANK_DIR = path.resolve(__dirname, '..', '..', 'fuzzy-rank');
+const DB_SEARCH_REBUILD_ROOTS = [
+  DB_SEARCH_TOOL_DIR,
+  FUZZY_RANK_DIR,
 ];
+
+function sourceFilesUnder(directory) {
+  if (!fs.existsSync(directory)) {
+    return [];
+  }
+
+  const files = [];
+  for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
+    const entryPath = path.join(directory, entry.name);
+    if (entry.isDirectory()) {
+      files.push(...sourceFilesUnder(entryPath));
+    } else if (entry.isFile()) {
+      files.push(entryPath);
+    }
+  }
+  return files;
+}
 
 function getDbSearchBinaryCandidates() {
   const executableName = process.platform === 'win32' ? 'chatgpt-db-search.exe' : 'chatgpt-db-search';
   return [
-    path.join(DB_SEARCH_TOOL_DIR, 'target', 'debug', executableName),
     path.join(DB_SEARCH_TOOL_DIR, 'target', 'release', executableName),
+    path.join(DB_SEARCH_TOOL_DIR, 'target', 'debug', executableName),
   ];
 }
 
@@ -38,7 +53,12 @@ function dbSearchBinaryNeedsRebuild(binaryPath) {
   }
 
   const binaryMtime = fs.statSync(binaryPath).mtimeMs;
-  return DB_SEARCH_REBUILD_INPUTS.some((filePath) => {
+  const rebuildInputs = DB_SEARCH_REBUILD_ROOTS.flatMap((root) => [
+    path.join(root, 'Cargo.toml'),
+    path.join(root, 'Cargo.lock'),
+    ...sourceFilesUnder(path.join(root, 'src')),
+  ]);
+  return rebuildInputs.some((filePath) => {
     if (!fs.existsSync(filePath)) {
       return false;
     }
@@ -52,7 +72,7 @@ function ensureDbSearchBinary() {
     return existingBinary;
   }
 
-  const build = spawnSync('cargo', ['build', '--manifest-path', DB_SEARCH_MANIFEST], {
+  const build = spawnSync('cargo', ['build', '--release', '--manifest-path', DB_SEARCH_MANIFEST], {
     cwd: path.resolve(__dirname, '..'),
     encoding: 'utf8',
   });
@@ -181,9 +201,18 @@ class DbSearchWorker {
 
 class ChatDatabase {
   constructor(filename = 'chatgpt.db') {
-    const dbPath = path.join(app.getPath('userData'), filename);
+    const dbPath = path.isAbsolute(filename)
+      ? filename
+      : path.join(app.getPath('userData'), filename);
+    fs.mkdirSync(path.dirname(dbPath), { recursive: true });
     this.dbPath = dbPath;
     this.db = new Database(dbPath);
+    this.db.pragma('journal_mode = WAL');
+    this.db.pragma('synchronous = NORMAL');
+    this.db.pragma('foreign_keys = ON');
+    this.db.pragma('busy_timeout = 5000');
+    this.db.pragma('temp_store = MEMORY');
+    this.db.pragma('cache_size = -32768');
     this.searchWorker = new DbSearchWorker(dbPath);
     this.init();
   }
@@ -220,7 +249,18 @@ class ChatDatabase {
         FOREIGN KEY (conversation_id) REFERENCES conversations(id)
       );
 
+      CREATE TABLE IF NOT EXISTS source_items (
+        source_key TEXT PRIMARY KEY,
+        source_path TEXT NOT NULL,
+        fingerprint TEXT NOT NULL,
+        imported_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        metadata_json TEXT
+      );
+
       CREATE INDEX IF NOT EXISTS idx_messages_conversation_id ON messages(conversation_id);
+      CREATE INDEX IF NOT EXISTS idx_messages_conversation_created ON messages(conversation_id, created_at, id);
+      CREATE INDEX IF NOT EXISTS idx_messages_role_created ON messages(role, created_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_conversations_updated ON conversations(updated_at DESC, id);
     `);
 
     // Migrations
@@ -308,10 +348,12 @@ class ChatDatabase {
   }
 
   deleteConversation(id) {
+    const deleteFailure = this.db.prepare('DELETE FROM cache_failures WHERE conversation_id = ?');
     const deleteMsgs = this.db.prepare('DELETE FROM messages WHERE conversation_id = ?');
     const deleteConv = this.db.prepare('DELETE FROM conversations WHERE id = ?');
     
     this.db.transaction(() => {
+      deleteFailure.run(id);
       deleteMsgs.run(id);
       deleteConv.run(id);
     })();
@@ -319,10 +361,59 @@ class ChatDatabase {
 
   clearAll() {
     this.db.transaction(() => {
+      this.db.prepare('DELETE FROM cache_failures').run();
       this.db.prepare('DELETE FROM messages').run();
       this.db.prepare('DELETE FROM conversations').run();
-      this.db.prepare('DELETE FROM cache_failures').run();
+      this.db.prepare('DELETE FROM source_items').run();
     })();
+  }
+
+  getStats() {
+    const row = this.db.prepare(`
+      SELECT
+        (SELECT COUNT(*) FROM conversations WHERE IFNULL(is_deleted_on_web, 0) = 0) AS conversation_count,
+        (SELECT COUNT(*) FROM messages) AS message_count,
+        (SELECT COUNT(DISTINCT conversation_id) FROM messages) AS cached_count,
+        (SELECT MAX(updated_at) FROM conversations) AS latest_updated_at
+    `).get();
+    return {
+      conversationCount: Number(row?.conversation_count || 0),
+      messageCount: Number(row?.message_count || 0),
+      cachedCount: Number(row?.cached_count || 0),
+      latestUpdatedAt: row?.latest_updated_at == null ? null : Number(row.latest_updated_at),
+    };
+  }
+
+  getSourceItem(sourceKey) {
+    return this.db.prepare('SELECT * FROM source_items WHERE source_key = ?').get(sourceKey) || null;
+  }
+
+  upsertSourceItem({ sourceKey, sourcePath, fingerprint, metadata = null }) {
+    this.db.prepare(`
+      INSERT INTO source_items (source_key, source_path, fingerprint, imported_at, metadata_json)
+      VALUES (?, ?, ?, CURRENT_TIMESTAMP, ?)
+      ON CONFLICT(source_key) DO UPDATE SET
+        source_path = excluded.source_path,
+        fingerprint = excluded.fingerprint,
+        imported_at = CURRENT_TIMESTAMP,
+        metadata_json = excluded.metadata_json
+    `).run(sourceKey, sourcePath, fingerprint, metadata == null ? null : JSON.stringify(metadata));
+  }
+
+  importConversationSnapshot(conversation, messages, { replaceMessages = false } = {}) {
+    this.db.transaction(() => {
+      this.upsertConversation(conversation);
+      if (replaceMessages) {
+        this.db.prepare('DELETE FROM messages WHERE conversation_id = ?').run(conversation.id);
+      }
+      for (const message of messages) this.upsertMessage(message);
+      this.upsertConversation(conversation);
+    })();
+  }
+
+  close() {
+    this.searchWorker.stop();
+    this.db.close();
   }
 
   upsertMessage(msg) {
@@ -330,8 +421,12 @@ class ChatDatabase {
       INSERT INTO messages (id, conversation_id, role, content, metadata_json, created_at, parent_id)
       VALUES (?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(id) DO UPDATE SET
+        conversation_id = excluded.conversation_id,
+        role = excluded.role,
         content = excluded.content,
-        metadata_json = excluded.metadata_json
+        metadata_json = excluded.metadata_json,
+        created_at = excluded.created_at,
+        parent_id = excluded.parent_id
     `);
     stmt.run(
       msg.id,

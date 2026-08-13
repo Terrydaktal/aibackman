@@ -49,8 +49,18 @@ function installFastModeMainWorld(maxTurnsArg, cacheSizeArg) {
   };
 
   const isVisibleNode = (node) => {
-    const role = node && node.message && node.message.author ? node.message.author.role : null;
-    return role === 'user' || role === 'assistant';
+    const message = node && node.message ? node.message : null;
+    const role = message && message.author ? message.author.role : null;
+    const metadata = message ? message.metadata : null;
+    const parts = message && message.content && Array.isArray(message.content.parts) ? message.content.parts : [];
+    const hasVisibleContent = parts.some((part) => (
+      typeof part === 'string' ? part.trim().length > 0 : !!part
+    ));
+    const isThinkingArtifact = !!metadata && (
+      metadata.is_thinking_preamble_message === true
+      || metadata.is_visually_hidden_from_conversation === true
+    );
+    return (role === 'user' || role === 'assistant') && hasVisibleContent && !isThinkingArtifact;
   };
 
   const countVisibleMessages = (data) => {

@@ -37,22 +37,31 @@ function htmlToPlainText(html) {
     .trim();
 }
 
-function extractAiModeTurnsFromHtml(htmlText) {
+function extractGoogleActivityTurnsFromHtml(htmlText, labels = null) {
   const text = htmlToPlainText(htmlText);
   if (!text) return [];
+  const labelPairs = labels || [
+    ['Your prompt:', 'user'],
+    ["Search's response:", 'assistant'],
+  ];
+  const escapedLabels = labelPairs.map(([label]) => label.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
   const turns = [];
-  const pattern = /(Your prompt:|Search's response:)\s*([\s\S]*?)(?=(?:Your prompt:|Search's response:|$))/g;
+  const pattern = new RegExp(`(${escapedLabels.join('|')})\\s*([\\s\\S]*?)(?=(?:${escapedLabels.join('|')}|$))`, 'g');
   let match = null;
   let sequence = 0;
   while ((match = pattern.exec(text)) !== null) {
     const label = match[1] || '';
     const content = String(match[2] || '').trim();
     if (!content) continue;
-    const role = label.startsWith('Your prompt:') ? 'user' : 'assistant';
+    const role = labelPairs.find(([candidate]) => candidate === label)?.[1] || 'assistant';
     turns.push({ role, content, sequence });
     sequence += 1;
   }
   return turns;
+}
+
+function extractAiModeTurnsFromHtml(htmlText) {
+  return extractGoogleActivityTurnsFromHtml(htmlText);
 }
 
 function buildDeterministicId(seed) {
@@ -65,28 +74,31 @@ function normalizeAiModeTitle(value) {
   return raw.replace(/^Searched for\s+/i, '').trim() || raw;
 }
 
-function buildTakeoutConversationRecord(entry, fallbackNowMs = Date.now()) {
+function buildTakeoutConversationRecord(entry, fallbackNowMs = Date.now(), options = {}) {
   const header = String(entry?.header || '').trim();
-  if (header && header !== 'AI Mode') return null;
+  const acceptedHeaders = options.acceptedHeaders || ['AI Mode'];
+  if (header && !acceptedHeaders.includes(header)) return null;
 
   const timeIso = String(entry?.time || '').trim();
   const timeMs = Number.isNaN(Date.parse(timeIso)) ? fallbackNowMs : Date.parse(timeIso);
   const createdAt = timeMs / 1000;
   const titleRaw = String(entry?.title || '').trim() || 'AI Mode Chat';
-  const title = normalizeAiModeTitle(titleRaw);
+  const title = typeof options.normalizeTitle === 'function'
+    ? options.normalizeTitle(titleRaw)
+    : normalizeAiModeTitle(titleRaw);
   const html = Array.isArray(entry?.safeHtmlItem) ? String(entry.safeHtmlItem[0]?.html || '') : '';
-  const turns = extractAiModeTurnsFromHtml(html);
+  const turns = extractGoogleActivityTurnsFromHtml(html, options.labels);
   if (turns.length === 0) return null;
 
   const conversationSeed = `${timeIso}|${titleRaw}|${html.slice(0, 4000)}`;
-  const conversationId = `aimode-${buildDeterministicId(conversationSeed)}`;
+  const conversationId = `${options.conversationPrefix || 'aimode'}-${buildDeterministicId(conversationSeed)}`;
   let previousMessageId = null;
   let lastMessageId = null;
   const messages = [];
 
   turns.forEach((turn, idx) => {
     const messageSeed = `${conversationId}|${idx}|${turn.role}|${turn.content}`;
-    const messageId = `aimsg-${buildDeterministicId(messageSeed)}`;
+    const messageId = `${options.messagePrefix || 'aimsg'}-${buildDeterministicId(messageSeed)}`;
     const created = createdAt + idx * 0.001;
     messages.push({
       id: messageId,
@@ -117,7 +129,7 @@ function buildTakeoutConversationRecord(entry, fallbackNowMs = Date.now()) {
   };
 }
 
-function parseAiModeTakeout(inputPath) {
+function parseAiModeTakeout(inputPath, options = {}) {
   const raw = fs.readFileSync(inputPath, 'utf8');
   const parsed = JSON.parse(raw);
   if (!Array.isArray(parsed)) {
@@ -126,7 +138,7 @@ function parseAiModeTakeout(inputPath) {
 
   const conversations = [];
   for (const entry of parsed) {
-    const record = buildTakeoutConversationRecord(entry);
+    const record = buildTakeoutConversationRecord(entry, Date.now(), options);
     if (record) conversations.push(record);
   }
 
@@ -136,12 +148,12 @@ function parseAiModeTakeout(inputPath) {
   };
 }
 
-function importAiModeTakeout(dbInstance, inputPath) {
-  const parsed = parseAiModeTakeout(inputPath);
+function importAiModeTakeout(dbInstance, inputPath, options = {}) {
+  const parsed = parseAiModeTakeout(inputPath, options);
   let importedConversations = 0;
   let importedMessages = 0;
 
-  dbInstance.clearAll();
+  if (options.replaceExisting !== false) dbInstance.clearAll();
   dbInstance.db.transaction(() => {
     for (const conversation of parsed.conversations) {
       dbInstance.upsertConversation({
@@ -180,6 +192,7 @@ function importAiModeTakeout(dbInstance, inputPath) {
 module.exports = {
   buildDeterministicId,
   extractAiModeTurnsFromHtml,
+  extractGoogleActivityTurnsFromHtml,
   htmlToPlainText,
   importAiModeTakeout,
   normalizeAiModeTitle,

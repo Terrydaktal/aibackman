@@ -1,205 +1,213 @@
-# ChatGPT Desktop (Electron + React)
+# AI Conversation Archive
 
-A local-first desktop client for ChatGPT that uses your web session, caches chats in SQLite, renders markdown/code/math, and includes advanced navigation/caching tools for large chat histories.
+A local-first Electron archive for browsing and searching conversations from multiple AI agents and accounts. The application keeps each account in an independent SQLite database, presents all agents and accounts on one home page, and searches every archive from one global search field.
 
-## What This Tool Is
+The existing live ChatGPT and Google AI Mode bridges remain available for their default accounts. Official exports and local coding-agent histories are handled by narrow provider plugins.
 
-This app is an Electron desktop wrapper around ChatGPT with:
-- Browser-based login to your ChatGPT account (Plus expected by project intent).
-- Local conversation/message cache in SQLite for fast browsing and search.
-- Explicit sync controls (manual sync and cache-all/retry flows) instead of always-live sync.
-- Image support through a custom `chatgpt-image://` protocol resolved in Electron main process.
-- Fullscreen image viewer with context menu copy-to-clipboard.
-- Markdown + code highlighting + KaTeX math rendering.
-- A right-side Message Map for in-chat navigation.
+## Supported Sources
 
-## Tech Stack
+| Agent | Live bridge | Official backup | Local history |
+| --- | --- | --- | --- |
+| ChatGPT | Read, sync, send, cache | `conversations.json`, export directory, or ZIP | No |
+| Google AI Mode | Read and sync | Google Takeout My Activity JSON, directory, or ZIP | No |
+| Gemini | No | Google Takeout Gemini Apps JSON, directory, or ZIP | No |
+| Codex | No | No | `~/.codex/sessions/**/*.jsonl`, separated by discovered account |
+| Antigravity | No | No | `~/.gemini/antigravity-cli` transcripts |
 
-- Electron (main process, IPC, custom protocol, auth fetch)
-- React 19 + TypeScript
-- Vite (renderer build/dev server)
-- better-sqlite3 (local persistence)
-- react-markdown + remark-gfm + remark-math + rehype-katex
-- react-virtuoso (virtualized lists)
+Backup accounts are read-only snapshots. Multiple backups from the same provider can coexist. Reimporting into a backup account replaces that account's snapshot; it never clears another account's database. Local providers fingerprint source files and skip unchanged sessions.
 
 ## Project Structure
 
 ```text
 .
 ├── electron/
-│   ├── main.cjs         # Electron main process, IPC handlers, protocol, ChatGPT API integration
-│   ├── auth.cjs         # Session/token acquisition + authenticated fetch helper
-│   ├── database.cjs     # SQLite schema, migrations, query helpers
-│   └── preload.cjs      # Safe renderer bridge (window.electronAPI)
+│   ├── accounts/
+│   │   ├── catalog.cjs       # Central account registry
+│   │   └── manager.cjs       # Account DB lifecycle, imports, refresh, global search
+│   ├── agents/
+│   │   ├── registry.cjs      # Provider registration
+│   │   ├── chatgpt.cjs       # ChatGPT official export adapter
+│   │   ├── google-ai-mode.cjs# AI Mode Takeout adapter
+│   │   ├── gemini.cjs        # Gemini Takeout adapter
+│   │   ├── codex.cjs         # Local Codex session adapter
+│   │   ├── antigravity.cjs   # Local Antigravity transcript adapter
+│   │   └── utils.cjs         # Safe ZIP/materialization and adapter helpers
+│   ├── bridges/
+│   │   ├── chatgpt.cjs       # ChatGPT live-site automation and extraction
+│   │   └── ai-mode.cjs       # Google AI Mode live-site automation and extraction
+│   ├── conversations/
+│   │   └── chatgpt-tree.cjs  # Branch reconstruction and snapshot safeguards
+│   ├── ipc/archive.cjs       # Archive/account/database IPC boundary
+│   ├── services/
+│   │   └── chatgpt-cache.cjs # Pacing, retries, cancellation, and cache progress
+│   ├── main.cjs              # Electron startup, windows, and IPC orchestration
+│   ├── database.cjs          # Per-account SQLite schema and query API
+│   ├── aimode-takeout.cjs    # Shared Google activity parser
+│   ├── auth.cjs              # ChatGPT session and authenticated requests
+│   ├── bridge-preload.cjs    # Isolated live bridge preload
+│   └── preload.cjs           # Renderer IPC exposure
 ├── src/
-│   ├── App.tsx          # Main UI and interaction logic
-│   ├── index.css        # App styles
-│   ├── main.tsx         # React bootstrap
-│   ├── types/index.ts   # Shared TS interfaces and window typing
-│   ├── components/      # Reserved for extracted UI modules
-│   ├── hooks/           # Reserved for extracted hooks
-│   ├── services/        # Reserved for extracted services
-│   └── assets/          # Static renderer assets
-├── public/
-│   ├── favicon.svg
-│   └── icons.svg
-├── dist/                # Renderer production build output
-├── package.json
-├── vite.config.ts
-├── tsconfig*.json
-└── README.md
+│   ├── App.tsx               # Home/account route shell
+│   ├── features/home/        # Agent directory and global search
+│   ├── features/chat/
+│   │   ├── ChatWorkspace.tsx         # Account session and composer coordinator
+│   │   ├── ChatPresentation.tsx      # Message/markdown/branch presentation
+│   │   ├── useArchiveSearch.ts       # Search across one account database
+│   │   ├── useMessageNavigation.ts   # In-chat matching, highlighting, and jumps
+│   │   ├── useCacheManagement.ts     # Cache runs, markers, and progress
+│   │   ├── useWorkspaceLayout.ts     # Persistent panels and zoom behavior
+│   │   └── useWorkspaceDiagnostics.ts# Opt-in renderer diagnostics
+│   ├── components/           # Shared renderer components
+│   ├── search/               # Crash-safe native highlight helpers
+│   ├── types/                # Renderer and IPC contracts
+│   └── index.css
+├── scripts/
+│   ├── test-archive-imports.cjs       # Provider/account regression suite
+│   ├── test-highlight.mjs             # Search highlighting regression suite
+│   └── reconcile-aimode-takeout.cjs   # Standalone AI Mode reconciliation
+├── tools/
+│   ├── db-search/             # Rust streaming SQLite search helper
+│   └── aibackman/             # GUI AI Mode backup/database comparator
+└── package.json
 ```
 
-## Core Features
+## Architecture
 
-- Auth and session reuse:
-  - Login window loads `https://chatgpt.com/auth/login`.
-  - Access token is fetched from `https://chatgpt.com/api/auth/session` and reused.
+Dependencies point inward in this order:
 
-- Conversation and message sync:
-  - Conversation list syncs from ChatGPT API with pagination.
-  - Message sync pulls `conversation/{id}` mapping, upserts local DB, and computes linear path.
-  - Cooldown throttles repeated message syncs per conversation.
+1. `database.cjs` owns one account's storage and search-worker lifecycle.
+2. `agents/*` translate one external source into the common conversation/message schema.
+3. `accounts/manager.cjs` resolves accounts, opens databases lazily, invokes plugins, and combines global-search results.
+4. `bridges/*`, `conversations/*`, and `services/*` own live-site automation, branch reconstruction, and cache workflows behind narrow interfaces.
+5. `ipc/archive.cjs` exposes account operations without knowing provider formats.
+6. `main.cjs` composes Electron windows, authentication, account services, and live-provider runtimes.
+7. Renderer features consume account capabilities and do not branch on storage paths; chat hooks isolate database search, in-chat navigation, cache runs, layout, and diagnostics from the account coordinator.
 
-- Local cache diagnostics:
-  - Displays cached vs local counts.
-  - Tracks uncached chats, failed cache attempts, and unknown uncached cases.
-  - Supports `Cache All` and `Retry failed` passes with retry/backoff for transient API failures.
+An agent plugin exports metadata plus one or more narrow operations:
 
-- Image handling:
-  - Image markdown references use `chatgpt-image://file_xxx?...`.
-  - Electron main resolves image bytes with authenticated fetch and relaxed response headers.
-  - Renderer fallback can request image as data URL if direct protocol load fails.
+```js
+module.exports = {
+  id: 'provider-id',
+  name: 'Provider',
+  description: 'Source description',
+  accent: '#000000',
+  capabilities: { importBackup: true, localBackup: true },
+  discoverAccounts, // optional
+  importBackup,     // optional: ({ db, inputPath, replaceExisting, sourceConfig })
+  refreshLocal,     // optional: ({ db, sourceConfig, onProgress })
+};
+```
 
-- Fullscreen image mode:
-  - Click image to open fullscreen.
-  - Right-click image for context menu with `Copy image`.
-  - `Esc` closes menu/overlay.
+Register a new plugin once in `electron/agents/registry.cjs`. It must write through the `ChatDatabase` API rather than opening another account's SQLite file.
 
-- Message navigation:
-  - Right-side Message Map lists user/assistant messages with compact previews.
-  - Click to jump a message to top of viewport.
-  - Active map item tracks message intersecting viewport top edge.
-  - Middle-click pan scrolling works in chat area and message map area.
+## Database Layout
 
-- Rich content rendering:
-  - Markdown tables/lists/checklists via GFM.
-  - Syntax-highlighted code blocks.
-  - Math rendering via KaTeX, including normalization of `\(...\)` and `\[...\]` delimiters.
+On Linux, Electron normally stores the archive under `~/.config/chatgpt/`:
 
-## Data Model (SQLite)
+```text
+~/.config/chatgpt/
+├── archive-catalog.db  # Account identity, provider, source kind, DB path
+├── chatgpt.db          # Existing default live ChatGPT account
+├── aimode.db           # Existing default live Google AI Mode account
+└── accounts/
+    └── account-*.db    # Backup and local-agent accounts
+```
 
-Database file:
-- `app.getPath('userData')/chatgpt.db`
+Every account database contains:
 
-Tables:
-- `conversations`
-  - `id` (PK), `title`, `created_at`, `updated_at`, `current_node_id`, `is_deleted_on_web`
-- `messages`
-  - `id` (PK), `conversation_id` (FK), `role`, `content`, `created_at`, `parent_id`
-- `cache_failures`
-  - `conversation_id` (PK/FK), `last_error`, `status_code`, `last_attempt_at`, `attempt_count`
+- `conversations`: title, timestamps, current branch node, deletion/sync state.
+- `messages`: stable message ID, role, content, metadata, timestamp, and parent ID.
+- `cache_failures`: non-destructive live-sync failure tracking.
+- `source_items`: source path and fingerprint for incremental local imports.
 
-## Renderer/Main Process Interface (IPC)
+SQLite uses WAL mode, normal synchronous writes, a busy timeout, foreign keys, an in-memory temp store, and indexes for conversation ordering and message traversal. Search runs through the persistent Rust `db-search` worker, with SQLite `LIKE` as a fallback.
 
-Preload exposes:
-- `window.electronAPI.invoke(channel, ...args)`
-- `window.electronAPI.onCacheProgress(handler)`
+## Operation
 
-Primary handlers in `electron/main.cjs`:
-- Auth:
-  - `auth:login`
-  - `auth:check`
-- DB/UI data:
-  - `db:getConversations`
-  - `db:deleteConversation`
-  - `db:getMessages`
-  - `db:searchMessages`
-  - `db:getStats`
-  - `db:getCacheDiagnostics`
-- Sync/cache:
-  - `api:syncConversations`
-  - `api:syncMessages`
-  - `api:cacheAll`
-  - `api:cacheFailed`
-  - `api:auditDeletions`
-- Messaging and media:
-  - `api:sendMessage`
-  - `api:getImageDataUrl`
-  - `api:copyImageToClipboard`
+### Add an official backup
 
-Progress events:
-- `api:cacheProgress`
+1. Open the archive home page.
+2. Select `Add backup` under ChatGPT, Google AI Mode, or Gemini.
+3. Give the account/snapshot a label.
+4. Select an export JSON file, extracted export directory, or ZIP.
+5. The provider adapter imports into a new isolated account database.
 
-## Custom Protocol
+Use `Import backup` on an existing account when the export belongs to that
+account and should update its current database. Use `Add backup` when the
+export should remain a separate account. Account labels can be changed from
+the home page; live ChatGPT and Google AI Mode accounts are renamed to the
+detected signed-in email when the site exposes it, unless a custom label has
+already been set.
 
-- Scheme: `chatgpt-image://`
-- Registered as privileged (`standard`, `secure`, `supportFetchAPI`, `bypassCSP`).
-- Used to fetch chat image bytes in main process under authenticated session.
+ZIP entries are validated before extraction; absolute paths, drive-prefixed paths, parent traversal, and extracted symbolic links are rejected.
 
-## Scripts
+### Back up local Codex or Antigravity chats
 
-- `npm run dev`
-  - Starts Vite renderer dev server only.
-  - Input: source files in `src/`, Vite config.
-  - Output: hot-reloaded renderer at `http://localhost:5173`.
+1. Start the app so local accounts are discovered.
+2. Select `Refresh all local` on the provider, or `Refresh local` on one account.
+3. Changed JSONL transcripts are streamed and atomically replaced per conversation.
+4. Unchanged source fingerprints are skipped on later runs.
 
-- `npm run electron:dev`
-  - Starts renderer dev server and Electron app together.
-  - Input: all renderer + Electron files.
-  - Output: desktop app pointing to local Vite URL.
+The home page reports imported chats/messages, unchanged files, and parse
+errors after each local refresh. A local provider such as Antigravity has no
+provider email to discover, so its default label is `Local Antigravity` and
+can be renamed manually.
 
-- `npm run build`
-  - Type-check/build renderer for production.
-  - Input: TypeScript + assets.
-  - Output: `dist/` renderer bundle.
+Codex reads all system sessions and routes them by the account IDs found in session events. Sessions without an account ID are kept in the `Local sessions (unattributed)` account.
 
-- `npm run preview`
-  - Serves built renderer bundle locally.
-  - Input: `dist/`.
-  - Output: local preview HTTP server.
+### Global search
 
-- `npm run lint`
-  - Lints codebase with configured ESLint rules.
+1. Search from the home page.
+2. The account manager queries all account databases concurrently.
+3. Results include provider, account, chat, role, and message identity.
+4. Selecting a result opens the correct account, chat, message, and highlight query.
 
-## Execution Pipeline and Order
+### Live synchronization
 
-Development flow:
-1. Run `npm install`.
-2. Run `npm run electron:dev`.
-3. Login via in-app browser window.
-4. App loads local conversations, then syncs conversations from API.
-5. Select chat to load local messages; manual sync updates from API.
-6. Use Message Map/search/cache tools as needed.
+The default ChatGPT and Google AI Mode accounts retain their bridge-specific controls. Live responses that look partial or interrupted do not replace a more complete cached conversation. Cache-all supports progress, retries, cancellation, and preservation of locally cached deleted chats.
 
-Cache synchronization flow:
-1. `api:cacheAll` or `api:cacheFailed` enumerates target conversations.
-2. Each uncached target calls conversation API.
-3. Mapping nodes are transformed/upserted into `messages`.
-4. Failures are written to `cache_failures` with retry metadata.
-5. Renderer receives `api:cacheProgress` updates.
+The Google AI Mode section also has `Compare backups`, which opens the
+`aibackman` GUI. It compares the default AI Mode database with another
+database or Takeout backup and reports added, missing, changed, and unchanged
+chats. The same GUI can be started directly with `npm run aibackman`.
 
-Image rendering flow:
-1. Message markdown contains `![Chat Image](chatgpt-image://file_...?... )`.
-2. Renderer `<img>` requests custom protocol URL.
-3. Main process resolves with authenticated fetch and returns bytes.
-4. If renderer load fails, fallback `api:getImageDataUrl` is requested.
+## Commands
 
-## Inputs and Outputs Summary
+- `npm install`: install JavaScript and Electron dependencies.
+- `npm run electron:dev`: start Vite and the Electron application in development mode.
+- `npm run build`: TypeScript check plus production renderer build into `dist/`.
+- `npm run lint`: run ESLint, including strict React hooks/compiler checks.
+- `npm run test:archive`: test all backup/local adapters, account refresh, and cross-account search under Electron's native Node ABI.
+- `npm run test:highlight`: run crash/highlight regression checks.
+- `cargo test --manifest-path tools/db-search/Cargo.toml`: test the Rust search worker.
+- `cargo test --manifest-path tools/aibackman/Cargo.toml`: test the backup comparison GUI core.
+- `npm run aibackman`: run the AI Mode backup/database comparison GUI.
+- `npm run aimode:reconcile-takeout -- DATABASE TAKEOUT`: diagnose and optionally reconcile an AI Mode database from Takeout.
+- `npm run electron:release`: build and start the production application.
+- `npm run preview`: serve the built renderer locally.
 
-Inputs:
-- ChatGPT web session/cookies/token.
-- Conversation/message payloads from ChatGPT backend APIs.
-- User prompts and optional pasted image data URLs.
+Recommended validation order:
 
-Outputs:
-- Desktop UI for chat browsing and composition.
-- Local SQLite cache (`chatgpt.db`).
-- Renderer build artifacts in `dist/`.
-- Clipboard image data when copying fullscreen images.
+```bash
+npm run lint
+npm run test:highlight
+npm run test:archive
+cargo test --manifest-path tools/db-search/Cargo.toml
+cargo test --manifest-path tools/aibackman/Cargo.toml
+npm run build
+```
 
-## Notes
+## Release Debugging
 
-- This project relies on ChatGPT web endpoints and your authenticated session.
-- Manual sync behavior is intentional for predictable local state control.
-- KaTeX assets increase build output size due to font files.
+`npm run electron:release:debug` builds production code with source maps, enables persistent diagnostics, exposes the renderer DevTools endpoint at `http://127.0.0.1:9222`, and exposes the main-process Node inspector at `127.0.0.1:9229`.
+
+- Diagnostics: `~/.config/chatgpt/debug/events-*.jsonl` and `chromium-*.log`.
+- Crash dumps: `~/.config/chatgpt/debug/crashes/`.
+- Set `CHATGPT_OPEN_DEVTOOLS=1` to open detached renderer DevTools automatically.
+- For a native debugger, find the Electron PID with `pgrep -a -f 'node_modules/electron/dist/electron'`, then attach with `gdb -p PID`.
+
+## Inputs and Outputs
+
+Inputs include authenticated live web sessions, official provider exports, local Codex/Antigravity JSONL histories, prompts, attachments, and images. Outputs are isolated SQLite account archives, the central catalog, the desktop browsing/search interface, renderer artifacts in `dist/`, optional diagnostics, and clipboard image data.
+
+This project depends on undocumented live website structure for ChatGPT and Google AI Mode. Provider export/local adapters are intentionally isolated so a website change does not affect stored archives or unrelated agents.

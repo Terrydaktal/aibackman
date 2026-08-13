@@ -16,6 +16,12 @@ target/
 # Database
 *.db
 *.db-journal
+*.db-shm
+*.db-wal
+
+# Local crash/debug output
+*.dmp
+debug/
 
 # Editor directories and files
 .vscode/*

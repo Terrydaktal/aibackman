@@ -10,6 +10,11 @@
     "electron:dev:oom": "concurrently \"npm run dev\" \"wait-on http://localhost:5173 && CHATGPT_OOM_DEBUG=1 CHATGPT_BRIDGE_VISIBLE=1 NODE_ENV=development electron .\"",
     "electron:dev:oom:tracegc": "concurrently \"npm run dev\" \"wait-on http://localhost:5173 && CHATGPT_OOM_DEBUG=1 CHATGPT_TRACE_GC=1 CHATGPT_BRIDGE_VISIBLE=1 NODE_ENV=development electron .\"",
     "build": "tsc -b && vite build",
+    "build:debug": "tsc -b && CHATGPT_DEBUG_BUILD=1 vite build",
+    "electron:release": "npm run build && NODE_ENV=production electron .",
+    "electron:release:debug": "npm run build:debug && CHATGPT_DEBUG=1 CHATGPT_BRIDGE_VISIBLE=1 ELECTRON_ENABLE_LOGGING=1 ELECTRON_ENABLE_STACK_DUMPING=1 NODE_ENV=production electron --inspect=9229 .",
+    "test:highlight": "node scripts/test-highlight.mjs",
+    "test:archive": "ELECTRON_RUN_AS_NODE=1 electron scripts/test-archive-imports.cjs",
     "lint": "eslint .",
     "preview": "vite preview",
     "aimode:reconcile-takeout": "node scripts/reconcile-aimode-takeout.cjs",
@@ -47,5 +52,8 @@
     "typescript-eslint": "^8.58.2",
     "vite": "^8.0.10",
     "wait-on": "^9.0.5"
+  },
+  "allowScripts": {
+    "better-sqlite3@12.9.0": true
   }
 }

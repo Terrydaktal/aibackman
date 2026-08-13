@@ -7,5 +7,6 @@ export default defineConfig({
   plugins: [react()],
   build: {
     chunkSizeWarningLimit: 2000,
+    sourcemap: process.env.CHATGPT_DEBUG_BUILD === '1',
   },
 })

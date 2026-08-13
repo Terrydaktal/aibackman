@@ -133,6 +133,25 @@ class ChatGPTAuth {
     return this.accessToken;
   }
 
+  async getIdentity() {
+    try {
+      const sessionResp = await session.defaultSession.fetch('https://chatgpt.com/api/auth/session');
+      if (!sessionResp.ok) return null;
+      const data = await sessionResp.json();
+      const candidates = [data?.user, data?.account, data?.profile, data].filter(Boolean);
+      const email = candidates.map((candidate) => (
+        candidate.email || candidate.email_address || candidate.username || ''
+      )).find((value) => /@/.test(String(value))) || '';
+      const name = candidates.map((candidate) => (
+        candidate.name || candidate.display_name || candidate.full_name || ''
+      )).find((value) => String(value).trim()) || '';
+      if (!email && !name) return null;
+      return { email: String(email).trim(), name: String(name).trim() };
+    } catch {
+      return null;
+    }
+  }
+
   async getDeviceId() {
     try {
       const cookies = await session.defaultSession.cookies.get({ domain: 'chatgpt.com', name: 'oai-did' });

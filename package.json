@@ -1,5 +1,7 @@
 {
-  "name": "chatgpt",
+  "name": "aibackman",
+  "productName": "AIBackman",
+  "description": "Unified AI conversation archive and backup manager",
   "private": true,
   "version": "0.1.0",
   "type": "module",
@@ -7,18 +9,18 @@
   "scripts": {
     "dev": "vite",
     "electron:dev": "concurrently \"npm run dev\" \"wait-on http://localhost:5173 && NODE_ENV=development electron .\"",
-    "electron:dev:oom": "concurrently \"npm run dev\" \"wait-on http://localhost:5173 && CHATGPT_OOM_DEBUG=1 CHATGPT_BRIDGE_VISIBLE=1 NODE_ENV=development electron .\"",
-    "electron:dev:oom:tracegc": "concurrently \"npm run dev\" \"wait-on http://localhost:5173 && CHATGPT_OOM_DEBUG=1 CHATGPT_TRACE_GC=1 CHATGPT_BRIDGE_VISIBLE=1 NODE_ENV=development electron .\"",
+    "electron:dev:oom": "concurrently \"npm run dev\" \"wait-on http://localhost:5173 && AIBACKMAN_OOM_DEBUG=1 AIBACKMAN_BRIDGE_VISIBLE=1 NODE_ENV=development electron .\"",
+    "electron:dev:oom:tracegc": "concurrently \"npm run dev\" \"wait-on http://localhost:5173 && AIBACKMAN_OOM_DEBUG=1 AIBACKMAN_TRACE_GC=1 AIBACKMAN_BRIDGE_VISIBLE=1 NODE_ENV=development electron .\"",
     "build": "tsc -b && vite build",
-    "build:debug": "tsc -b && CHATGPT_DEBUG_BUILD=1 vite build",
+    "build:debug": "tsc -b && AIBACKMAN_DEBUG_BUILD=1 vite build",
     "electron:release": "npm run build && NODE_ENV=production electron .",
-    "electron:release:debug": "npm run build:debug && CHATGPT_DEBUG=1 CHATGPT_BRIDGE_VISIBLE=1 ELECTRON_ENABLE_LOGGING=1 ELECTRON_ENABLE_STACK_DUMPING=1 NODE_ENV=production electron --inspect=9229 .",
+    "electron:release:debug": "npm run build:debug && AIBACKMAN_DEBUG=1 AIBACKMAN_BRIDGE_VISIBLE=1 ELECTRON_ENABLE_LOGGING=1 ELECTRON_ENABLE_STACK_DUMPING=1 NODE_ENV=production electron --inspect=9229 .",
     "test:highlight": "node scripts/test-highlight.mjs",
     "test:archive": "ELECTRON_RUN_AS_NODE=1 electron scripts/test-archive-imports.cjs",
     "lint": "eslint .",
     "preview": "vite preview",
     "aimode:reconcile-takeout": "node scripts/reconcile-aimode-takeout.cjs",
-    "aibackman": "cargo run --manifest-path tools/aibackman/Cargo.toml"
+    "aibackdiff": "cargo run --manifest-path tools/aibackdiff/Cargo.toml"
   },
   "dependencies": {
     "better-sqlite3": "^12.9.0",

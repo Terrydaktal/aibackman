@@ -48,7 +48,7 @@ function listSessionFiles(root) {
       else if (
         entry.isFile()
         && path.basename(directory) === 'chats'
-        && /^session-.*\.jsonl$/i.test(entry.name)
+        && /^session-.*\.(?:json|jsonl)$/i.test(entry.name)
       ) {
         files.push(entryPath);
       }
@@ -62,8 +62,13 @@ function readSessionHeader(filePath) {
   try {
     const buffer = Buffer.alloc(64 * 1024);
     const bytesRead = fs.readSync(descriptor, buffer, 0, buffer.length, 0);
-    const firstLine = buffer.subarray(0, bytesRead).toString('utf8').split(/\r?\n/, 1)[0];
-    return JSON.parse(firstLine);
+    const prefix = buffer.subarray(0, bytesRead).toString('utf8');
+    if (path.extname(filePath).toLowerCase() === '.jsonl') {
+      return JSON.parse(prefix.split(/\r?\n/, 1)[0]);
+    }
+    const sessionId = prefix.match(/"sessionId"\s*:\s*"([^"]+)"/)?.[1];
+    const startTime = prefix.match(/"startTime"\s*:\s*"([^"]+)"/)?.[1];
+    return { sessionId, startTime };
   } catch {
     return {};
   } finally {
@@ -75,7 +80,7 @@ function sessionGroups(root) {
   const groups = new Map();
   for (const filePath of listSessionFiles(root)) {
     const header = readSessionHeader(filePath);
-    const fallbackId = path.basename(filePath, '.jsonl').replace(/^session-/, '');
+    const fallbackId = path.basename(filePath).replace(/\.(?:json|jsonl)$/i, '').replace(/^session-/, '');
     const sessionId = String(header.sessionId || fallbackId);
     if (!groups.has(sessionId)) groups.set(sessionId, []);
     groups.get(sessionId).push({
@@ -153,6 +158,19 @@ async function parseSessionGroup(group) {
 
   for (const { filePath, startTime } of group.files) {
     projectName ||= path.basename(path.dirname(path.dirname(filePath)));
+
+    if (path.extname(filePath).toLowerCase() === '.json') {
+      try {
+        const document = JSON.parse(await fs.promises.readFile(filePath, 'utf8'));
+        if (document.startTime) createdAt = Math.min(createdAt, asUnixSeconds(document.startTime, startTime));
+        if (document.lastUpdated) updatedAt = Math.max(updatedAt, asUnixSeconds(document.lastUpdated, startTime));
+        for (const event of Array.isArray(document.messages) ? document.messages : []) recordEvent(event);
+      } catch {
+        parseErrors += 1;
+      }
+      continue;
+    }
+
     createdAt = Math.min(createdAt, startTime);
     const lines = readline.createInterface({
       input: fs.createReadStream(filePath, { encoding: 'utf8' }),
@@ -203,7 +221,7 @@ async function parseSessionGroup(group) {
   return {
     conversation: {
       id: group.sessionId,
-      title: compactTitle(firstUser?.content, projectName ? `Gemini CLI: ${projectName}` : 'Gemini CLI chat'),
+      title: compactTitle(firstUser?.content, projectName ? `Gemini CLI: ${projectName}` : 'Gemini CLI session'),
       created_at: Number.isFinite(createdAt) ? createdAt : fallbackTime,
       updated_at: updatedAt || messages.at(-1)?.created_at || fallbackTime,
       last_synced_updated_at: updatedAt || messages.at(-1)?.created_at || fallbackTime,

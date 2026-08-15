@@ -19,12 +19,38 @@ const {
   normalizeAiModeTitle,
 } = require('./aimode-takeout.cjs');
 
+const APPLICATION_NAME = 'aibackman';
+const LEGACY_APPLICATION_NAME = 'chatgpt';
 const isDev = process.env.NODE_ENV === 'development';
-const OOM_DEBUG = process.env.CHATGPT_OOM_DEBUG === '1';
-const OOM_TRACE_GC = process.env.CHATGPT_TRACE_GC === '1';
-const DEBUG_MODE = process.env.CHATGPT_DEBUG === '1' || OOM_DEBUG;
+const OOM_DEBUG = process.env.AIBACKMAN_OOM_DEBUG === '1';
+const OOM_TRACE_GC = process.env.AIBACKMAN_TRACE_GC === '1';
+const DEBUG_MODE = process.env.AIBACKMAN_DEBUG === '1' || OOM_DEBUG;
 const DEBUG_SESSION_ID = `${new Date().toISOString().replace(/[:.]/g, '-')}-${process.pid}`;
 let debugRuntimePaths = null;
+
+function configureApplicationStorage() {
+  const appDataPath = app.getPath('appData');
+  const applicationPath = path.join(appDataPath, APPLICATION_NAME);
+  const legacyPath = path.join(appDataPath, LEGACY_APPLICATION_NAME);
+  let userDataPath = applicationPath;
+
+  if (!fs.existsSync(applicationPath) && fs.existsSync(legacyPath)) {
+    try {
+      fs.renameSync(legacyPath, applicationPath);
+    } catch (error) {
+      console.error('[storage] Failed to migrate legacy ChatGPT data directory:', error);
+      userDataPath = legacyPath;
+    }
+  } else if (
+    !fs.existsSync(path.join(applicationPath, 'archive-catalog.db'))
+    && !fs.existsSync(path.join(applicationPath, 'chatgpt.db'))
+    && fs.existsSync(legacyPath)
+  ) {
+    userDataPath = legacyPath;
+  }
+
+  app.setPath('userData', userDataPath);
+}
 
 function serializeDebugPayload(payload) {
   const seen = new WeakSet();
@@ -59,7 +85,7 @@ function initializeDebugRuntime() {
   if (!DEBUG_MODE) return;
   try {
     const debugDir = path.resolve(
-      process.env.CHATGPT_DEBUG_DIR || path.join(app.getPath('userData'), 'debug')
+      process.env.AIBACKMAN_DEBUG_DIR || path.join(app.getPath('userData'), 'debug')
     );
     const crashDumps = path.join(debugDir, 'crashes');
     fs.mkdirSync(crashDumps, { recursive: true });
@@ -72,14 +98,14 @@ function initializeDebugRuntime() {
     app.setPath('crashDumps', crashDumps);
 
     app.commandLine.appendSwitch('remote-debugging-address', '127.0.0.1');
-    app.commandLine.appendSwitch('remote-debugging-port', process.env.CHATGPT_REMOTE_DEBUG_PORT || '9222');
+    app.commandLine.appendSwitch('remote-debugging-port', process.env.AIBACKMAN_REMOTE_DEBUG_PORT || '9222');
     app.commandLine.appendSwitch('enable-logging', 'file');
     app.commandLine.appendSwitch('log-file', debugRuntimePaths.chromium);
     app.commandLine.appendSwitch('log-level', '0');
-    if (process.env.CHATGPT_VERBOSE_LOGGING === '1') app.commandLine.appendSwitch('v', '1');
+    if (process.env.AIBACKMAN_VERBOSE_LOGGING === '1') app.commandLine.appendSwitch('v', '1');
 
     crashReporter.start({
-      productName: 'chatgpt',
+      productName: 'AIBackman',
       companyName: 'local',
       submitURL: 'https://localhost.invalid',
       uploadToServer: false,
@@ -94,7 +120,7 @@ function initializeDebugRuntime() {
       argv: process.argv,
       versions: process.versions,
       paths: debugRuntimePaths,
-      remoteDebuggingPort: process.env.CHATGPT_REMOTE_DEBUG_PORT || '9222',
+      remoteDebuggingPort: process.env.AIBACKMAN_REMOTE_DEBUG_PORT || '9222',
     });
     console.info('[debug] Persistent diagnostics:', debugRuntimePaths);
   } catch (error) {
@@ -112,6 +138,7 @@ if (OOM_DEBUG) {
   app.commandLine.appendSwitch('enable-precise-memory-info');
 }
 
+configureApplicationStorage();
 initializeDebugRuntime();
 
 if (DEBUG_MODE) {
@@ -132,11 +159,11 @@ let db;
 let aiDb;
 let accountManager;
 let chatgptRuntime = null;
-const shouldShowBridgeWindow = () => isDev || process.env.CHATGPT_BRIDGE_VISIBLE === '1';
-const BRIDGE_FAST_MODE = process.env.CHATGPT_BRIDGE_FAST_MODE !== '0';
-const BRIDGE_FAST_TURNS = Math.max(1, Number(process.env.CHATGPT_BRIDGE_FAST_TURNS || 1));
-const BRIDGE_FAST_CACHE = Math.max(1, Number(process.env.CHATGPT_BRIDGE_FAST_CACHE || 5));
-const BRIDGE_RESOURCE_BLOCKING = process.env.CHATGPT_BRIDGE_RESOURCE_BLOCKING === '1';
+const shouldShowBridgeWindow = () => isDev || process.env.AIBACKMAN_BRIDGE_VISIBLE === '1';
+const BRIDGE_FAST_MODE = process.env.AIBACKMAN_BRIDGE_FAST_MODE !== '0';
+const BRIDGE_FAST_TURNS = Math.max(1, Number(process.env.AIBACKMAN_BRIDGE_FAST_TURNS || 1));
+const BRIDGE_FAST_CACHE = Math.max(1, Number(process.env.AIBACKMAN_BRIDGE_FAST_CACHE || 5));
+const BRIDGE_RESOURCE_BLOCKING = process.env.AIBACKMAN_BRIDGE_RESOURCE_BLOCKING === '1';
 const BRIDGE_BLOCKED_RESOURCE_TYPES = new Set(['image', 'imageset', 'media', 'font']);
 const AI_MODE_URL = process.env.AI_MODE_URL || 'https://www.google.com/search?udm=50&aep=11';
 const AI_MODE_HISTORY_BUTTON_SELECTOR = 'button.UTNPFf[aria-label="AI Mode history"], button[aria-label="AI Mode history"]';
@@ -152,12 +179,12 @@ function createWindow() {
       preload: path.join(__dirname, 'preload.cjs'),
       nodeIntegration: false,
       contextIsolation: true,
-      additionalArguments: [`--chatgpt-debug=${DEBUG_MODE ? '1' : '0'}`],
+      additionalArguments: [`--aibackman-debug=${DEBUG_MODE ? '1' : '0'}`],
     },
   });
   chatgptRuntime.attachRendererDiagnostics('main', mainWindow.webContents);
 
-  if (DEBUG_MODE && process.env.CHATGPT_OPEN_DEVTOOLS === '1') {
+  if (DEBUG_MODE && process.env.AIBACKMAN_OPEN_DEVTOOLS === '1') {
     mainWindow.webContents.once('did-finish-load', () => {
       if (!mainWindow.isDestroyed()) mainWindow.webContents.openDevTools({ mode: 'detach' });
     });

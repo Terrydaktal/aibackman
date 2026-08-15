@@ -1,12 +1,12 @@
-# aibackman
+# AIBackdiff
 
-`aibackman` is a read-only native GUI for comparing any two AI Mode SQLite
-databases or Google Takeout backups.
+`aibackdiff` is a read-only native GUI for comparing any two AI archive
+databases or official backups.
 
 Run it from the project root:
 
 ```sh
-npm run aibackman
+npm run aibackdiff
 ```
 
 Choose a baseline source and a comparison source. Either source can be:

@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import type { AgentAccount, Conversation, Message } from '../../types';
+import { archiveItemLabel } from '../archiveLabels';
 import { Virtuoso, type StateSnapshot, type VirtuosoHandle } from 'react-virtuoso';
 import {
   buildCitationRegistry,
@@ -43,6 +44,8 @@ export function ChatWorkspace({
   initialSearchQuery = '',
 }: ChatWorkspaceProps) {
   const isAiMode = account.agentId === 'google-ai-mode';
+  const itemLabel = archiveItemLabel(account.agentId, true);
+  const itemLabelSingular = archiveItemLabel(account.agentId);
   const isLiveChatGPT = account.agentId === 'chatgpt' && account.capabilities.liveSync;
   const canLiveSync = account.capabilities.liveSync;
   const canSend = account.capabilities.send;
@@ -658,7 +661,7 @@ export function ChatWorkspace({
   }, []);
 
   const handleDeleteConversation = async (id: string) => {
-    if (window.confirm('Permanently delete this chat from your local database?')) {
+    if (window.confirm(`Permanently delete this ${itemLabelSingular} from your local database?`)) {
       await invokeMode('db:deleteConversation', { id });
       if (activeConvId === id) {
         setActiveConvId(null);
@@ -761,7 +764,7 @@ export function ChatWorkspace({
   const handleOpenImage = useCallback((src: string) => {
     setImageMenu(null);
     setFullscreenImage(src);
-  }, []);
+  }, [setFullscreenImage, setImageMenu]);
 
   useEffect(() => {
     if (!fullscreenImage) return;
@@ -785,7 +788,7 @@ export function ChatWorkspace({
       console.error('Copy image failed:', result?.error || 'unknown error');
     }
     setImageMenu(null);
-  }, [fullscreenImage, activeConvId]);
+  }, [activeConvId, fullscreenImage, setImageMenu]);
 
   useEffect(() => {
     let unsubscribe: (() => void) | undefined;
@@ -883,7 +886,7 @@ export function ChatWorkspace({
   if (isLiveChatGPT && isAuth === null) return <div className="auth-overlay">Loading...</div>;
   if (isLiveChatGPT && isAuth === false) return (
     <div className="auth-overlay">
-      <h1>ChatGPT Desktop</h1>
+      <h1>AIBackman</h1>
       <p>Please log in to your ChatGPT Plus account</p>
       <button className="login-btn" onClick={handleLogin}>Login with Browser</button>
     </div>
@@ -916,7 +919,7 @@ export function ChatWorkspace({
                 setRestoreVirtuosoState(null);
                 invokeMode('api:prewarmConversation', { conversationId: null }).catch((error) => console.warn('Failed to prewarm new chat bridge', error));
               }}>+ New Chat</button> : <div className="sidebar-account-name" title={account.label}>{account.label}</div>}
-              <button className="search-trigger-btn" onClick={openSearch} title="Search Chats">
+              <button className="search-trigger-btn" onClick={openSearch} title={`Search ${itemLabel}`}>
                 <svg viewBox="0 0 24 24" fill="currentColor" width="20" height="20"><path d="M15.5 14h-.79l-.28-.27A6.471 6.471 0 0 0 16 9.5 6.5 6.5 0 1 0 9.5 16c1.61 0 3.09-.59 4.23-1.57l.27.28v.79l5 4.99L20.49 19l-4.99-5zm-6 0C7.01 14 5 11.99 5 9.5S7.01 5 9.5 5 14 7.01 14 9.5 11.99 14 9.5 14z"/></svg>
               </button>
             </div>
@@ -954,12 +957,12 @@ export function ChatWorkspace({
                   <span className="stats-label">Cached:</span>
                   <span className="stats-value">{cacheStats.cachedCount} / {cacheStats.localCount}</span>
                 </div>
-                <div className="cache-stats-line" title="Uncached chats split by known failed fetches vs unknown/no-data cases">
+                <div className="cache-stats-line" title="Uncached conversations split by known failed fetches vs unknown/no-data cases">
                   <span className="stats-label">Uncached:</span>
                   <span className="stats-value">{cacheDiagnostics.uncachedCount}</span>
                   <span className="stats-subvalue">fail {cacheDiagnostics.failedCount} · unknown {cacheDiagnostics.unknownCount}</span>
                 </div>
-                <div className="cache-stats-line" title="Cached chats that need a full sync">
+                <div className="cache-stats-line" title="Cached conversations that need a full sync">
                   <span className="stats-label">Needs sync:</span>
                   <span className="stats-value">{cacheDiagnostics.dirtyCount}</span>
                 </div>
@@ -994,7 +997,7 @@ export function ChatWorkspace({
                       className={`cache-all-btn ${isCachingAll ? 'spinning' : ''}`}
                       onClick={handleCacheAll}
                       disabled={isCachingAll || (cacheDiagnostics.uncachedCount === 0 && cacheDiagnostics.dirtyCount === 0)}
-                      title="Cache missing chats and refresh chats that need a full sync"
+                      title="Cache missing conversations and refresh conversations that need a full sync"
                     >
                       <svg viewBox="0 0 24 24" fill="currentColor" width="16" height="16">
                         <path d="M19 9h-4V3H9v6H5l7 7 7-7zM5 18v2h14v-2H5z"/>
@@ -1005,7 +1008,7 @@ export function ChatWorkspace({
               </div>
             </div>
             <div className="footer-actions">
-              <button className="sync-btn-sidebar" onClick={() => void handleRefreshCurrentChat()} disabled={!activeConvId} title={canRefreshLocal ? 'Refresh local backup' : canLiveSync ? 'Sync current chat' : 'Reload cached chat'}>
+              <button className="sync-btn-sidebar" onClick={() => void handleRefreshCurrentChat()} disabled={!activeConvId} title={canRefreshLocal ? 'Refresh local backup' : canLiveSync ? `Sync current ${itemLabelSingular}` : `Reload cached ${itemLabelSingular}`}>
                 <svg viewBox="0 0 24 24" fill="currentColor" width="16" height="16"><path d="M17.65 6.35C16.2 4.9 14.21 4 12 4c-4.42 0-7.99 3.58-7.99 8s3.57 8 7.99 8c3.73 0 6.84-2.55 7.73-6h-2.08c-.82 2.33-3.04 4-5.65 4-3.31 0-6-2.69-6-6s2.69-6 6-6c1.66 0 3.14.69 4.22 1.78L13 11h7V4l-2.35 2.35z"/></svg>
               </button>
               <button
@@ -1033,7 +1036,7 @@ export function ChatWorkspace({
           onMouseDown={handleSidebarResizeStart}
           role="separator"
           aria-orientation="vertical"
-          aria-label="Resize chat list panel"
+          aria-label={`Resize ${itemLabel} list panel`}
         />
       ) : null}
       <div className={`main-content ${isSidebarOpen ? 'sidebar-open' : 'sidebar-closed'} ${isMessageMapOpen ? 'map-open' : 'map-closed'}`}>
@@ -1044,8 +1047,8 @@ export function ChatWorkspace({
         <button
           className={`sidebar-toggle ${isSidebarOpen ? 'open' : 'closed'}`}
           onClick={toggleSidebar}
-          title={isSidebarOpen ? 'Hide chat list' : 'Show chat list'}
-          aria-label={isSidebarOpen ? 'Hide chat list' : 'Show chat list'}
+          title={isSidebarOpen ? `Hide ${itemLabel} list` : `Show ${itemLabel} list`}
+          aria-label={isSidebarOpen ? `Hide ${itemLabel} list` : `Show ${itemLabel} list`}
         >
           {isSidebarOpen ? '‹' : '›'}
         </button>
@@ -1100,7 +1103,7 @@ export function ChatWorkspace({
           >
             {isMessageMapOpen ? '›' : '‹'}
           </button>
-          <aside className={`content-nav ${isMessageMapOpen ? '' : 'collapsed'}`} aria-label="Chat message navigation">
+          <aside className={`content-nav ${isMessageMapOpen ? '' : 'collapsed'}`} aria-label={`${itemLabelSingular[0].toUpperCase()}${itemLabelSingular.slice(1)} message navigation`}>
             <div className="content-nav-header">
               <span>Message Map</span>
             </div>
@@ -1123,7 +1126,7 @@ export function ChatWorkspace({
                 <input
                   type="text"
                   className="content-nav-search-input"
-                  placeholder="Find in this chat..."
+                  placeholder={`Find in this ${itemLabelSingular}...`}
                   value={mapSearchQuery}
                   onMouseDown={(e) => {
                     if (e.button === 1) e.preventDefault();
@@ -1280,7 +1283,7 @@ export function ChatWorkspace({
               <input type="range" min={FONT_SIZE_MIN} max={FONT_SIZE_MAX} value={fontSize} onChange={(e) => setFontSize(parseInt(e.target.value, 10))} />
             </div>
             <div className="setting-item">
-              <label>Chat Column Width <span className="setting-value">{chatWidth}px</span></label>
+              <label>Content Column Width <span className="setting-value">{chatWidth}px</span></label>
               <input type="range" min="400" max="5000" step="50" value={chatWidth} onChange={(e) => setChatWidth(parseInt(e.target.value))} />
             </div>
             <div className="setting-item">
@@ -1313,7 +1316,7 @@ export function ChatWorkspace({
         <div className="modal-backdrop" onClick={closeSearch}>
           <div className="search-modal" onClick={e => e.stopPropagation()}>
             <div className="modal-header">
-              <h2>Search Conversations</h2>
+              <h2>{`Search ${itemLabel[0].toUpperCase()}${itemLabel.slice(1)}`}</h2>
               <button className="close-modal" onClick={closeSearch}>×</button>
             </div>
             <div className="search-input-container">

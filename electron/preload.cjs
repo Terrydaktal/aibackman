@@ -1,7 +1,7 @@
 const { contextBridge, ipcRenderer } = require('electron');
 
 contextBridge.exposeInMainWorld('electronAPI', {
-  debugEnabled: process.argv.includes('--chatgpt-debug=1'),
+  debugEnabled: process.argv.includes('--aibackman-debug=1'),
   // We will add IPC handlers here
   sendMessage: (channel, data) => ipcRenderer.send(channel, data),
   onMessage: (channel, func) => ipcRenderer.on(channel, (event, ...args) => func(...args)),

@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { AgentAccount, AgentOverview, ArchiveOverview, GlobalSearchResult } from '../../types';
+import { archiveItemLabel } from '../archiveLabels';
 
 export interface ArchiveNavigationTarget {
   conversationId?: string;
@@ -21,7 +22,7 @@ const resultPreview = (content: string, query: string) => {
 
 const formatCount = (value: number | undefined) => new Intl.NumberFormat().format(Number(value || 0));
 
-const summarizeRefresh = (label: string, result: unknown) => {
+const summarizeRefresh = (label: string, result: unknown, itemLabel: string) => {
   const resultRecord = result && typeof result === 'object' ? result as Record<string, unknown> : null;
   const rows = Array.isArray(resultRecord?.results) ? resultRecord.results : [result];
   const readNumber = (row: unknown, key: string) => (
@@ -32,7 +33,7 @@ const summarizeRefresh = (label: string, result: unknown) => {
   const skippedFiles = rows.reduce((sum, row) => sum + readNumber(row, 'skippedFiles'), 0);
   const parseErrors = rows.reduce((sum, row) => sum + readNumber(row, 'parseErrors'), 0);
   if (importedConversations || importedMessages) {
-    return `${label}: imported ${formatCount(importedConversations)} chats and ${formatCount(importedMessages)} messages${skippedFiles ? `; skipped ${formatCount(skippedFiles)} unchanged files` : ''}${parseErrors ? `; ${formatCount(parseErrors)} parse errors` : ''}.`;
+    return `${label}: imported ${formatCount(importedConversations)} ${itemLabel} and ${formatCount(importedMessages)} messages${skippedFiles ? `; skipped ${formatCount(skippedFiles)} unchanged files` : ''}${parseErrors ? `; ${formatCount(parseErrors)} parse errors` : ''}.`;
   }
   return `${label}: no changes found${skippedFiles ? `; ${formatCount(skippedFiles)} files were unchanged` : ''}${parseErrors ? `; ${formatCount(parseErrors)} parse errors` : ''}.`;
 };
@@ -151,7 +152,7 @@ export function ArchiveHome({ onOpenAccount }: ArchiveHomeProps) {
     setActionStatus('');
     try {
       const result = await window.electronAPI.invoke('archive:refreshLocal', { accountId: account.id });
-      setActionStatus(summarizeRefresh(account.label, result));
+      setActionStatus(summarizeRefresh(account.label, result, archiveItemLabel(account.agentId, true)));
       await loadOverview();
     } catch (refreshError) {
       setError(String((refreshError as Error)?.message || refreshError));
@@ -166,7 +167,7 @@ export function ArchiveHome({ onOpenAccount }: ArchiveHomeProps) {
     setActionStatus('');
     try {
       const result = await window.electronAPI.invoke('archive:refreshAllLocal', { agentId: agent.id });
-      setActionStatus(summarizeRefresh(`${agent.name} local accounts`, result));
+      setActionStatus(summarizeRefresh(`${agent.name} local accounts`, result, archiveItemLabel(agent.id, true)));
       await loadOverview();
     } catch (refreshError) {
       setError(String((refreshError as Error)?.message || refreshError));
@@ -196,8 +197,8 @@ export function ArchiveHome({ onOpenAccount }: ArchiveHomeProps) {
     try {
       const result = await window.electronAPI.invoke('archive:openComparator');
       setActionStatus(result?.alreadyRunning
-        ? 'The backup comparator is already open.'
-        : 'Opened the backup comparator.');
+        ? 'AIBackdiff is already open.'
+        : 'Opened AIBackdiff.');
     } catch (comparatorError) {
       setError(String((comparatorError as Error)?.message || comparatorError));
     } finally {
@@ -219,12 +220,12 @@ export function ArchiveHome({ onOpenAccount }: ArchiveHomeProps) {
     <main className="archive-home">
       <header className="archive-home-header">
         <div>
-          <div className="archive-kicker">AI archive</div>
+          <div className="archive-kicker">AIBackman</div>
           <h1>Conversations</h1>
         </div>
         <div className="archive-totals" aria-label="Archive totals">
           <span><strong>{formatCount(overview?.totals.accounts)}</strong> accounts</span>
-          <span><strong>{formatCount(overview?.totals.conversations)}</strong> chats</span>
+          <span><strong>{formatCount(overview?.totals.conversations)}</strong> conversations</span>
           <span><strong>{formatCount(overview?.totals.messages)}</strong> messages</span>
         </div>
       </header>
@@ -256,7 +257,7 @@ export function ArchiveHome({ onOpenAccount }: ArchiveHomeProps) {
                 <i style={{ background: result.agent_accent }} />
                 {result.agent_name} / {result.account_label}
               </span>
-              <strong>{result.conversation_title || 'Untitled chat'}</strong>
+              <strong>{result.conversation_title || `Untitled ${archiveItemLabel(result.agent_id)}`}</strong>
               <span className="global-result-preview">{resultPreview(result.content, query)}</span>
               <span className="global-result-role">{result.role}</span>
             </button>
@@ -305,7 +306,7 @@ export function ArchiveHome({ onOpenAccount }: ArchiveHomeProps) {
                       <span className="account-card-title">{account.label}</span>
                       <span className="account-card-kind">{account.sourceKind}</span>
                       <span className="account-card-stats">
-                        {formatCount(account.stats?.conversationCount)} chats · {formatCount(account.stats?.messageCount)} messages
+                        {formatCount(account.stats?.conversationCount)} {archiveItemLabel(agent.id, true)} · {formatCount(account.stats?.messageCount)} messages
                       </span>
                     </button>
                     <div className="account-card-actions">

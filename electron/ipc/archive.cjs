@@ -7,19 +7,19 @@ let comparatorProcess = null;
 function comparatorLaunchSpec(app) {
   const projectRoot = path.resolve(__dirname, '../..');
   const candidates = [
-    process.env.AIBACKMAN_BIN,
-    path.join(projectRoot, 'tools', 'aibackman', 'target', 'release', 'aibackman'),
-    path.join(projectRoot, 'tools', 'aibackman', 'target', 'debug', 'aibackman'),
-    path.join(app.getAppPath(), 'tools', 'aibackman', 'target', 'release', 'aibackman'),
+    process.env.AIBACKDIFF_BIN,
+    path.join(projectRoot, 'tools', 'aibackdiff', 'target', 'release', 'aibackdiff'),
+    path.join(projectRoot, 'tools', 'aibackdiff', 'target', 'debug', 'aibackdiff'),
+    path.join(app.getAppPath(), 'tools', 'aibackdiff', 'target', 'release', 'aibackdiff'),
   ].filter(Boolean);
   const binary = candidates.find((candidate) => fs.existsSync(candidate));
   if (binary) return { command: binary, args: [], cwd: projectRoot };
 
-  const manifest = path.join(projectRoot, 'tools', 'aibackman', 'Cargo.toml');
+  const manifest = path.join(projectRoot, 'tools', 'aibackdiff', 'Cargo.toml');
   if (fs.existsSync(manifest)) {
     return { command: 'cargo', args: ['run', '--manifest-path', manifest, '--release'], cwd: projectRoot };
   }
-  throw new Error('aibackman is not available. Build tools/aibackman or set AIBACKMAN_BIN.');
+  throw new Error('aibackdiff is not available. Build tools/aibackdiff or set AIBACKDIFF_BIN.');
 }
 
 function registerArchiveIpc({
@@ -61,7 +61,7 @@ function registerArchiveIpc({
       env: { ...process.env, RUST_BACKTRACE: process.env.RUST_BACKTRACE || '1' },
     });
     comparatorProcess.once('error', (error) => {
-      console.error('Failed to launch aibackman:', error);
+      console.error('Failed to launch aibackdiff:', error);
       comparatorProcess = null;
     });
     comparatorProcess.once('exit', () => {

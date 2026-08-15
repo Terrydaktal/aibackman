@@ -1,4 +1,4 @@
-# AI Conversation Archive
+# AIBackman
 
 A local-first Electron archive for browsing and searching conversations from multiple AI agents and accounts. The application keeps each account in an independent SQLite database, presents all agents and accounts on one home page, and searches every archive from one global search field.
 
@@ -67,7 +67,7 @@ Backup accounts are read-only snapshots. Multiple backups from the same provider
 │   └── reconcile-aimode-takeout.cjs   # Standalone AI Mode reconciliation
 ├── tools/
 │   ├── db-search/             # Rust streaming SQLite search helper
-│   └── aibackman/             # GUI AI Mode backup/database comparator
+│   └── aibackdiff/            # GUI AI archive backup/database comparator
 └── package.json
 ```
 
@@ -102,10 +102,12 @@ Register a new plugin once in `electron/agents/registry.cjs`. It must write thro
 
 ## Database Layout
 
-On Linux, Electron normally stores the archive under `~/.config/chatgpt/`:
+On Linux, Electron normally stores the archive under `~/.config/aibackman/`:
+the first launch after upgrading migrates the legacy `~/.config/chatgpt/`
+directory when it is present.
 
 ```text
-~/.config/chatgpt/
+~/.config/aibackman/
 ├── archive-catalog.db  # Account identity, provider, source kind, DB path
 ├── chatgpt.db          # Existing default live ChatGPT account
 ├── aimode.db           # Existing default live Google AI Mode account
@@ -167,9 +169,9 @@ Codex reads all system sessions and routes them by the account IDs found in sess
 The default ChatGPT and Google AI Mode accounts retain their bridge-specific controls. Live responses that look partial or interrupted do not replace a more complete cached conversation. Cache-all supports progress, retries, cancellation, and preservation of locally cached deleted chats.
 
 The Google AI Mode section also has `Compare backups`, which opens the
-`aibackman` GUI. It compares the default AI Mode database with another
+`AIBackdiff` GUI. It compares the default AI Mode database with another
 database or Takeout backup and reports added, missing, changed, and unchanged
-chats. The same GUI can be started directly with `npm run aibackman`.
+chats. The same GUI can be started directly with `npm run aibackdiff`.
 
 ## Commands
 
@@ -180,8 +182,8 @@ chats. The same GUI can be started directly with `npm run aibackman`.
 - `npm run test:archive`: test all backup/local adapters, account refresh, and cross-account search under Electron's native Node ABI.
 - `npm run test:highlight`: run crash/highlight regression checks.
 - `cargo test --manifest-path tools/db-search/Cargo.toml`: test the Rust search worker.
-- `cargo test --manifest-path tools/aibackman/Cargo.toml`: test the backup comparison GUI core.
-- `npm run aibackman`: run the AI Mode backup/database comparison GUI.
+- `cargo test --manifest-path tools/aibackdiff/Cargo.toml`: test the backup comparison GUI core.
+- `npm run aibackdiff`: run the AI archive backup/database comparison GUI.
 - `npm run aimode:reconcile-takeout -- DATABASE TAKEOUT`: diagnose and optionally reconcile an AI Mode database from Takeout.
 - `npm run electron:release`: build and start the production application.
 - `npm run preview`: serve the built renderer locally.
@@ -193,7 +195,7 @@ npm run lint
 npm run test:highlight
 npm run test:archive
 cargo test --manifest-path tools/db-search/Cargo.toml
-cargo test --manifest-path tools/aibackman/Cargo.toml
+cargo test --manifest-path tools/aibackdiff/Cargo.toml
 npm run build
 ```
 
@@ -201,9 +203,9 @@ npm run build
 
 `npm run electron:release:debug` builds production code with source maps, enables persistent diagnostics, exposes the renderer DevTools endpoint at `http://127.0.0.1:9222`, and exposes the main-process Node inspector at `127.0.0.1:9229`.
 
-- Diagnostics: `~/.config/chatgpt/debug/events-*.jsonl` and `chromium-*.log`.
-- Crash dumps: `~/.config/chatgpt/debug/crashes/`.
-- Set `CHATGPT_OPEN_DEVTOOLS=1` to open detached renderer DevTools automatically.
+- Diagnostics: `~/.config/aibackman/debug/events-*.jsonl` and `chromium-*.log`.
+- Crash dumps: `~/.config/aibackman/debug/crashes/`.
+- Set `AIBACKMAN_OPEN_DEVTOOLS=1` to open detached renderer DevTools automatically.
 - For a native debugger, find the Electron PID with `pgrep -a -f 'node_modules/electron/dist/electron'`, then attach with `gdb -p PID`.
 
 ## Inputs and Outputs

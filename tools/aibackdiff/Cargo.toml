@@ -1,8 +1,8 @@
 [package]
-name = "aibackman"
+name = "aibackdiff"
 version = "0.1.0"
 edition = "2024"
-description = "GUI for comparing an AI Mode Google Takeout backup with the current chat database"
+description = "GUI for comparing AI archive databases and official backups"
 
 [dependencies]
 anyhow = "1.0"
@@ -13,4 +13,3 @@ rfd = "0.15"
 rusqlite = { version = "0.37", features = ["bundled"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-

@@ -25,6 +25,21 @@ static WHITESPACE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"[ \t]+\n").un
 static EXTRA_NEWLINES: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\n{3,}").unwrap());
 static TITLE_SPACES: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\s+").unwrap());
 
+fn default_aimode_database_path() -> String {
+    let Some(home) = env::var_os("HOME") else {
+        return String::new();
+    };
+    let current = PathBuf::from(&home).join(".config/aibackman/aimode.db");
+    if current.exists() {
+        return current.display().to_string();
+    }
+    let legacy = PathBuf::from(home).join(".config/chatgpt/aimode.db");
+    if legacy.exists() {
+        return legacy.display().to_string();
+    }
+    current.display().to_string()
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize)]
 struct Message {
     role: String,
@@ -165,7 +180,7 @@ struct CompareFinished {
     result: std::result::Result<Report, String>,
 }
 
-struct AiBackmanApp {
+struct AiBackdiffApp {
     baseline_path: String,
     comparison_path: String,
     report: Option<Report>,
@@ -176,13 +191,9 @@ struct AiBackmanApp {
     compare_rx: Option<Receiver<CompareFinished>>,
 }
 
-impl Default for AiBackmanApp {
+impl Default for AiBackdiffApp {
     fn default() -> Self {
-        let baseline_path = env::var("HOME")
-            .ok()
-            .map(|home| format!("{home}/.config/chatgpt/aimode.db"))
-            .filter(|path| Path::new(path).exists())
-            .unwrap_or_default();
+        let baseline_path = default_aimode_database_path();
         Self {
             baseline_path,
             comparison_path: String::new(),
@@ -196,7 +207,7 @@ impl Default for AiBackmanApp {
     }
 }
 
-impl AiBackmanApp {
+impl AiBackdiffApp {
     fn google_backups_dialog() -> rfd::FileDialog {
         let dialog = rfd::FileDialog::new();
         let preferred = Path::new("/home/lewis/Desktop/backups/Google");
@@ -260,7 +271,7 @@ impl AiBackmanApp {
             return;
         };
         let Some(path) = rfd::FileDialog::new()
-            .set_file_name("aibackman-report.json")
+            .set_file_name("aibackdiff-report.json")
             .add_filter("JSON report", &["json"])
             .save_file()
         else {
@@ -288,10 +299,8 @@ impl AiBackmanApp {
             {
                 self.baseline_path = path.display().to_string();
             }
-            if ui.button("Use aimode.db default").clicked()
-                && let Ok(home) = env::var("HOME")
-            {
-                self.baseline_path = format!("{home}/.config/chatgpt/aimode.db");
+            if ui.button("Use aimode.db default").clicked() {
+                self.baseline_path = default_aimode_database_path();
             }
         });
         ui.add_space(8.0);
@@ -475,12 +484,12 @@ impl AiBackmanApp {
     }
 }
 
-impl eframe::App for AiBackmanApp {
+impl eframe::App for AiBackdiffApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_compare(ctx);
         egui::CentralPanel::default().show(ctx, |ui| {
-            ui.heading("AI Backup Manager");
-            ui.label("Compare any two AI Mode SQLite databases or Google Takeout backups.");
+            ui.heading("AIBackdiff");
+            ui.label("Compare AI archive databases and official backups.");
             ui.add_space(8.0);
             self.show_paths(ui);
             ui.separator();
@@ -1232,15 +1241,15 @@ fn change_order(kind: ChangeKind) -> usize {
 fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_title("AI Backup Manager")
+            .with_title("AIBackdiff")
             .with_inner_size([1280.0, 820.0])
             .with_min_inner_size([900.0, 600.0]),
         ..Default::default()
     };
     eframe::run_native(
-        "AI Backup Manager",
+        "AIBackdiff",
         options,
-        Box::new(|_| Ok(Box::<AiBackmanApp>::default())),
+        Box::new(|_| Ok(Box::<AiBackdiffApp>::default())),
     )
 }
 
@@ -1384,7 +1393,7 @@ mod tests {
     #[test]
     fn compares_two_takeout_backups() {
         let unique = format!(
-            "aibackman-test-{}-{}",
+            "aibackdiff-test-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)

@@ -106,6 +106,16 @@ async function main() {
       { id: 'gemini-user-three', timestamp: '2026-01-05T00:00:01Z', type: 'user', displayContent: [{ text: 'displayed question' }], content: [{ text: 'internal question' }] },
       { id: 'gemini-assistant-three', timestamp: '2026-01-05T00:00:02Z', type: 'gemini', content: 'displayed answer' },
     ].map((entry) => JSON.stringify(entry)).join('\n'));
+    fs.writeFileSync(path.join(geminiChatsRoot, 'session-2026-01-05T00-00-local-json.json'), JSON.stringify({
+      sessionId: 'gemini-cli-json',
+      startTime: '2026-01-05T00:00:00Z',
+      lastUpdated: '2026-01-05T00:00:03Z',
+      messages: [
+        { id: 'gemini-user-json', timestamp: '2026-01-05T00:00:01Z', type: 'user', content: 'JSON format question' },
+        { id: 'gemini-assistant-json-progress', timestamp: '2026-01-05T00:00:02Z', type: 'gemini', content: 'JSON format progress' },
+        { id: 'gemini-assistant-json', timestamp: '2026-01-05T00:00:03Z', type: 'gemini', content: 'JSON format answer' },
+      ],
+    }));
 
     const discoveredGeminiAccounts = geminiCli.discoverAccounts({ geminiRoot, sessionsRoot: geminiSessionsRoot });
     assert.deepEqual(discoveredGeminiAccounts.map((account) => account.label), [
@@ -127,10 +137,10 @@ async function main() {
     });
     const initiallyActiveGemini = discoveredGeminiAccounts.find((account) => account.sourceConfig.active);
     const initiallyInactiveGemini = discoveredGeminiAccounts.find((account) => !account.sourceConfig.active);
-    assert.equal(localGeminiDatabases.get(initiallyActiveGemini.id).getStats().conversationCount, 2);
-    assert.equal(localGeminiDatabases.get(initiallyActiveGemini.id).getStats().messageCount, 6);
+    assert.equal(localGeminiDatabases.get(initiallyActiveGemini.id).getStats().conversationCount, 3);
+    assert.equal(localGeminiDatabases.get(initiallyActiveGemini.id).getStats().messageCount, 8);
     assert.equal(localGeminiDatabases.get(initiallyInactiveGemini.id).getStats().conversationCount, 0);
-    assert.equal(firstLocalGeminiRefresh.results.find((result) => result.account.id === initiallyActiveGemini.id).importedConversations, 2);
+    assert.equal(firstLocalGeminiRefresh.results.find((result) => result.account.id === initiallyActiveGemini.id).importedConversations, 3);
     assert.equal(localGeminiDatabases.get(initiallyActiveGemini.id).getMessages('gemini-cli-two')[0].content, 'displayed question');
 
     fs.writeFileSync(path.join(geminiChatsRoot, 'session-2026-01-06T00-00-local-three.jsonl'), [
@@ -149,7 +159,7 @@ async function main() {
       accounts: switchedGeminiAccounts,
       getDatabase: (account) => localGeminiDatabases.get(account.id),
     });
-    assert.equal(localGeminiDatabases.get(initiallyActiveGemini.id).getStats().conversationCount, 2);
+    assert.equal(localGeminiDatabases.get(initiallyActiveGemini.id).getStats().conversationCount, 3);
     assert.equal(localGeminiDatabases.get(initiallyInactiveGemini.id).getStats().conversationCount, 1);
     assert.equal(localGeminiDatabases.get(initiallyInactiveGemini.id).getMessages('gemini-cli-three').length, 2);
 
@@ -159,9 +169,10 @@ async function main() {
     fs.writeFileSync(codexSessionPath, [
       { timestamp: '2026-02-01T00:00:00Z', type: 'session_meta', payload: { id: 'codex-session', cwd: '/tmp/project' } },
       { timestamp: '2026-02-01T00:00:01Z', type: 'event_msg', payload: { type: 'user_message', message: 'codex question' } },
-      { timestamp: '2026-02-01T00:00:02Z', type: 'event_msg', account_id: 'account-one', payload: { type: 'token_count' } },
-      { timestamp: '2026-02-01T00:00:03Z', type: 'event_msg', payload: { type: 'agent_message', message: 'codex answer', phase: 'final' } },
-      { timestamp: '2026-02-01T00:00:04Z', type: 'event_msg', account_id: 'account-two', payload: { type: 'token_count' } },
+      { timestamp: '2026-02-01T00:00:02Z', type: 'event_msg', payload: { type: 'agent_message', message: 'codex internal progress', phase: 'commentary' } },
+      { timestamp: '2026-02-01T00:00:03Z', type: 'event_msg', account_id: 'account-one', payload: { type: 'token_count' } },
+      { timestamp: '2026-02-01T00:00:04Z', type: 'event_msg', payload: { type: 'agent_message', message: 'codex answer', phase: 'final' } },
+      { timestamp: '2026-02-01T00:00:05Z', type: 'event_msg', account_id: 'account-two', payload: { type: 'token_count' } },
     ].map((entry) => JSON.stringify(entry)).join('\n'));
     fs.writeFileSync(path.join(sessionsRoot, 'rollout-unattributed.jsonl'), [
       { timestamp: '2026-02-02T00:00:00Z', type: 'session_meta', payload: { id: 'codex-unattributed-session', cwd: '/tmp/other-project' } },

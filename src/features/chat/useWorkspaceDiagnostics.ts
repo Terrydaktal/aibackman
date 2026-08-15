@@ -110,10 +110,10 @@ export function useWorkspaceDiagnostics() {
         ...statsRef.current,
       }),
     };
-    (window as Window & { __chatgptOomDebug?: typeof api }).__chatgptOomDebug = api;
+    (window as Window & { __aibackmanOomDebug?: typeof api }).__aibackmanOomDebug = api;
     return () => {
-      const target = window as Window & { __chatgptOomDebug?: typeof api };
-      if (target.__chatgptOomDebug === api) delete target.__chatgptOomDebug;
+      const target = window as Window & { __aibackmanOomDebug?: typeof api };
+      if (target.__aibackmanOomDebug === api) delete target.__aibackmanOomDebug;
     };
   }, []);
 

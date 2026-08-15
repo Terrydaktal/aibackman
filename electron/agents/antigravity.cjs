@@ -99,7 +99,7 @@ async function refreshLocal({ db, sourceConfig = {}, onProgress }) {
       const updatedAt = asUnixSeconds(summary.UpdatedAt, parsed.messages.at(-1).created_at);
       db.importConversationSnapshot({
         id: conversationId,
-        title: compactTitle(summary.Title || summary.Preview || firstUser?.content, 'Antigravity chat'),
+        title: compactTitle(summary.Title || summary.Preview || firstUser?.content, 'Antigravity session'),
         created_at: createdAt,
         updated_at: updatedAt,
         last_synced_updated_at: updatedAt,

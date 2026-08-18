@@ -1,3 +1,6 @@
+const { readConversations } = require('../archive/standard/reader.cjs');
+const { STANDARD_CACHE_FORMAT_VERSION } = require('../archive/standard/cacheVersion.cjs');
+
 function withJitter(milliseconds, jitterRatio = 0.25) {
   const jitter = milliseconds * jitterRatio;
   return Math.max(0, Math.round(milliseconds + ((Math.random() * 2 - 1) * jitter)));
@@ -119,15 +122,17 @@ function createChatGptCacheService({ auth, db, conversations }) {
       if (signal.aborted) break;
       inspected += 1;
       publish('chat-start', { id: conversation.id, title: conversation.title || '' });
-      const hasMessages = db.db.prepare('SELECT id FROM messages WHERE conversation_id = ? LIMIT 1').get(conversation.id);
-      const hasMetadata = db.db
-        .prepare('SELECT id FROM messages WHERE conversation_id = ? AND metadata_json IS NOT NULL LIMIT 1')
-        .get(conversation.id);
-      const needsFullSync = conversation.last_synced_updated_at == null
+      const hasMessages = db.hasMessages(conversation.id);
+      // Older scraper runs stored citations/reasoning metadata but discarded the
+      // model fields. Treat those conversations as uncached so a later cache
+      // run can refresh them with the model and effort metadata now preserved.
+      const hasMissingModelMetadata = db.hasAssistantMessagesMissingModelMetadata(conversation.id);
+      const needsFullSync = conversation.cache_format_version !== STANDARD_CACHE_FORMAT_VERSION
+        || conversation.last_synced_updated_at == null
         || conversation.updated_at == null
         || conversation.updated_at !== conversation.last_synced_updated_at;
 
-      if ((!hasMessages || !hasMetadata || needsFullSync) && !conversation.is_deleted_on_web) {
+      if ((!hasMessages || hasMissingModelMetadata || needsFullSync) && !conversation.is_deleted_on_web) {
         const result = await cacheConversation(conversation, { signal });
         if (result.cancelled) break;
         if (result.success) {
@@ -181,8 +186,28 @@ function createChatGptCacheService({ auth, db, conversations }) {
   return { cancel, start };
 }
 
-function registerChatGptCacheIpc({ ipcMain, auth, db, resolveAccount, conversations }) {
-  const service = createChatGptCacheService({ auth, db, conversations });
+function registerChatGptCacheIpc({
+  ipcMain,
+  auth,
+  db,
+  getDatabase,
+  resolveAccount,
+  conversations,
+  createConversations,
+}) {
+  const services = new Map();
+  const contextFor = (payload) => {
+    const targetDb = getDatabase ? getDatabase(payload) : db;
+    if (!targetDb) throw new Error('No ChatGPT archive database is available for this account.');
+    if (!services.has(targetDb)) {
+      services.set(targetDb, createChatGptCacheService({
+        auth,
+        db: targetDb,
+        conversations: createConversations ? createConversations(targetDb) : conversations,
+      }));
+    }
+    return { db: targetDb, service: services.get(targetDb) };
+  };
   const unsupported = () => ({
     success: false,
     processed: 0,
@@ -190,20 +215,33 @@ function registerChatGptCacheIpc({ ipcMain, auth, db, resolveAccount, conversati
     reason: 'This account does not support live bulk caching',
   });
 
-  ipcMain.handle('api:cancelCache', async () => service.cancel());
+  ipcMain.handle('api:cancelCache', async () => {
+    let cancelled = false;
+    for (const service of services.values()) {
+      if (service.cancel().success) cancelled = true;
+    }
+    return cancelled
+      ? { success: true }
+      : { success: false, reason: 'No cache run is active' };
+  });
   ipcMain.handle('api:cacheAll', async (event, payload) => {
     if (!resolveAccount(payload)?.capabilities.cacheAll) return unsupported();
-    return service.start(event, db.getConversations());
+    const context = contextFor(payload);
+    return context.service.start(event, readConversations(context.db));
   });
   ipcMain.handle('api:cacheFailed', async (event, payload) => {
     if (!resolveAccount(payload)?.capabilities.cacheAll) return unsupported();
-    const diagnostics = db.getCacheDiagnostics(5000);
+    const context = contextFor(payload);
+    const diagnostics = context.db.getCacheDiagnostics(5000);
     const failedIds = new Set(
-      (diagnostics.uncachedRows || [])
+      [...(diagnostics.uncachedRows || []), ...(diagnostics.resyncRows || [])]
         .filter((row) => row.last_error)
         .map((row) => row.id)
     );
-    return service.start(event, db.getConversations().filter((conversation) => failedIds.has(conversation.id)));
+    return context.service.start(
+      event,
+      readConversations(context.db).filter((conversation) => failedIds.has(conversation.id))
+    );
   });
 }
 

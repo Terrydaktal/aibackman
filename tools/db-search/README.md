@@ -25,6 +25,7 @@ tools/db-search/
 ├── README.md
 └── src/
     ├── main.rs
+    ├── ranking_model.rs
     └── db_search/
         ├── mod.rs
         ├── query.rs
@@ -35,3 +36,11 @@ The binary supports `ensure-index`, `search`, and `serve` commands. It opens
 the ChatGPT SQLite database, maintains the `messages_fts` external-content
 index, retrieves FTS candidates, and passes multi-token results through
 `fuzzy-rank` before emitting JSON.
+
+If `CHATGPT_FIELD_RANK_MODEL` is set, or if
+`$XDG_STATE_HOME/chatgpt-db-search/field-rank-model.json` exists, the worker
+loads a schema-versioned `fuzzy-rank::fields::FieldRankModel` and reranks only
+the leading 256 retrieved message candidates. Without a valid active model,
+the deterministic `fields::literal` ordering is unchanged. Model persistence
+and feedback collection remain caller-owned; this worker only loads the model
+and applies it.

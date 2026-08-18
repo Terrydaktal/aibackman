@@ -3,10 +3,13 @@ use std::env;
 use std::io::{self, BufRead, Write};
 
 mod db_search;
+mod ranking_model;
 
 use crate::db_search::query::SearchQuery;
 use crate::db_search::sqlite_fts::{FtsIndexConfig, SearchMode, prepare_fts_query};
-use fuzzy_rank::fields::literal::{MessageCandidate, MessageField, MessageQuery, select_top_k};
+use fuzzy_rank::fields::literal::{
+    MessageCandidate, MessageField, MessageQuery, select_top_k, select_top_k_with_model,
+};
 use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
 
@@ -259,7 +262,11 @@ fn search_messages(
         })
         .collect::<Vec<_>>();
 
-    select_top_k(&mut ranked, output_limit);
+    if let Some(model) = ranking_model::field_rank_model() {
+        select_top_k_with_model(&mut ranked, output_limit, model, 256);
+    } else {
+        select_top_k(&mut ranked, output_limit);
+    }
 
     let mut ordered = Vec::with_capacity(ranked.len());
 

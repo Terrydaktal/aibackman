@@ -26,7 +26,7 @@ import {
   MAX_MAP_SEARCH_QUERY_LEN,
   sanitizeMapSearchQuery,
   type DisplayMessage,
-} from './ChatPresentation';
+} from '../../archive/standard/UniversalArchivePresenter';
 
 interface UseMessageNavigationOptions {
   activeConversationId: string | null;

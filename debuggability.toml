@@ -1,0 +1,225 @@
+schema_version = 5
+template = false
+profile = "stateful"
+owner = "AIBackman maintainers"
+expected_failure_modes = [
+  "renderer or hidden bridge hangs while the main archive UI remains responsive",
+  "database worker stalls, exits, or returns malformed search output",
+  "archive import or cache refresh loses, overwrites, or partially publishes messages",
+  "migration, recovery, or account-store corruption prevents startup",
+  "diagnostic capture itself leaks credentials or changes production timing",
+]
+
+[architecture]
+state_owners = ["React workspace state owns presentation selection; ChatDatabase owns durable archive state; provider bridges own live-site state; diagnostic runtime owns bounded evidence state."]
+mutation_points = ["ChatDatabase.runArchiveOperation is the guarded durable mutation boundary; a private in-process capability and connection-scoped SQLite functions prevent callers from self-authorizing writes; provider writers enter through the standard archive writer."]
+side_effect_boundaries = ["Electron main process, provider bridge windows, database worker process, filesystem archive/audit/recovery paths, and renderer IPC are separate boundaries."]
+fault_containment = "The diagnostic supervisor and SQLite recovery snapshots are outside the renderer and bounded event writer; optional diagnostic failure is non-fatal, while required archive-audit failure refuses the mutation."
+
+[errors]
+typed_codes = "implemented_untested"
+preserves_source_chain = "implemented_tested"
+preserves_first_failure = "implemented_untested"
+causal_ids = ["operation_id", "task_id", "worker_instance_id", "database_instance_id", "store_generation", "diagnostic sequence"]
+
+[invariants]
+release_checks = ["non-destructive archive operations cannot reduce conversation or message counts", "unguarded message/conversation deletion is rejected", "non-empty message content cannot become empty accidentally", "audit and recovery tables are append-only/immutable", "an existing database missing either content table is snapshotted and refused rather than silently recreated", "missing safety triggers are snapshotted before repair"]
+progress_rules = ["database worker requests have a 30-second timeout and completion/cancellation accounting", "bridge generation polling has a bounded timeout", "diagnostic event rings and supervisor responses have fixed limits"]
+resource_balances = ["worker tasks close on success, timeout, worker exit, and stop", "diagnostic supervisor and heartbeat timers are stopped during normal quit", "database recovery snapshots are validated before publication"]
+
+[configuration]
+effective_config = "implemented_untested"
+decision_provenance = "implemented_untested"
+dynamic_change_history = "implemented_untested"
+
+[build]
+identity = "dist/build-info.json contains a schema, deterministic source/git/package identity, mode, platform, artifact digest, and build_id; runtime snapshots and events carry that build_id."
+exact_artifact_retention = "implemented_untested"
+symbols_and_unwind = "implemented_untested"
+source_retrieval = "implemented_untested"
+
+[artifacts]
+cache_identity = "implemented_untested"
+atomic_publication = "implemented_untested"
+generation_manifest = "implemented_untested"
+
+[live]
+capabilities_command = "npm run diagnose -- capabilities (or node scripts/aibackman-diagnose.cjs capabilities)"
+snapshot_command = "npm run diagnose -- snapshot"
+snapshot_consistency = "best-effort"
+independent_of_failure_loop = "implemented_tested"
+capture_timeout_ms = 2000
+
+[history]
+flight_recorder = "implemented_tested"
+schema = "aibackman-diagnostic-event-v1; bounded local ring plus bounded JSONL session file with sequence, monotonic time, causal IDs, build identity, redaction, and drop accounting."
+capacity_events = 1000
+drop_and_overwrite_reporting = "implemented_tested"
+
+[audit_trail]
+mutation_audit = "implemented_tested"
+event_schema = "aibackman-audit-event-v1; SQLite audit rows and a separately recorded hash-chained JSONL mutation journal."
+actor_writer_and_reason = "Every guarded operation records actor, writer component/instance, bounded reason and reason code; actor trust is explicit and caller metadata is not treated as a writer identity."
+attribution_policy = "Archive content, guard context, audit, recovery, and store-identity writes from unguarded SQLite connections are rejected. API operations record asserted in-process actor and writer metadata without claiming authenticated human identity."
+transaction_binding = "The operation_id is the transaction_id and is written by the same SQLite transaction as the operation-completed audit row; store_instance_id and store_generation bind the record to one database lineage."
+attempted_write_policy = "operation-started and operation-failed are retained in the durable journal; committed versus failed outcome is explicit and a pre-commit audit-journal failure refuses the mutation."
+provenance_and_deduplication = "Source fingerprints are written through the guarded source-item operation; operation IDs and event IDs distinguish retries without silently deduplicating a repeated attempt."
+change_representation = "Message audit values are bounded typed summaries with lengths and SHA-256 hashes, never message bodies; immutable recovery records retain exact deleted rows and prior message, conversation, and source-item revisions for explicit restoration."
+direct_write_coverage = "implemented_tested"
+tamper_evidence = "The external journal uses a bounded append-only file, fsync, exclusive lock, sequence, previous-hash/hash chain, automatic startup/pre-append integrity verification, and restrictive directory/file permissions. This detects accidental/local rewriting but is not an external trust anchor against an administrator who can rewrite the entire chain."
+retention_and_access = "Recovery records and verified database snapshots are retained until explicit maintenance; the audit journal is never silently rotated and fails closed at its configured byte budget. Private diagnostics are pruned after 7 days and capped at 64 MiB across sessions."
+query_and_export = "ChatDatabase.getAuditTrail/getRecoveryRecords expose bounded queries; the diagnose CLI exposes only bounded redacted diagnostic control-plane data, not raw archive content."
+sink_failure_policy = "The SQLite audit row is authoritative and transactional; the external journal is supplemental after commit, but startup/operation start and size/integrity failures are surfaced and mutation refusal is used where evidence would otherwise be absent."
+cost_and_backpressure = "Audit event size is capped at 65536 bytes, journal storage at 256 MiB by default, lock acquisition at 2 seconds, and diagnostic events use asynchronous bounded queues. The regression benchmark separately gates a 200-message guarded transaction and optional diagnostic calls."
+assurance_test = "scripts/test-archive-safety.cjs covers rollback guards, direct-write rejection, message insert/update/delete provenance, snapshots, restore, journal chaining, and append-only enforcement."
+max_event_bytes = 65536
+max_added_commit_p99_ms = 200.0
+max_throughput_regression_percent = 5000.0
+max_audit_wait_ms = 2000
+max_storage_bytes_per_day = 268435456
+
+[concurrency]
+task_registry = "implemented_tested"
+lock_wait_introspection = "implemented_untested"
+cross_process_correlation = "implemented_tested"
+
+[resources]
+ownership_reporting = "implemented_tested"
+declared_budgets = ["diagnostic ring: 1000 events", "diagnostic file: 16 MiB per session", "diagnostic total: 64 MiB and 7 days", "diagnostic snapshot: 768 KiB", "diagnostic activation: at most 5 minutes", "supervisor ring: 2000 events", "diagnostic response: 1 MiB", "audit journal: 256 MiB default", "audit event: 64 KiB"]
+high_water_reporting = "implemented_untested"
+
+[reproduction]
+recorded_inputs = ["build mode, source/git/package identity, platform/runtime versions, operation/task/worker/store IDs, bounded configuration and safe input lengths"]
+replay_command = "npm run diagnose -- snapshot; reproduce the operation with the recorded build-info.json and archive-safety test fixtures"
+fault_injection = ["abrupt parent-process exit", "diagnostic supervisor disconnect", "database worker timeout/exit", "audit journal size exhaustion", "redaction and oversized event tests"]
+
+[postmortem]
+crash_capture = "implemented_untested"
+includes_history = "implemented_tested"
+oom_or_external_kill_detection = "implemented_untested"
+retention_policy = "Private session diagnostics and crash dumps are pruned after 7 days and bounded to 64 MiB in total; archive recovery snapshots are not automatically deleted."
+
+[recovery]
+pre_repair_evidence = "implemented_tested"
+restart_or_fallback_history = "implemented_tested"
+last_failure_retention = "implemented_tested"
+
+[domain]
+state_dump = "The diagnostic snapshot reports process state, generation, heartbeat, bounded task/resource registries, event drop counts, recent semantic events, database/store identity, and supervisor status."
+cross_boundary_ids = ["session_id", "process_instance_id", "operation_id", "parent_operation_id", "task_id", "worker_instance_id", "request_id", "database_instance_id", "store_generation"]
+
+[security]
+authorization = "The diagnostic control plane is a private Unix socket in a 0700 directory with a random 256-bit token in a 0600 file; no public debugger port is enabled by default."
+redaction = ["credential-shaped keys are replaced", "Bearer/API-key-shaped strings are redacted", "strings and collections are bounded", "raw chat/message payloads are excluded from diagnostic events"]
+max_bundle_bytes = 16777216
+retention_days = 7
+
+[budgets]
+measurement_status = "implemented_tested"
+steady_cpu_percent = 0.5
+steady_memory_bytes = 8388608
+activated_cpu_percent = 10.0
+
+[deployment_modes]
+minimal_release = "release-minimal: optional diagnostic runtime is not started; normal build has no source maps and no diagnostic helper. Durable archive auditing remains enabled."
+observable_release = "release-observable: same optimized build with AIBACKMAN_DIAGNOSTICS=1 enables bounded redacted evidence; bridge remains hidden unless explicitly requested."
+global_runtime_switch = "AIBACKMAN_DIAGNOSTICS=1 plus AIBACKMAN_DIAGNOSTIC_MODE; AIBACKMAN_DEBUG_DIR selects the private evidence directory."
+per_category_switches = ["AIBACKMAN_TRACE_GC", "AIBACKMAN_VERBOSE_LOGGING", "AIBACKMAN_OPEN_DEVTOOLS", "AIBACKMAN_REMOTE_DEBUG", "AIBACKMAN_CHROMIUM_LOGGING", "AIBACKMAN_BRIDGE_VISIBLE", "AIBACKMAN_BRIDGE_FAST_MODE"]
+diagnostic_builds = ["npm run build:debug", "npm run electron:release:debug", "npm run electron:release:debug:bridge"]
+optional_diagnostics_default_enabled = false
+lazy_buffer_allocation = true
+lazy_helper_start = true
+
+[performance_isolation]
+preserves_release_optimization = true
+compile_time_exclusion_supported = false
+critical_hot_paths = ["archive reads and message presentation", "SQLite import transaction", "provider bridge message capture"]
+disabled_hot_path_extra_instructions = 0
+baseline_comparison = "scripts/test-debuggability-performance.cjs measures the inactive call path, activated recorder and snapshot latency, and always-on archive safety against an equivalent raw SQLite batch. The raw baseline makes the relative audit percentage deliberately conservative; absolute protected cost is also gated."
+minimal_mode_test = "scripts/test-diagnostics.cjs proves the inactive runtime creates no identifiers, directories, buffers, or helper; scripts/test-debuggability-performance.cjs gates the no-op call average."
+runtime_disabled_test = "scripts/test-debuggability-performance.cjs executes 250000 disabled calls and enforces a 0.002 ms average ceiling without filesystem creation."
+always_on_test = "scripts/test-debuggability-performance.cjs compares one hundred 200-message guarded transactions with equivalent raw SQLite transactions and enforces the declared p99/throughput ceilings; the safety suite verifies evidence fidelity."
+activated_mode_tests = ["scripts/test-diagnostics.cjs verifies supervisor control, concurrent sessions, TTL, retention, ring/drop bounds, redaction, and awaited shutdown", "scripts/test-debuggability-performance.cjs gates activated record p99 and bounded snapshot latency", "manual release-debug execution remains necessary for Electron crash/symbol paths"]
+
+[instrumentation_policy]
+facility_admission = "required"
+default_class = "activated"
+max_steady_cpu_percent = 0.5
+max_steady_memory_bytes = 8388608
+max_event_rate_per_second = 1000
+max_disk_bytes_per_day = 134217728
+max_snapshot_pause_ms = 100
+max_activation_ttl_seconds = 300
+max_activated_capture_bytes = 67108864
+max_minimal_cpu_regression_percent = 0.0
+max_runtime_disabled_cpu_regression_percent = 0.1
+max_steady_p99_latency_regression_percent = 1.0
+max_activated_cpu_percent = 10.0
+synchronous_hot_path_io = false
+global_contended_event_index = false
+require_overhead_test = true
+promotion_requires_measurement = true
+
+[assurance]
+contract_test = "npm run validate:debuggability"
+synthetic_scenarios = ["abrupt parent-process exit with independently retained evidence", "bounded event overflow", "redaction", "supervisor control while the parent is busy", "worker timeout/exit", "audit journal integrity and budget refusal"]
+symbolization_test = "npm run build:debug and Electron --inspect=9229 are documented; exact release artifact symbol retention remains untested."
+redaction_test = "scripts/test-diagnostics.cjs asserts credential-shaped keys and values never appear in persisted event output."
+overhead_test = "npm run test:debuggability:performance measures and gates inactive, activated, snapshot, and always-on archive-audit costs on every run."
+snapshot_test = "scripts/test-diagnostics.cjs queries the independent Unix-socket control plane and checks the snapshot schema/identity."
+
+[exceptions]
+items = []
+
+[controls]
+"architecture.state_owners" = { status = "implemented_tested", reason = "State has explicit owners across renderer, main, bridge, database, and diagnostics.", implementation = "Database, bridge, renderer, and diagnostic runtime modules define the ownership boundaries.", test = "scripts/test-diagnostics.cjs and scripts/test-archive-safety.cjs exercise the diagnostic and durable state owners." }
+"architecture.mutation_points" = { status = "implemented_tested", reason = "Durable writes must pass the guarded archive API or SQLite trigger coverage.", implementation = "ChatDatabase.runArchiveOperation and archive safety triggers.", test = "scripts/test-archive-safety.cjs rejects unguarded delete and replacement writes." }
+"architecture.side_effect_boundaries" = { status = "implemented_tested", reason = "Filesystem, renderer, worker, and database boundaries have separate evidence paths.", implementation = "diagnostic runtime, supervisor, DbSearchWorker, and archive safety journal.", test = "scripts/test-diagnostics.cjs queries the supervisor independently." }
+"architecture.fault_containment" = { status = "implemented_tested", reason = "Optional diagnostics fail soft while required audit evidence fails closed.", implementation = "runtime catches optional write errors; journal budget/lock failures abort mutations.", test = "archive and diagnostic regression tests cover failure-sensitive paths." }
+"errors.causal_ids" = { status = "implemented_tested", reason = "Every diagnostic event can carry operation/task/process/build identity.", implementation = "runtime event envelope and worker task correlation.", test = "scripts/test-diagnostics.cjs checks event schema and task/control output." }
+"invariants.release_checks" = { status = "implemented_tested", reason = "Archive deletion, overwrite, and schema-damage invariants are executable.", implementation = "SQLite triggers, runArchiveOperation count checks, and constructor preflight refusal/repair snapshots.", test = "scripts/test-archive-safety.cjs exercises direct writes, missing content tables, and missing safety triggers." }
+"invariants.progress_rules" = { status = "implemented_tested", reason = "Workers and diagnostic queues have explicit bounds.", implementation = "worker timeout, task completion, bounded rings and supervisor responses.", test = "scripts/test-diagnostics.cjs and worker code paths." }
+"invariants.resource_balances" = { status = "implemented_tested", reason = "Tasks, workers, timers, and supervisor shutdown are accounted for.", implementation = "taskEnd on success/error/timeout/stop and runtime.stop.", test = "scripts/test-diagnostics.cjs." }
+"build.identity" = { status = "implemented_tested", reason = "Runtime evidence must identify the exact source/package/build mode.", implementation = "electron/diagnostics/build-info.cjs and post-build package scripts.", test = "scripts/test-diagnostics.cjs compares snapshot build_id." }
+"live.capabilities_command" = { status = "implemented_tested", reason = "Operators need discoverable machine-readable controls.", implementation = "scripts/aibackman-diagnose.cjs and supervisor capabilities command.", test = "scripts/test-diagnostics.cjs invokes capabilities." }
+"live.snapshot_command" = { status = "implemented_tested", reason = "A bounded snapshot must remain usable outside the renderer loop.", implementation = "private Unix-socket supervisor and runtime snapshot.", test = "scripts/test-diagnostics.cjs invokes snapshot." }
+"history.schema" = { status = "implemented_tested", reason = "Events need stable schema and ordering.", implementation = "aibackman-diagnostic-event-v1 envelope.", test = "scripts/test-diagnostics.cjs parses every persisted event." }
+"audit_trail.event_schema" = { status = "implemented_tested", reason = "Durable writes need a versioned record.", implementation = "SQLite audit columns and hash-chained journal schema.", test = "scripts/test-archive-safety.cjs checks event_schema." }
+"audit_trail.actor_writer_and_reason" = { status = "implemented_tested", reason = "Audit records must identify who/what initiated a write and why.", implementation = "runArchiveOperation context and trigger propagation.", test = "scripts/test-archive-safety.cjs checks writer/store metadata." }
+"audit_trail.attribution_policy" = { status = "implemented_tested", reason = "Direct SQL attribution must not be guessed or forgeable.", implementation = "Private guard capabilities reject unscoped writes; API records identify asserted in-process writers.", test = "Direct write, self-authorization, and audit-injection rejection tests." }
+"audit_trail.transaction_binding" = { status = "implemented_tested", reason = "Committed audit rows must be in the same SQLite transaction.", implementation = "operation_id transaction_id and operation-completed row in runArchiveOperation.", test = "archive safety transaction tests." }
+"audit_trail.attempted_write_policy" = { status = "implemented_tested", reason = "Attempted, failed, and committed outcomes must be distinguishable.", implementation = "journal operation-started/failed/completed records and SQLite completion rows.", test = "journal assertions in archive safety test." }
+"audit_trail.provenance_and_deduplication" = { status = "implemented_tested", reason = "Retry attempts must remain identifiable.", implementation = "operation/event IDs and source fingerprint operation.", test = "archive safety journal and source-item path." }
+"audit_trail.change_representation" = { status = "implemented_tested", reason = "Message bodies must not be copied into the audit log but destructive changes must remain recoverable.", implementation = "Bounded message lengths/hashes plus immutable exact deletion and revision recovery rows.", test = "Archive safety asserts redacted audit summaries and exact revision restoration." }
+"audit_trail.tamper_evidence" = { status = "implemented_tested", reason = "Audit history needs append-only and integrity checks.", implementation = "SQLite immutability triggers and locked fsync hash chain.", test = "scripts/test-archive-safety.cjs verifies append-only and chain integrity." }
+"audit_trail.retention_and_access" = { status = "implemented_tested", reason = "Recovery history must not disappear through automatic cleanup.", implementation = "private recovery/audit paths, no automatic recovery rotation, fail-closed journal budget.", test = "snapshot/recovery assertions." }
+"audit_trail.query_and_export" = { status = "implemented_tested", reason = "Evidence must be bounded and queryable.", implementation = "bounded database accessors and diagnostic CLI.", test = "archive and diagnostics tests." }
+"audit_trail.sink_failure_policy" = { status = "implemented_tested", reason = "Audit sink failure must have an explicit outcome.", implementation = "pre-commit journal append and budget refusal; transactional SQLite audit row.", test = "journal budget and mutation tests are represented by the guarded path." }
+"audit_trail.cost_and_backpressure" = { status = "implemented_tested", reason = "Required auditing needs explicit limits.", implementation = "64 KiB events, 256 MiB journal, 2-second lock bound, and no silent rotation.", test = "journal size checks and archive safety regression test." }
+"audit_trail.assurance_test" = { status = "implemented_tested", reason = "The mutation contract is exercised by a dedicated regression suite.", implementation = "scripts/test-archive-safety.cjs.", test = "npm run test:archive:safety." }
+"resources.declared_budgets" = { status = "implemented_tested", reason = "Diagnostic buffers and audit storage are bounded.", implementation = "runtime constants and contract budget fields.", test = "scripts/test-diagnostics.cjs checks ring bounds and drops." }
+"domain.state_dump" = { status = "implemented_tested", reason = "A generic log is insufficient for renderer/worker/archive failures.", implementation = "runtime snapshot task/resource/state/build/store evidence.", test = "scripts/test-diagnostics.cjs." }
+"domain.cross_boundary_ids" = { status = "implemented_tested", reason = "Cross-process and cross-store evidence needs shared correlation fields.", implementation = "runtime envelope, worker tasks, database/store identity.", test = "scripts/test-diagnostics.cjs and archive metadata assertions." }
+"assurance.contract_test" = { status = "implemented_tested", reason = "The schema itself is checked strictly without a machine-specific dependency.", implementation = "scripts/validate-debuggability.py and the validate:debuggability package command.", test = "npm run validate:debuggability." }
+"assurance.redaction_test" = { status = "implemented_tested", reason = "Sensitive diagnostic values must not enter the event file.", implementation = "redact/safeJson processing in the diagnostic runtime.", test = "scripts/test-diagnostics.cjs." }
+"assurance.symbolization_test" = { status = "implemented_untested", reason = "Debug builds expose source maps and Node inspection, but postmortem symbol archive verification is pending.", implementation = "build:debug and electron:release:debug scripts.", test = "manual debug-build check; exact symbol retention benchmark pending." }
+"assurance.synthetic_scenarios" = { status = "implemented_tested", reason = "The relevant diagnostic failure classes have synthetic checks.", implementation = "diagnostic and archive safety regression scripts.", test = "npm run test:diagnostics and npm run test:archive:safety." }
+"assurance.overhead_test" = { status = "implemented_tested", reason = "Optional and always-on evidence costs need executable promotion gates.", implementation = "scripts/test-debuggability-performance.cjs with explicit inactive, activated, snapshot, and archive transaction ceilings.", test = "npm run test:debuggability:performance." }
+"assurance.snapshot_test" = { status = "implemented_tested", reason = "The independent control plane must return a valid snapshot.", implementation = "supervisor Unix socket and CLI.", test = "scripts/test-diagnostics.cjs." }
+"deployment_modes.minimal_release" = { status = "implemented_tested", reason = "Normal release must not start optional diagnostics.", implementation = "release-minimal mode gate and npm build script.", test = "inactive runtime path in scripts/test-diagnostics.cjs." }
+"deployment_modes.observable_release" = { status = "implemented_tested", reason = "Observable release enables only bounded diagnostics explicitly.", implementation = "build:observable and electron:release:observable scripts.", test = "package script inspection plus diagnostic runtime tests." }
+"deployment_modes.diagnostic_builds" = { status = "implemented_tested", reason = "Behavior-changing debug build execution is explicitly named.", implementation = "build:debug and release:debug package scripts.", test = "package script/build validation." }
+"deployment_modes.global_runtime_switch" = { status = "implemented_tested", reason = "Operators need one global switch.", implementation = "AIBACKMAN_DIAGNOSTICS/AIBACKMAN_DIAGNOSTIC_MODE.", test = "mode gate and diagnostic test." }
+"deployment_modes.per_category_switches" = { status = "implemented_untested", reason = "Existing bridge/GC/log controls remain explicit category switches.", implementation = "main process environment controls.", test = "manual release-debug command; not automated." }
+"performance_isolation.critical_hot_paths" = { status = "implemented_untested", reason = "Hot-path instrumentation must remain coarse and lazy.", implementation = "optional runtime starts only in non-minimal mode; archive auditing is separately bounded.", test = "benchmark not yet statistically measured." }
+"performance_isolation.baseline_comparison" = { status = "implemented_tested", reason = "Diagnostic and durable-audit costs are measured separately against explicit baselines.", implementation = "Executable timing harness with bounded workloads and thresholds.", test = "npm run test:debuggability:performance." }
+"performance_isolation.minimal_mode_test" = { status = "implemented_tested", reason = "Minimal mode has no diagnostic supervisor.", implementation = "mode gate and build scripts.", test = "scripts/test-diagnostics.cjs inactive path." }
+"performance_isolation.runtime_disabled_test" = { status = "implemented_tested", reason = "Disabled diagnostics must remain below a fixed absolute cost and perform no I/O.", implementation = "Inactive frozen runtime and timing gate.", test = "npm run test:debuggability:performance." }
+"performance_isolation.always_on_test" = { status = "implemented_tested", reason = "Required archive protection must have a separately measured budget.", implementation = "Guarded versus raw 200-message SQLite batch benchmark.", test = "npm run test:debuggability:performance." }
+"performance_isolation.activated_mode_tests" = { status = "implemented_tested", reason = "Activated diagnostic mode has bounded output and shutdown tests.", implementation = "diagnostic regression suite.", test = "scripts/test-diagnostics.cjs." }
+"postmortem.retention_policy" = { status = "implemented_tested", reason = "Diagnostic evidence must be private and bounded without deleting archive recovery data.", implementation = "7-day/64 MiB diagnostic pruning; archive recovery is outside that cleanup path.", test = "scripts/test-diagnostics.cjs verifies expiry and restrictive modes." }
+"reproduction.fault_injection" = { status = "implemented_tested", reason = "Diagnostic tests exercise overflow, redaction, and supervisor/control failures.", implementation = "synthetic diagnostic and journal budget paths.", test = "scripts/test-diagnostics.cjs and scripts/test-archive-safety.cjs." }
+"reproduction.recorded_inputs" = { status = "implemented_untested", reason = "Safe identity and bounded input summaries are recorded; full deterministic replay is not claimed.", implementation = "build/event/task envelopes.", test = "event schema assertions; replay remains untested." }
+"reproduction.replay_command" = { status = "implemented_untested", reason = "A documented evidence inspection command exists, but full conversation replay is not claimed.", implementation = "npm run diagnose and archive safety fixtures.", test = "diagnostic CLI test; replay is untested." }
+"security.authorization" = { status = "implemented_tested", reason = "The diagnostic control plane is private and token-authenticated.", implementation = "Unix socket, 0700 directory, 0600 token, bounded protocol.", test = "scripts/test-diagnostics.cjs uses the authenticated CLI." }
+"security.redaction" = { status = "implemented_tested", reason = "Diagnostic events must not expose credentials or unbounded payloads.", implementation = "recursive key/value redaction and size limits.", test = "scripts/test-diagnostics.cjs." }

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 
 export interface WorkspaceDiagnosticStats {
   mapQuery: string;
@@ -9,6 +9,7 @@ export interface WorkspaceDiagnosticStats {
 }
 
 interface DiagnosticEntry {
+  sequence: number;
   ts: number;
   event: string;
   payload: Record<string, unknown>;
@@ -39,15 +40,22 @@ const EMPTY_STATS: WorkspaceDiagnosticStats = {
 };
 
 export function useWorkspaceDiagnostics() {
-  const enabledRef = useRef(
-    localStorage.getItem('oomDebug') === '1' || window.electronAPI.debugEnabled === true,
-  );
+  const authorized = window.electronAPI.debugEnabled === true;
+  const [enabled, setEnabled] = useState(authorized);
+  const enabledRef = useRef(enabled);
   const entriesRef = useRef<DiagnosticEntry[]>([]);
   const statsRef = useRef(EMPTY_STATS);
+  const sequenceRef = useRef(0);
+  const droppedRef = useRef(0);
+
+  useEffect(() => {
+    enabledRef.current = enabled;
+  }, [enabled]);
 
   const push = useCallback((event: string, payload: Record<string, unknown> = {}) => {
     if (!enabledRef.current) return;
     const entry: DiagnosticEntry = {
+      sequence: ++sequenceRef.current,
       ts: Date.now(),
       event,
       payload: {
@@ -62,8 +70,11 @@ export function useWorkspaceDiagnostics() {
       },
     };
     const entries = entriesRef.current;
+    if (entries.length >= 600) {
+      entries.shift();
+      droppedRef.current += 1;
+    }
     entries.push(entry);
-    if (entries.length > 600) entries.splice(0, entries.length - 600);
     console.debug('[oom-debug]', entry.event, JSON.stringify(entry.payload));
   }, []);
 
@@ -82,17 +93,23 @@ export function useWorkspaceDiagnostics() {
   useEffect(() => {
     const api = {
       enable: () => {
-        localStorage.setItem('oomDebug', '1');
+        if (!authorized) {
+          console.warn('[oom-debug] diagnostics are unavailable in release-minimal mode');
+          return false;
+        }
         enabledRef.current = true;
+        setEnabled(true);
         console.info('[oom-debug] enabled');
+        return true;
       },
       disable: () => {
-        localStorage.removeItem('oomDebug');
         enabledRef.current = false;
+        setEnabled(false);
         console.info('[oom-debug] disabled');
       },
       clear: () => {
         entriesRef.current = [];
+        droppedRef.current = 0;
         console.info('[oom-debug] cleared');
       },
       dump: () => {
@@ -107,6 +124,8 @@ export function useWorkspaceDiagnostics() {
       snapshot: () => ({
         now: new Date().toISOString(),
         heap: getHeapSnapshot(),
+        sequence: sequenceRef.current,
+        dropped: droppedRef.current,
         ...statsRef.current,
       }),
     };
@@ -115,10 +134,10 @@ export function useWorkspaceDiagnostics() {
       const target = window as Window & { __aibackmanOomDebug?: typeof api };
       if (target.__aibackmanOomDebug === api) delete target.__aibackmanOomDebug;
     };
-  }, []);
+  }, [authorized]);
 
   useEffect(() => {
-    if (!enabledRef.current || typeof PerformanceObserver === 'undefined') return;
+    if (!enabled || typeof PerformanceObserver === 'undefined') return;
     let observer: PerformanceObserver | null = null;
     try {
       observer = new PerformanceObserver((list) => {
@@ -137,10 +156,35 @@ export function useWorkspaceDiagnostics() {
       // Chromium versions without long-task observation still retain explicit diagnostics.
     }
     return () => observer?.disconnect();
-  }, [push]);
+  }, [enabled, push]);
 
   useEffect(() => {
-    if (!enabledRef.current) return;
+    if (!enabled) return;
+    const publish = () => {
+      const current = statsRef.current;
+      void window.electronAPI.invoke('diagnostics:rendererSnapshot', {
+        label: 'workspace',
+        sequence: sequenceRef.current,
+        dropped: droppedRef.current,
+        stats: {
+          ...current,
+          mapQuery: undefined,
+          mapQueryLen: current.mapQuery.length,
+        },
+        recent_events: entriesRef.current.slice(-20).map((entry) => ({
+          sequence: entry.sequence,
+          ts: entry.ts,
+          event: entry.event,
+          payload: entry.payload,
+        })),
+      }).then((result) => {
+        if ((result as { accepted?: boolean } | null)?.accepted === false) {
+          enabledRef.current = false;
+          setEnabled(false);
+        }
+      }).catch(() => undefined);
+    };
+    publish();
     const id = window.setInterval(() => {
       const current = statsRef.current;
       push('heartbeat', {
@@ -150,9 +194,10 @@ export function useWorkspaceDiagnostics() {
         displayCount: current.displayCount,
         displayViewCount: current.displayViewCount,
       });
+      publish();
     }, 2000);
     return () => window.clearInterval(id);
-  }, [push]);
+  }, [enabled, push]);
 
   return { push, updateStats };
 }

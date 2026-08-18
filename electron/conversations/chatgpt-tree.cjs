@@ -1,3 +1,6 @@
+const { isChatGptInternalProtocolMessage } = require('./chatgpt-protocol.cjs');
+const { getLinearMessages } = require('../archive/standard/reader.cjs');
+
 function parseMetadataJson(value) {
   if (!value) return null;
   if (typeof value === 'object') return value;
@@ -24,35 +27,59 @@ function isThinkingArtifactMetadata(metadata) {
 }
 
 function isCachedThinkingArtifact(message) {
-  return !!message && isThinkingArtifactMetadata(parseMetadataJson(message.metadata_json));
+  return !!message && (
+    isThinkingArtifactMetadata(parseMetadataJson(message.metadata_json))
+    || isChatGptInternalProtocolMessage(message)
+  );
 }
 
-function getLinearMessages(db, conversationId) {
-  const conversation = db.getConversation(conversationId);
-  const allMessages = db.getMessages(conversationId);
-  if (!conversation?.current_node_id) return allMessages;
+function createStoredMessageIdResolver(data) {
+  const mapping = data?.mapping && typeof data.mapping === 'object' ? data.mapping : {};
+  const messageIdByNodeId = new Map();
+  for (const [nodeId, node] of Object.entries(mapping)) {
+    if (!node?.message) continue;
+    const messageId = String(node.message.id || nodeId).trim();
+    if (messageId) messageIdByNodeId.set(String(nodeId), messageId);
+  }
 
-  const currentPath = db.getLinearPath(conversation.current_node_id);
-  const isVisibleMessage = (message) => (
-    message
-    && (message.role === 'user' || message.role === 'assistant')
-    && typeof message.content === 'string'
-    && message.content.trim()
-    && !isCachedThinkingArtifact(message)
-  );
-  const visibleAllCount = allMessages.filter(isVisibleMessage).length;
-  const visiblePathCount = currentPath.filter(isVisibleMessage).length;
-  const pathLooksPartial = (
-    visibleAllCount >= 8
-    && visiblePathCount > 0
-    && visiblePathCount < Math.max(4, Math.floor(visibleAllCount * 0.55))
-  );
-  const largePathLoss = (
-    visibleAllCount >= 100
-    && visiblePathCount > 0
-    && (visibleAllCount - visiblePathCount) >= 20
-  );
-  return pathLooksPartial || largePathLoss ? allMessages : currentPath;
+  const cache = new Map();
+  const hasNode = (nodeId) => Object.prototype.hasOwnProperty.call(mapping, nodeId);
+
+  return (nodeId) => {
+    let cursor = nodeId == null ? null : String(nodeId);
+    const trail = [];
+    const visited = new Set();
+
+    while (cursor && !visited.has(cursor)) {
+      if (cache.has(cursor)) {
+        const resolved = cache.get(cursor);
+        for (const trailNodeId of trail) cache.set(trailNodeId, resolved);
+        return resolved;
+      }
+
+      visited.add(cursor);
+      trail.push(cursor);
+
+      const storedMessageId = messageIdByNodeId.get(cursor);
+      if (storedMessageId) {
+        for (const trailNodeId of trail) cache.set(trailNodeId, storedMessageId);
+        return storedMessageId;
+      }
+
+      // Parent pointers in a ChatGPT payload are mapping-node IDs. Unknown
+      // pointers are external/root sentinels (for example
+      // `client-created-root`), not stored messages.
+      if (!hasNode(cursor)) {
+        for (const trailNodeId of trail) cache.set(trailNodeId, null);
+        return null;
+      }
+
+      cursor = mapping[cursor]?.parent ? String(mapping[cursor].parent) : null;
+    }
+
+    for (const trailNodeId of trail) cache.set(trailNodeId, null);
+    return null;
+  };
 }
 
 function buildOrderedVisibleTurns(data, conversationId, renderMessageContent) {
@@ -76,7 +103,8 @@ function buildOrderedVisibleTurns(data, conversationId, renderMessageContent) {
       if (!node?.message) return false;
       const role = node.message.author?.role;
       return (role === 'user' || role === 'assistant')
-        && !isThinkingArtifactMetadata(node.message.metadata);
+        && !isThinkingArtifactMetadata(node.message.metadata)
+        && !isChatGptInternalProtocolMessage(node.message);
     })
     .map((node) => ({
       role: node.message.author?.role,
@@ -146,6 +174,7 @@ function shouldPreserveCachedSnapshot(existingMessages, remoteTurns) {
 
 module.exports = {
   buildOrderedVisibleTurns,
+  createStoredMessageIdResolver,
   getLinearMessages,
   shouldPreserveCachedSnapshot,
 };

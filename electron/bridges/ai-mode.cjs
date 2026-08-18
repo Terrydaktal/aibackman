@@ -1,3 +1,5 @@
+const { readConversation, readConversations } = require('../archive/standard/reader.cjs');
+
 function createAiModeBridge({
   db: aiDb,
   buildDeterministicId,
@@ -112,7 +114,7 @@ function deriveAiConversationId(ref) {
 }
 
 function cleanupAiModeShadowConversations() {
-  const convs = aiDb.getConversations();
+  const convs = readConversations(aiDb);
   const byTitle = new Map();
   for (const conv of convs) {
     const t = normalizeAiModeTitle(conv.title || '').toLowerCase();
@@ -121,13 +123,12 @@ function cleanupAiModeShadowConversations() {
     byTitle.get(t).push(conv);
   }
 
-  const messageCountStmt = aiDb.db.prepare('SELECT COUNT(*) AS n FROM messages WHERE conversation_id = ?');
   const toDelete = [];
   for (const [, group] of byTitle) {
     if (!Array.isArray(group) || group.length < 2) continue;
     const enriched = group.map((conv) => ({
       conv,
-      messageCount: Number(messageCountStmt.get(conv.id)?.n || 0),
+      messageCount: aiDb.countMessages(conv.id),
     }));
     const hasCanonicalWithMessages = enriched.some((row) => !String(row.conv.id).startsWith('aimode-live-') && row.messageCount > 0);
     if (!hasCanonicalWithMessages) continue;
@@ -139,11 +140,13 @@ function cleanupAiModeShadowConversations() {
   }
 
   if (toDelete.length === 0) return 0;
-  aiDb.db.transaction(() => {
-    for (const id of toDelete) {
-      aiDb.deleteConversation(id);
-    }
-  })();
+  for (const id of toDelete) {
+    aiDb.deleteConversation(id, {
+      confirmation: id,
+      reason: 'Remove a zero-message AI Mode shadow row after confirming a populated canonical row exists.',
+      actor: 'ai-mode-shadow-reconciler',
+    });
+  }
   return toDelete.length;
 }
 
@@ -151,7 +154,7 @@ async function resolveAiModeConversationRef(conversationId) {
   let ref = aiModeConversationRefs.get(conversationId) || null;
   if (ref) return ref;
 
-  const currentConv = aiDb.getConversation(conversationId);
+  const currentConv = readConversation(aiDb, conversationId);
   const currentTitleNorm = normalizeAiModeTitle(currentConv?.title || '').toLowerCase();
   const refs = await fetchAiModeConversationIndex(2000);
   for (const row of refs) {

@@ -1,6 +1,7 @@
 const fs = require('fs');
 const path = require('path');
 const { spawn } = require('child_process');
+const { readConversations } = require('../archive/standard/index.cjs');
 
 let comparatorProcess = null;
 
@@ -40,6 +41,14 @@ function registerArchiveIpc({
   ipcMain.handle('archive:createAccount', async (_event, payload) => (
     accountManager.createAccount(payload || {})
   ));
+
+  ipcMain.handle('archive:deleteAccount', async (_event, payload) => {
+    const accountId = String(payload?.accountId || '').trim();
+    if (!accountId) throw new Error('Missing archive account id.');
+    const result = accountManager.deleteAccount(accountId);
+    notifyArchiveChanged();
+    return result;
+  });
 
   ipcMain.handle('archive:renameAccount', async (_event, payload) => {
     const accountId = String(payload?.accountId || '').trim();
@@ -115,15 +124,29 @@ function registerArchiveIpc({
   });
 
   ipcMain.handle('db:getConversations', async (_event, payload) => (
-    getDatabase(payload).getConversations()
+    readConversations(getDatabase(payload))
   ));
 
   ipcMain.handle('db:deleteConversation', async (_event, arg1, arg2) => {
     const id = typeof arg1 === 'object' ? arg1?.id : arg1;
     const account = typeof arg1 === 'object' ? arg1 : arg2;
     if (!id) throw new Error('Missing conversation id');
-    return getDatabase(account).deleteConversation(id);
+    return getDatabase(account).deleteConversation(id, {
+      confirmation: typeof arg1 === 'object' ? arg1?.confirmation : null,
+      reason: typeof arg1 === 'object' ? arg1?.reason : null,
+      actor: 'archive-viewer-user',
+    });
   });
+
+  ipcMain.handle('db:restoreConversation', async (_event, payload) => {
+    const id = String(payload?.id || '').trim();
+    if (!id) throw new Error('Missing conversation id');
+    return getDatabase(payload).restoreDeletedConversation(id);
+  });
+
+  ipcMain.handle('db:getAuditTrail', async (_event, payload) => (
+    getDatabase(payload).getAuditTrail(payload?.limit)
+  ));
 
   ipcMain.handle('db:getStats', async (_event, payload) => {
     const stats = getDatabase(payload).getStats();

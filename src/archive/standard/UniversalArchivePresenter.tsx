@@ -11,6 +11,7 @@ import {
   countSearchTextMatches,
   createWhitespaceFlexibleSearchRegExp,
 } from '../../search/nativeHighlights';
+import { formatChatGptContent } from './chatgptContent';
 import 'katex/dist/katex.min.css';
 import '../../index.css';
 
@@ -21,8 +22,6 @@ const escapeRegExp = (value: unknown) => {
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 const MAX_MESSAGE_HIGHLIGHT_HITS = 240;
 const MAX_MAP_SEARCH_QUERY_LEN = 160;
-const MAX_MARKDOWN_RENDER_CHARS = 30000;
-const MAX_MARKDOWN_RENDER_LINES = 1200;
 const MAX_MARKDOWN_MATH_DELIMITERS = 180;
 const MAX_MARKDOWN_LATEX_COMMANDS = 320;
 const MAX_MARKDOWN_CDOT_COMMANDS = 80;
@@ -30,10 +29,11 @@ const MIN_PLAIN_LATEX_COMMANDS = 6;
 const MIN_PLAIN_LATEX_LINES = 8;
 const MAX_CODE_HIGHLIGHT_CHARS = 8000;
 const MAX_CODE_HIGHLIGHT_LINES = 400;
-const MAX_SAFE_FALLBACK_CHARS = 120000;
 const getMessagePreview = (content: string) => {
   const normalized = content
     .replace(/cite[^]*/g, ' ')
+    .replace(/filecite[^]*/g, ' ')
+    .replace(/\[\d+(?:\s*·[^\]]+)?\]\(citation:\/\/[^)]+\)/g, ' ')
     .replace(/products[\s\S]*?(?:|$)/g, ' ')
     .replace(/!\[[^\]]*]\([^)]+\)/g, ' [image] ')
     .replace(/```[\s\S]*?```/g, ' [code] ')
@@ -42,6 +42,19 @@ const getMessagePreview = (content: string) => {
     .trim();
   if (!normalized) return '[empty]';
   return normalized.length > 120 ? `${normalized.slice(0, 117)}...` : normalized;
+};
+
+const isLikelyTerminalTranscript = (content: string): boolean => {
+  const value = String(content || '');
+  if (!value) return false;
+
+  const hasTerminalPrompt = /(?:^|\s)[\w.-]+@[\w.-]+\s+[~/][^\n]*?(?:[$#>])\s*(?:bash|zsh|sh|fish)?\b/i.test(value)
+    || /(?:^|\n)\s*root@[\w.-]+[ :]~?[^\n]*[$#>]\s*/i.test(value);
+  const hasShellVariable = /(^|[^\w])\$(?:[A-Z_][A-Z0-9_]*|\{[A-Za-z_][A-Za-z0-9_]*\})/.test(value);
+  const hasShellCommand = /\b(?:bash|zsh|sh|fish|ssh|gpg|chmod|tar|sudo|curl|wget|systemctl|docker|cryptroot-unlock)\b/i.test(value);
+  const hasShellOperator = /(?:&&|\|\||\|\s|\s;\s)/.test(value);
+
+  return hasTerminalPrompt || (hasShellVariable && hasShellCommand && hasShellOperator);
 };
 
 const normalizeMathDelimiters = (content: string) => {
@@ -66,6 +79,18 @@ const normalizeCitationMarkers = (content: string) => {
   };
 
   return content
+    .replace(/filecite([^]+)/g, (_match, rawRefs: string) => {
+      const refs = rawRefs.split('').map((ref) => ref.trim()).filter(Boolean);
+      const groups: string[][] = [];
+      for (const ref of refs) {
+        if (/^turn\d+[a-z]+\d+$/i.test(ref) || groups.length === 0) groups.push([ref]);
+        else groups.at(-1)!.push(ref);
+      }
+      return groups.map(([id, ...details]) => {
+        const label = [citationNumber(id), ...details].join(' · ');
+        return `[${label}](citation://${id})`;
+      }).join(' ');
+    })
     .replace(/cite([^]+)/g, (_match, rawRefs: string) => {
       const refs = rawRefs
         .split('')
@@ -77,7 +102,7 @@ const normalizeCitationMarkers = (content: string) => {
         return `[${n}](citation://${id})`;
       }).join(' ');
     })
-    .replace(/cite/g, '')
+    .replace(/(?:file)?cite/g, '')
     .replace(//g, '');
 };
 
@@ -335,6 +360,215 @@ const getEmbeddedUiEntries = (msg: Message): EmbeddedUiEntry[] => {
     return sanitizeEmbeddedUiEntries(metadata.embedded_ui);
   } catch {
     return [];
+  }
+};
+
+const CHATGPT_TOOL_CALL_KEYS = new Set([
+  'calculator',
+  'click',
+  'computer',
+  'file_search',
+  'find',
+  'image_query',
+  'open',
+  'python',
+  'search_model_queries',
+  'search_query',
+  'screenshot',
+  'shell',
+  'web',
+]);
+
+const getMessageMetadata = (msg: Message): Record<string, unknown> => {
+  if (!msg.metadata_json) return {};
+  try {
+    const metadata = JSON.parse(msg.metadata_json) as unknown;
+    return metadata && typeof metadata === 'object' ? metadata as Record<string, unknown> : {};
+  } catch {
+    return {};
+  }
+};
+
+const isChatGptToolCallPayload = (content: string, metadata: Record<string, unknown>) => {
+  const trimmed = content.trim();
+  if (!trimmed || (!trimmed.startsWith('{') && !trimmed.startsWith('['))) return false;
+
+  try {
+    const parsed = JSON.parse(trimmed) as unknown;
+    const candidates = Array.isArray(parsed) ? parsed : [parsed];
+    return candidates.some((candidate) => {
+      if (!candidate || typeof candidate !== 'object' || Array.isArray(candidate)) return false;
+      const hasToolKey = Object.keys(candidate).some((key) => CHATGPT_TOOL_CALL_KEYS.has(key));
+      return hasToolKey && (
+        metadata.message_type === 'next'
+        || metadata.reasoning_status === 'is_reasoning'
+        || !!metadata.request_id
+        || hasToolKey
+      );
+    });
+  } catch {
+    return false;
+  }
+};
+
+const isChatGptInternalProtocolMessage = (msg: Message) => {
+  const metadata = getMessageMetadata(msg);
+  if (metadata.chatgpt_internal_protocol === true || msg.role === 'tool') return true;
+  if (msg.role !== 'assistant') return false;
+
+  if (isChatGptToolCallPayload(msg.content || '', metadata)) return true;
+  return !msg.content?.trim() && (
+    metadata.message_type === 'next'
+    || typeof metadata.reasoning_status === 'string'
+    || typeof metadata.reasoning_title === 'string'
+    || metadata.skip_reasoning_title === 'Skip'
+    || !!metadata.finish_details
+    || metadata.is_complete === true
+  );
+};
+
+type ClaudeArtifact = {
+  id: string;
+  type: string;
+  title: string;
+  command: string;
+  language: string;
+  content: string;
+  oldStr: string;
+  newStr: string;
+  versionUuid: string;
+};
+
+const sanitizeClaudeArtifacts = (artifacts: unknown): ClaudeArtifact[] => {
+  if (!Array.isArray(artifacts)) return [];
+  return artifacts.flatMap((rawArtifact) => {
+    if (!rawArtifact || typeof rawArtifact !== 'object') return [];
+    const artifact = rawArtifact as Record<string, unknown>;
+    const normalized: ClaudeArtifact = {
+      id: typeof artifact.id === 'string' ? artifact.id : '',
+      type: typeof artifact.type === 'string' ? artifact.type : '',
+      title: typeof artifact.title === 'string' ? artifact.title : '',
+      command: typeof artifact.command === 'string' ? artifact.command : '',
+      language: typeof artifact.language === 'string' ? artifact.language : '',
+      content: typeof artifact.content === 'string' ? artifact.content : '',
+      oldStr: typeof artifact.oldStr === 'string' ? artifact.oldStr : '',
+      newStr: typeof artifact.newStr === 'string' ? artifact.newStr : '',
+      versionUuid: typeof artifact.versionUuid === 'string' ? artifact.versionUuid : '',
+    };
+    return normalized.content || normalized.oldStr || normalized.newStr || normalized.title
+      ? [normalized]
+      : [];
+  });
+};
+
+const getClaudeArtifacts = (msg: Message): ClaudeArtifact[] => {
+  if (!msg.metadata_json) return [];
+  try {
+    const metadata = JSON.parse(msg.metadata_json) as Record<string, unknown>;
+    if (metadata.source !== 'claude-export') return [];
+    return sanitizeClaudeArtifacts(metadata.claude_artifacts);
+  } catch {
+    return [];
+  }
+};
+
+const getChatHubModelLabel = (msg: Message): string => {
+  if (!msg.metadata_json) return '';
+  try {
+    const metadata = JSON.parse(msg.metadata_json) as Record<string, unknown>;
+    if (typeof metadata.source !== 'string' || !metadata.source.startsWith('chathub-')) return '';
+    if (typeof metadata.model_label === 'string' && metadata.model_label.trim()) return metadata.model_label.trim();
+    const model = typeof metadata.model === 'string' ? metadata.model.trim() : '';
+    if (!model) return '';
+    return model
+      .replace(/^cloud-/i, '')
+      .replace(/[-_]+/g, ' ')
+      .replace(/\b\w/g, (character) => character.toUpperCase());
+  } catch {
+    return '';
+  }
+};
+
+const formatChatGptModelLabel = (value: string): string => {
+  let label = value.trim().replace(/^gpt-/i, 'GPT-');
+  label = label.replace(/^(GPT-\d+)-(\d+)/i, '$1.$2');
+  label = label.replace(/-([a-z])(?=-|$)/gi, (_match, character: string) => `-${character.toUpperCase()}`);
+  label = label.replace(/-(thinking|instant)$/i, (_match, mode: string) => ` ${mode[0].toUpperCase()}${mode.slice(1).toLowerCase()}`);
+  label = label.replace(/-mini$/i, ' Mini');
+  return label || value;
+};
+
+const formatProviderModelLabel = (value: string): string => {
+  if (/^gpt-/i.test(value.trim())) return formatChatGptModelLabel(value);
+  return value.trim()
+    .replace(/[-_]+/g, ' ')
+    .replace(/\b\w/g, (character) => character.toUpperCase());
+};
+
+const formatThinkingEffortLabel = (value: string): string => {
+  const normalized = value.trim().toLowerCase();
+  return normalized === 'max' || normalized === 'maximum' ? 'xhigh' : value.trim();
+};
+
+const MODEL_EFFORT_AGENT_LABELS = new Set(['Codex CLI', 'Antigravity CLI', 'Grok', 'Gemini', 'Gemini CLI', 'Claude', 'DeepSeek']);
+const MODEL_EFFORT_SOURCES = new Set(['codex-local', 'antigravity-local', 'grok-export', 'gemini-web-export', 'gemini-cli-local', 'claude-export', 'deepseek-export']);
+
+const getMetadataText = (value: unknown): string => {
+  if (typeof value === 'string') return value.trim();
+  if (typeof value === 'number' && Number.isFinite(value)) return String(value);
+  return '';
+};
+
+const getProviderMessageLabel = (msg: Message, assistantLabel: string): string => {
+  let metadata: Record<string, unknown> = {};
+  if (msg.metadata_json) {
+    try {
+      const parsed = JSON.parse(msg.metadata_json);
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) metadata = parsed as Record<string, unknown>;
+    } catch {
+      metadata = {};
+    }
+  }
+  const source = getMetadataText(metadata.source);
+  if (!MODEL_EFFORT_AGENT_LABELS.has(assistantLabel) && !MODEL_EFFORT_SOURCES.has(source)) return '';
+  const rawModel = [
+    metadata.model_slug,
+    metadata.requested_model_slug,
+    metadata.default_model_slug,
+    metadata.model,
+    metadata.model_name,
+    metadata.model_version,
+    metadata.engine,
+  ].map(getMetadataText).find(Boolean) || '';
+  const rawEffort = [
+    metadata.thinking_effort,
+    metadata.reasoning_effort,
+    metadata.effort,
+    metadata.thinking_level,
+    metadata.reasoning_level,
+  ].map(getMetadataText).find(Boolean) || '';
+  const modelLabel = rawModel ? formatProviderModelLabel(rawModel) : 'unavailable';
+  const effortLabel = rawEffort ? formatThinkingEffortLabel(rawEffort) : 'unavailable';
+  return `Model: ${modelLabel} · Thinking effort: ${effortLabel}`;
+};
+
+const getChatGptMessageLabel = (msg: Message): string => {
+  if (!msg.metadata_json) return '';
+  try {
+    const metadata = JSON.parse(msg.metadata_json) as Record<string, unknown>;
+    if (typeof metadata.source === 'string' && metadata.source.startsWith('chathub-')) return '';
+    const rawModel = [metadata.model_slug, metadata.requested_model_slug, metadata.default_model_slug, metadata.model]
+      .find((value): value is string => typeof value === 'string' && !!value.trim() && value.trim().toLowerCase() !== 'auto')
+      || '';
+    const rawEffort = [metadata.thinking_effort, metadata.reasoning_effort, metadata.effort]
+      .find((value): value is string => typeof value === 'string' && !!value.trim())
+      || '';
+    if (!rawModel && !rawEffort) return '';
+    const details = rawModel ? [formatChatGptModelLabel(rawModel)] : [];
+    if (rawEffort) details.push(`Thinking: ${formatThinkingEffortLabel(rawEffort)}`);
+    return details.join(' · ');
+  } catch {
+    return '';
   }
 };
 
@@ -666,10 +900,20 @@ const buildLinearConversationPath = (
   };
 };
 
-const buildDisplayMessages = (rawMessages: Message[]): DisplayMessage[] => {
+const buildDisplayMessages = (rawMessages: Message[], provider = ''): DisplayMessage[] => {
   const output: DisplayMessage[] = [];
   const embeddedUiSeen = new Set<string>();
-  const segmentable = rawMessages.filter((m) => (m.content && m.content.trim()) || !!m.metadata_json);
+  const isChatGpt = provider === 'chatgpt';
+  const formattedMessages = isChatGpt
+    ? rawMessages.map((message) => ({ ...message, content: formatChatGptContent(message.content) }))
+    : rawMessages;
+  const segmentable = formattedMessages.filter((m) => {
+    if (!(m.content && m.content.trim()) && !m.metadata_json) return false;
+    if (!isChatGpt || !isChatGptInternalProtocolMessage(m)) return true;
+    // Deep Research widgets are attached to tool nodes, so retain those nodes
+    // long enough for the embedded UI branch below to promote the widget.
+    return getEmbeddedUiEntries(m).length > 0;
+  });
 
   const flushSegment = (segment: Message[]) => {
     if (segment.length === 0) return;
@@ -812,8 +1056,8 @@ const countRegexMatches = (text: string, pattern: RegExp) => {
   return matches ? matches.length : 0;
 };
 
-const CHAT_IMAGE_MARKDOWN_PATTERN = /!\[([^\]]*?)\]\((chatgpt-image:\/\/[^)\s]+)\)/g;
-const HAS_CHAT_IMAGE_MARKDOWN_PATTERN = /!\[[^\]]*?\]\(chatgpt-image:\/\/[^)\s]+\)/;
+const ARCHIVE_IMAGE_MARKDOWN_PATTERN = /!\[([^\]]*?)\]\(((?:chatgpt-image|archive-asset):\/\/[^)\s]+)\)/g;
+const HAS_ARCHIVE_IMAGE_MARKDOWN_PATTERN = /!\[[^\]]*?\]\((?:chatgpt-image|archive-asset):\/\/[^)\s]+\)/;
 
 const stripRedundantChatImageText = (value: string) => {
   const lines = String(value || '').split('\n');
@@ -844,8 +1088,9 @@ const ChatImage = ({ src, alt, conversationId, onOpenImage, ...props }: ChatImag
   const resolvedSrc = triedFallback ? (fallback.resolved || src) : src;
 
   const handleError = useCallback(async () => {
-    if (triedFallback || !src || typeof src !== 'string' || !src.startsWith('chatgpt-image://')) return;
+    if (triedFallback || !src || typeof src !== 'string') return;
     setFallback({ source: src });
+    if (!src.startsWith('chatgpt-image://')) return;
     const rawId = src.replace('chatgpt-image://', '').replace(/^\/+/, '');
     try {
       const dataUrl = await window.electronAPI.invoke('api:getImageDataUrl', { rawImageId: rawId, conversationId });
@@ -860,6 +1105,10 @@ const ChatImage = ({ src, alt, conversationId, onOpenImage, ...props }: ChatImag
   const handleClick = useCallback(() => {
     if (resolvedSrc && onOpenImage) onOpenImage(resolvedSrc);
   }, [resolvedSrc, onOpenImage]);
+
+  // Do not leave a native broken-image icon behind when an old backup pointer
+  // cannot be resolved. A sibling image reference may still resolve correctly.
+  if (triedFallback && !fallback.resolved) return null;
 
   return <img src={resolvedSrc} alt={alt || 'Image'} loading="lazy" onError={handleError} onClick={handleClick} {...props} />;
 };
@@ -900,9 +1149,48 @@ const DeepResearchEmbed = memo(({ entry }: { entry: EmbeddedUiEntry }) => {
   );
 });
 
-const MarkdownMessage = memo(({ content, embeddedUi, highlightQuery, highlightCodeBlocks, conversationId, onOpenImage, citationRegistry }: { content: string, embeddedUi?: EmbeddedUiEntry[], highlightQuery?: string, highlightCodeBlocks?: boolean, conversationId?: string, onOpenImage?: (src: string) => void, citationRegistry: Record<string, CitationEntry> }) => {
+const ClaudeArtifactList = memo(({ artifacts }: { artifacts: ClaudeArtifact[] }) => {
+  if (artifacts.length === 0) return null;
+  return (
+    <section className="claude-artifacts" aria-label="Claude artifacts">
+      <div className="claude-artifacts-title">Claude artifacts</div>
+      {artifacts.map((artifact, index) => {
+        const label = artifact.title || artifact.id || `Artifact ${index + 1}`;
+        const format = artifact.language || artifact.type.replace(/^application\/vnd\.ant\./, '') || 'artifact';
+        return (
+          <details className="claude-artifact" key={`${artifact.id || label}-${index}`}>
+            <summary>
+              <span>{label}</span>
+              <span className="claude-artifact-meta">{artifact.command ? `${artifact.command} · ` : ''}{format}</span>
+            </summary>
+            <div className="claude-artifact-body">
+              {artifact.content ? (
+                <pre><code>{artifact.content}</code></pre>
+              ) : null}
+              {artifact.oldStr ? (
+                <div className="claude-artifact-change">
+                  <div className="claude-artifact-change-label">Previous text</div>
+                  <pre><code>{artifact.oldStr}</code></pre>
+                </div>
+              ) : null}
+              {artifact.newStr ? (
+                <div className="claude-artifact-change">
+                  <div className="claude-artifact-change-label">Replacement text</div>
+                  <pre><code>{artifact.newStr}</code></pre>
+                </div>
+              ) : null}
+            </div>
+          </details>
+        );
+      })}
+    </section>
+  );
+});
+
+const MarkdownMessage = memo(({ content, role, embeddedUi, highlightQuery, highlightCodeBlocks, conversationId, onOpenImage, citationRegistry }: { content: string, role?: Message['role'], embeddedUi?: EmbeddedUiEntry[], highlightQuery?: string, highlightCodeBlocks?: boolean, conversationId?: string, onOpenImage?: (src: string) => void, citationRegistry: Record<string, CitationEntry> }) => {
   const query = highlightQuery || '';
   const rawContent = typeof content === 'string' ? content : String(content || '');
+  const terminalTranscript = role === 'user' && isLikelyTerminalTranscript(rawContent);
   const embeddedUiEntries = useMemo(() => sanitizeEmbeddedUiEntries(embeddedUi), [embeddedUi]);
   const contentWithoutEmbeddedUi = rawContent;
   const rawLineCount = useMemo(() => countLines(contentWithoutEmbeddedUi), [contentWithoutEmbeddedUi]);
@@ -918,24 +1206,19 @@ const MarkdownMessage = memo(({ content, embeddedUi, highlightQuery, highlightCo
   const plainLatexTextMode = !hasMarkdownMath
     && (latexCommandCount >= MIN_PLAIN_LATEX_COMMANDS || cdotCount > 0)
     && (rawLineCount >= MIN_PLAIN_LATEX_LINES || rawContent.length > 800);
-  const safeRenderMode = rawContent.length > MAX_MARKDOWN_RENDER_CHARS || rawLineCount > MAX_MARKDOWN_RENDER_LINES;
   const effectiveQuery = mathComplexityHigh ? '' : query;
   const codeSearchQuery = highlightCodeBlocks ? effectiveQuery : '';
-  const safeFallbackContent = useMemo(() => {
-    if (contentWithoutEmbeddedUi.length <= MAX_SAFE_FALLBACK_CHARS) return contentWithoutEmbeddedUi;
-    return `${contentWithoutEmbeddedUi.slice(0, MAX_SAFE_FALLBACK_CHARS)}\n\n[truncated for performance]`;
-  }, [contentWithoutEmbeddedUi]);
   const renderedContent = useMemo(() => {
     try {
       const normalized = normalizeMathDelimiters(normalizeCitationMarkers(normalizeProductsMarkers(contentWithoutEmbeddedUi)));
-      if (!HAS_CHAT_IMAGE_MARKDOWN_PATTERN.test(normalized)) return normalized;
+      if (!HAS_ARCHIVE_IMAGE_MARKDOWN_PATTERN.test(normalized)) return normalized;
       return stripRedundantChatImageText(normalized);
     } catch (error) {
       console.error('Markdown preprocessing failed:', error);
       return contentWithoutEmbeddedUi;
     }
   }, [contentWithoutEmbeddedUi]);
-  const hasChatImages = useMemo(() => HAS_CHAT_IMAGE_MARKDOWN_PATTERN.test(renderedContent), [renderedContent]);
+  const hasChatImages = useMemo(() => HAS_ARCHIVE_IMAGE_MARKDOWN_PATTERN.test(renderedContent), [renderedContent]);
 
   const markdownComponents: Components = {
     a: ({ href, children, ...props }) => {
@@ -985,15 +1268,15 @@ const MarkdownMessage = memo(({ content, embeddedUi, highlightQuery, highlightCo
       const codeTooLarge = codeText.length > MAX_CODE_HIGHLIGHT_CHARS || codeLineCount > MAX_CODE_HIGHLIGHT_LINES;
       const shouldHighlightCode = !!codeSearchQuery && !codeTooLarge;
       return match ? (
-        codeTooLarge ? (
-          <pre className="large-code-fallback">
-            <code>{codeText.length <= MAX_SAFE_FALLBACK_CHARS ? codeText : `${codeText.slice(0, MAX_SAFE_FALLBACK_CHARS)}\n\n[truncated for performance]`}</code>
-          </pre>
-        ) : shouldHighlightCode ? (
+        shouldHighlightCode ? (
           <pre className={className}>
             <code>
               <HighlightText query={codeSearchQuery}>{codeText}</HighlightText>
             </code>
+          </pre>
+        ) : codeTooLarge ? (
+          <pre className={className}>
+            <code>{codeText}</code>
           </pre>
         ) : (
           <SyntaxHighlighter
@@ -1035,7 +1318,7 @@ const MarkdownMessage = memo(({ content, embeddedUi, highlightQuery, highlightCo
     let lastIndex = 0;
     let match: RegExpExecArray | null;
     let imageIndex = 0;
-    const chatImagePattern = new RegExp(CHAT_IMAGE_MARKDOWN_PATTERN);
+    const chatImagePattern = new RegExp(ARCHIVE_IMAGE_MARKDOWN_PATTERN);
 
     while ((match = chatImagePattern.exec(renderedContent)) !== null) {
       const before = renderedContent.slice(lastIndex, match.index);
@@ -1077,21 +1360,20 @@ const MarkdownMessage = memo(({ content, embeddedUi, highlightQuery, highlightCo
     );
   };
 
+  if (terminalTranscript) {
+    return (
+      <div className="user-terminal-message">
+        <pre><code><HighlightText query={query}>{rawContent.replace(/\r\n?/g, '\n')}</HighlightText></code></pre>
+        {renderContentWithEmbeddedUi(null)}
+      </div>
+    );
+  }
+
   if (hasChatImages) {
     return (
       <MarkdownErrorBoundary rawContent={content} conversationId={conversationId}>
         {renderContentWithEmbeddedUi(renderContentWithImages())}
       </MarkdownErrorBoundary>
-    );
-  }
-
-  if (safeRenderMode) {
-    return (
-      <div className="markdown-fallback">
-        <div className="markdown-fallback-title">Large message rendered in safe mode.</div>
-        <pre><HighlightText query={effectiveQuery}>{safeFallbackContent}</HighlightText></pre>
-        {renderContentWithEmbeddedUi(null)}
-      </div>
     );
   }
 
@@ -1111,8 +1393,27 @@ const MarkdownMessage = memo(({ content, embeddedUi, highlightQuery, highlightCo
   );
 });
 
-const MessageRow = memo(({ msg, highlightQuery, highlightCodeBlocks, isTarget, onOpenImage, citationRegistry, onSwitchBranch }: { msg: DisplayMessage, highlightQuery?: string, highlightCodeBlocks?: boolean, isTarget?: boolean, onOpenImage?: (src: string) => void, citationRegistry: Record<string, CitationEntry>, onSwitchBranch?: (parentId: string, childId: string) => void }) => {
+type MessageRowProps = {
+  msg: DisplayMessage;
+  assistantLabel?: string;
+  highlightQuery?: string;
+  highlightCodeBlocks?: boolean;
+  isTarget?: boolean;
+  onOpenImage?: (src: string) => void;
+  citationRegistry: Record<string, CitationEntry>;
+  onSwitchBranch?: (parentId: string, childId: string) => void;
+};
+
+const MessageRow = memo(({ msg, assistantLabel = 'ChatGPT', highlightQuery, highlightCodeBlocks, isTarget, onOpenImage, citationRegistry, onSwitchBranch }: MessageRowProps) => {
   const hasThinking = msg.role === 'assistant' && !!msg.thinkingParts && msg.thinkingParts.length > 0;
+  const claudeArtifacts = useMemo(() => getClaudeArtifacts(msg), [msg]);
+  const chatHubModelLabel = msg.role === 'assistant' ? getChatHubModelLabel(msg) : '';
+  const providerMessageLabel = msg.role === 'assistant' && !chatHubModelLabel
+    ? getProviderMessageLabel(msg, assistantLabel)
+    : '';
+  const chatGptMessageLabel = msg.role === 'assistant' && !chatHubModelLabel && !providerMessageLabel
+    ? getChatGptMessageLabel(msg)
+    : '';
   const [thinkingState, setThinkingState] = useState({ messageId: msg.id, open: false });
   const thinkingOpen = thinkingState.messageId === msg.id && thinkingState.open;
   const branchInfo = msg.branchInfo;
@@ -1125,7 +1426,7 @@ const MessageRow = memo(({ msg, highlightQuery, highlightCodeBlocks, isTarget, o
       <div className={`message-row assistant bridge-status-message ${isTarget ? 'highlight-target' : ''}`} data-message-id={msg.id}>
         <div className="message-content">
           <div className="message-header">
-            <div className="role-label">ChatGPT</div>
+            <div className="role-label">{assistantLabel}</div>
           </div>
           <div className="bridge-status-bubble">
             <div className={`bridge-status-text ${msg.bridgeStatusState === 'thinking' ? 'loading-shimmer' : ''}`}>
@@ -1141,7 +1442,10 @@ const MessageRow = memo(({ msg, highlightQuery, highlightCodeBlocks, isTarget, o
     <div className={`message-row ${msg.role} ${isTarget ? 'highlight-target' : ''}`} data-message-id={msg.id}>
       <div className="message-content">
         <div className="message-header">
-          <div className="role-label">{msg.role === 'user' ? 'You' : 'ChatGPT'}</div>
+          <div className="role-label">{msg.role === 'user' ? 'You' : assistantLabel}</div>
+          {chatHubModelLabel ? <span className="message-model-label">{chatHubModelLabel}</span> : null}
+          {providerMessageLabel ? <span className="message-model-label">{providerMessageLabel}</span> : null}
+          {chatGptMessageLabel ? <span className="message-model-label">{chatGptMessageLabel}</span> : null}
           {hasThinking ? (
             <button
               type="button"
@@ -1164,7 +1468,7 @@ const MessageRow = memo(({ msg, highlightQuery, highlightCodeBlocks, isTarget, o
                 <div key={part.id} className="thinking-item">
                   <div className="thinking-role">{part.role}</div>
                   <div className="markdown-body">
-                    <MarkdownMessage content={part.content} highlightQuery={highlightQuery} conversationId={msg.conversation_id} onOpenImage={onOpenImage} citationRegistry={citationRegistry} />
+                    <MarkdownMessage content={part.content} role={part.role} highlightQuery={highlightQuery} conversationId={msg.conversation_id} onOpenImage={onOpenImage} citationRegistry={citationRegistry} />
                   </div>
                 </div>
               ))}
@@ -1172,8 +1476,9 @@ const MessageRow = memo(({ msg, highlightQuery, highlightCodeBlocks, isTarget, o
           </div>
         ) : null}
         <div className="markdown-body">
-          <MarkdownMessage content={msg.content} embeddedUi={msg.embeddedUi} highlightQuery={highlightQuery} highlightCodeBlocks={highlightCodeBlocks} conversationId={msg.conversation_id} onOpenImage={onOpenImage} citationRegistry={citationRegistry} />
+          <MarkdownMessage content={msg.content} role={msg.role} embeddedUi={msg.embeddedUi} highlightQuery={highlightQuery} highlightCodeBlocks={highlightCodeBlocks} conversationId={msg.conversation_id} onOpenImage={onOpenImage} citationRegistry={citationRegistry} />
         </div>
+        <ClaudeArtifactList artifacts={claudeArtifacts} />
         {branchInfo ? (
           <div className="branch-switcher" aria-label="Branch switcher">
             <button
@@ -1211,12 +1516,14 @@ const MessageRow = memo(({ msg, highlightQuery, highlightCodeBlocks, isTarget, o
   );
 });
 
-type ConversationMarkerState = 'none' | 'uncached' | 'dirty';
+type ConversationMarkerState = 'none' | 'uncached' | 'new-messages' | 'resync';
 
 const ConversationItem = memo(({ conv, active, markerState, onClick, onContextMenu }: { conv: Conversation, active: boolean, markerState: ConversationMarkerState, onClick: () => void, onContextMenu: (e: React.MouseEvent) => void }) => {
   const markerTitle = markerState === 'uncached'
     ? 'Not cached yet'
-    : markerState === 'dirty'
+    : markerState === 'new-messages'
+      ? 'New messages are available; sync this chat to update the cache'
+      : markerState === 'resync'
       ? 'Cached copy needs a full sync'
       : '';
   return (
@@ -1254,6 +1561,10 @@ export {
   findTextOccurrenceRect,
   formatSendError,
   getDisplayMessageSearchText,
+  getClaudeArtifacts,
+  getChatHubModelLabel,
+  getChatGptMessageLabel,
+  getProviderMessageLabel,
   getEmbeddedUiEntries,
   getMessagePreview,
   isNavigableMessage,
@@ -1268,5 +1579,6 @@ export {
 export type {
   BridgeComposerStatus,
   CitationEntry,
+  ClaudeArtifact,
   DisplayMessage,
 };

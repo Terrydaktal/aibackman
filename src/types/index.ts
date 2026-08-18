@@ -4,7 +4,10 @@ export interface Conversation {
   created_at: number;
   updated_at: number;
   last_synced_updated_at?: number | null;
+  last_message_at?: number | null;
+  message_count?: number;
   current_node_id?: string | null;
+  cache_format_version?: number | null;
   is_deleted_on_web?: number;
 }
 

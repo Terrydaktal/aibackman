@@ -59,6 +59,23 @@ function asUnixSeconds(value, fallback = Date.now() / 1000) {
   if (typeof value === 'number' && Number.isFinite(value)) {
     return value > 10_000_000_000 ? value / 1000 : value;
   }
+  if (value && typeof value === 'object') {
+    if (Object.prototype.hasOwnProperty.call(value, '$date')) {
+      return asUnixSeconds(value.$date, fallback);
+    }
+    if (Object.prototype.hasOwnProperty.call(value, '$numberLong')) {
+      return asUnixSeconds(value.$numberLong, fallback);
+    }
+    if (Object.prototype.hasOwnProperty.call(value, 'seconds')) {
+      const seconds = Number(value.seconds);
+      const nanos = Number(value.nanos || value.nanoseconds || 0);
+      if (Number.isFinite(seconds)) return seconds + (Number.isFinite(nanos) ? nanos / 1_000_000_000 : 0);
+    }
+  }
+  const numeric = Number(value);
+  if (Number.isFinite(numeric) && String(value).trim() !== '') {
+    return numeric > 10_000_000_000 ? numeric / 1000 : numeric;
+  }
   const parsed = Date.parse(String(value || ''));
   return Number.isFinite(parsed) ? parsed / 1000 : fallback;
 }
@@ -71,6 +88,79 @@ function compactTitle(value, fallback = 'Untitled chat') {
 
 function parseJsonFile(filePath) {
   return JSON.parse(fs.readFileSync(filePath, 'utf8'));
+}
+
+const MIME_TYPES = new Map([
+  ['.bmp', 'image/bmp'],
+  ['.gif', 'image/gif'],
+  ['.jpeg', 'image/jpeg'],
+  ['.jpg', 'image/jpeg'],
+  ['.pdf', 'application/pdf'],
+  ['.png', 'image/png'],
+  ['.svg', 'image/svg+xml'],
+  ['.txt', 'text/plain'],
+  ['.webp', 'image/webp'],
+  ['.css', 'text/css'],
+  ['.html', 'text/html'],
+  ['.js', 'text/javascript'],
+  ['.json', 'application/json'],
+  ['.py', 'text/x-python'],
+  ['.sh', 'text/x-shellscript'],
+]);
+
+function mimeTypeForPath(filePath) {
+  return MIME_TYPES.get(path.extname(String(filePath || '')).toLowerCase()) || 'application/octet-stream';
+}
+
+function createAssetStore(db, providerId) {
+  const root = path.join(path.dirname(db.dbPath), 'assets', String(providerId || 'archive'));
+  fs.mkdirSync(root, { recursive: true });
+  const copied = new Map();
+
+  function add(sourcePath, key = sourcePath, displayName = path.basename(String(sourcePath || ''))) {
+    if (!sourcePath || !fs.existsSync(sourcePath)) return null;
+    let stat;
+    try {
+      stat = fs.lstatSync(sourcePath);
+    } catch {
+      return null;
+    }
+    if (!stat.isFile() || stat.isSymbolicLink()) return null;
+
+    const normalizedName = path.basename(String(displayName || sourcePath)) || 'attachment';
+    const extension = path.extname(normalizedName).slice(0, 20).toLowerCase();
+    const id = stableId('asset', `${providerId}|${key}|${sourcePath}`);
+    const destination = path.join(root, `${id}${extension}`);
+    if (!copied.has(id)) {
+      try {
+        fs.copyFileSync(sourcePath, destination);
+      } catch {
+        return null;
+      }
+    }
+    copied.set(id, destination);
+    return {
+      id,
+      name: normalizedName,
+      sizeBytes: stat.size,
+      mimeType: mimeTypeForPath(normalizedName),
+      path: destination,
+      uri: `archive-asset://local?path=${encodeURIComponent(destination)}`,
+    };
+  }
+
+  return { root, add };
+}
+
+function attachmentMarkdown(attachments) {
+  return attachments
+    .filter((attachment) => attachment && attachment.uri)
+    .map((attachment) => {
+      const label = String(attachment.name || 'attachment').replace(/[\[\]]/g, '');
+      return String(attachment.mimeType || '').startsWith('image/')
+        ? `![${label}](${attachment.uri})`
+        : `[${label}](${attachment.uri})`;
+    });
 }
 
 function archiveEntryIsUnsafe(entry) {
@@ -128,11 +218,14 @@ function materializeBackupPath(inputPath) {
 
 module.exports = {
   asUnixSeconds,
+  attachmentMarkdown,
   compactTitle,
+  createAssetStore,
   fileFingerprint,
   findNamedFile,
   findNamedFiles,
   materializeBackupPath,
+  mimeTypeForPath,
   parseJsonFile,
   stableId,
 };

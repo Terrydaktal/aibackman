@@ -23,7 +23,7 @@ export default defineConfig([
     // This module intentionally co-locates the message presentation components
     // with their pure branch/search transformations so the rendering contract
     // remains reviewable in one place. Non-component exports only affect HMR.
-    files: ['src/features/chat/ChatPresentation.tsx'],
+    files: ['src/archive/standard/UniversalArchivePresenter.tsx'],
     rules: {
       'react-refresh/only-export-components': 'off',
     },

@@ -5,16 +5,48 @@ const AccountCatalog = require('./catalog.cjs');
 const ChatDatabase = require('../database.cjs');
 const { getAgentPlugin, listAgentPlugins } = require('../agents/registry.cjs');
 const { stableId } = require('../agents/utils.cjs');
+const {
+  ArchiveRecoveryManager,
+  DurableAuditJournal,
+} = require('../archive/safety/journal.cjs');
 
 class AccountManager {
-  constructor({ userDataPath, legacyDatabases, legacyIdentities = {} }) {
+  constructor({ userDataPath, legacyDatabases, legacyIdentities = {}, diagnostics = null }) {
     this.userDataPath = userDataPath;
     this.accountsPath = path.join(userDataPath, 'accounts');
-    fs.mkdirSync(this.accountsPath, { recursive: true });
+    fs.mkdirSync(this.userDataPath, { recursive: true, mode: 0o700 });
+    fs.chmodSync(this.userDataPath, 0o700);
+    fs.mkdirSync(this.accountsPath, { recursive: true, mode: 0o700 });
+    fs.chmodSync(this.accountsPath, 0o700);
+    this.auditJournal = new DurableAuditJournal(userDataPath, {
+      buildInfo: diagnostics?.getBuildInfo?.() || null,
+      maxBytes: Number(process.env.AIBACKMAN_AUDIT_MAX_BYTES || 256 * 1024 * 1024),
+    });
+    this.recoveryManager = new ArchiveRecoveryManager(userDataPath, this.auditJournal);
     this.catalog = new AccountCatalog(path.join(userDataPath, 'archive-catalog.db'));
     this.databases = new Map();
     this.legacyDatabases = legacyDatabases;
     this.legacyIdentities = legacyIdentities;
+    this.diagnostics = diagnostics;
+    this.migrateLegacyDatabasePaths();
+  }
+
+  migrateLegacyDatabasePaths() {
+    const currentRoot = path.resolve(this.userDataPath);
+    const legacyRoot = path.resolve(path.join(path.dirname(this.userDataPath), 'chatgpt'));
+    if (currentRoot === legacyRoot) return;
+
+    const legacyPrefix = `${legacyRoot}${path.sep}`;
+    for (const account of this.catalog.listAccounts()) {
+      const accountPath = path.resolve(account.db_path);
+      if (!accountPath.startsWith(legacyPrefix)) continue;
+
+      const migratedPath = path.join(currentRoot, path.relative(legacyRoot, accountPath));
+      if (!fs.existsSync(migratedPath)) continue;
+
+      this.catalog.updateDatabasePath(account.id, migratedPath);
+      console.info(`[storage] Migrated archive database path for ${account.id}: ${migratedPath}`);
+    }
   }
 
   async initialize() {
@@ -177,7 +209,10 @@ class AccountManager {
     const account = typeof accountOrId === 'string' ? this.getAccount(accountOrId) : accountOrId;
     if (!account) throw new Error('Unknown archive account.');
     if (!this.databases.has(account.id)) {
-      this.databases.set(account.id, new ChatDatabase(account.dbPath));
+      this.databases.set(account.id, new ChatDatabase(account.dbPath, {
+        diagnostics: this.diagnostics,
+        accountId: account.id,
+      }));
     }
     return this.databases.get(account.id);
   }
@@ -227,32 +262,135 @@ class AccountManager {
     return this.getAccount(id);
   }
 
+  deleteAccount(accountId) {
+    const account = this.getAccount(accountId);
+    if (!account) throw new Error('Unknown archive account.');
+    if (account.isDefault) throw new Error('Default archive accounts cannot be deleted.');
+
+    const operationId = crypto.randomUUID();
+    const database = this.getDatabase(account);
+    const snapshot = database.createRecoverySnapshot('before-account-deletion', {
+      force: true,
+      operationId,
+    });
+    database.close();
+    this.databases.delete(account.id);
+
+    const quarantine = this.recoveryManager.quarantineDatabaseFiles({
+      dbPath: account.dbPath,
+      account,
+      reason: 'Archive account removed by the user; database retained for recovery.',
+      operationId,
+    });
+    try {
+      this.catalog.deleteAccount(account.id);
+    } catch (error) {
+      for (const { source, destination } of quarantine.moved.slice().reverse()) {
+        if (fs.existsSync(destination) && !fs.existsSync(source)) fs.renameSync(destination, source);
+      }
+      throw error;
+    }
+    this.auditJournal.append({
+      action: 'account-removed-from-catalog',
+      operation_id: operationId,
+      account_id: account.id,
+      agent_id: account.agentId,
+      database_path: account.dbPath,
+      recovery_path: quarantine.directory,
+    });
+    return {
+      success: true,
+      accountId: account.id,
+      recoveryPath: quarantine.directory,
+      snapshotPath: snapshot?.snapshot_database || null,
+    };
+  }
+
   async importBackup(accountId, inputPath) {
     const account = this.getAccount(accountId);
     if (!account) throw new Error('Unknown archive account.');
     const plugin = getAgentPlugin(account.agentId);
-    if (typeof plugin?.importBackup !== 'function') {
+    const backupParser = plugin?.backupParser || plugin;
+    if (typeof backupParser?.importBackup !== 'function') {
       throw new Error(`${plugin?.name || account.agentId} does not support official backup imports.`);
     }
     const db = this.getDatabase(account);
-    const result = await plugin.importBackup({
-      db,
-      inputPath,
-      replaceExisting: account.sourceKind === 'backup',
-      sourceConfig: account.sourceConfig,
+    const operationId = crypto.randomUUID();
+    this.auditJournal.append({
+      action: 'backup-import-started',
+      operation_id: operationId,
+      account_id: account.id,
+      agent_id: account.agentId,
+      database_path: account.dbPath,
+      source_path: inputPath,
     });
-    this.catalog.upsertAccount({
-      ...account,
-      sourceConfig: { ...account.sourceConfig, lastImportPath: result.sourcePath || inputPath },
-    });
-    return { success: true, account: this.getAccount(account.id), ...result, stats: db.getStats() };
+    let snapshot = null;
+    try {
+      snapshot = db.createRecoverySnapshot('before-official-backup-import', { operationId });
+      const result = await backupParser.importBackup({
+        db,
+        inputPath,
+        // Imports are always additive. A backup can be partial, older, or from a
+        // nested Takeout folder, so absence is never evidence for deletion.
+        replaceExisting: false,
+        sourceConfig: account.sourceConfig,
+      });
+      this.catalog.upsertAccount({
+        ...account,
+        sourceConfig: { ...account.sourceConfig, lastImportPath: result.sourcePath || inputPath },
+      });
+      const stats = db.getStats();
+      try {
+        this.auditJournal.append({
+          action: 'backup-import-completed',
+          operation_id: operationId,
+          account_id: account.id,
+          agent_id: account.agentId,
+          database_path: account.dbPath,
+          source_path: inputPath,
+          recovery_path: snapshot?.snapshot_database || null,
+          result: {
+            imported_conversations: Number(result.importedConversations || 0),
+            imported_messages: Number(result.importedMessages || 0),
+            conversation_count: stats.conversationCount,
+            message_count: stats.messageCount,
+          },
+        });
+      } catch (journalError) {
+        console.error('The external audit journal could not record backup-import completion:', journalError);
+      }
+      return {
+        success: true,
+        account: this.getAccount(account.id),
+        ...result,
+        stats,
+        preImportSnapshotPath: snapshot?.snapshot_database || null,
+      };
+    } catch (error) {
+      try {
+        this.auditJournal.append({
+          action: 'backup-import-failed',
+          operation_id: operationId,
+          account_id: account.id,
+          agent_id: account.agentId,
+          database_path: account.dbPath,
+          source_path: inputPath,
+          recovery_path: snapshot?.snapshot_database || null,
+          error: String(error?.stack || error),
+        });
+      } catch (journalError) {
+        console.error('The external audit journal could not record backup-import failure:', journalError);
+      }
+      throw error;
+    }
   }
 
   async refreshLocal(accountId, onProgress) {
     const account = this.getAccount(accountId);
     if (!account) throw new Error('Unknown archive account.');
     const plugin = getAgentPlugin(account.agentId);
-    if (typeof plugin?.refreshLocal !== 'function') {
+    const backupParser = plugin?.backupParser || plugin;
+    if (typeof backupParser?.refreshLocal !== 'function') {
       throw new Error(`${plugin?.name || account.agentId} is not a local session source.`);
     }
     if (plugin.capabilities?.sharedLocalSource && typeof plugin.refreshAllLocal === 'function') {
@@ -269,7 +407,7 @@ class AccountManager {
       return result;
     }
     const db = this.getDatabase(account);
-    const result = await plugin.refreshLocal({
+    const result = await backupParser.refreshLocal({
       db,
       sourceConfig: account.sourceConfig,
       onProgress,
@@ -290,8 +428,9 @@ class AccountManager {
 
     for (const [targetAgentId, agentAccounts] of accountsByAgent) {
       const plugin = getAgentPlugin(targetAgentId);
-      if (typeof plugin?.refreshAllLocal === 'function') {
-        const batch = await plugin.refreshAllLocal({
+      const backupParser = plugin?.backupParser || plugin;
+      if (typeof backupParser?.refreshAllLocal === 'function') {
+        const batch = await backupParser.refreshAllLocal({
           accounts: agentAccounts,
           getDatabase: (account) => this.getDatabase(account),
           onProgress,

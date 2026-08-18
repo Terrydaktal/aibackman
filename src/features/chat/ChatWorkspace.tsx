@@ -19,12 +19,13 @@ import {
   sleep,
   type BridgeComposerStatus,
   type DisplayMessage,
-} from './ChatPresentation';
+} from '../../archive/standard/UniversalArchivePresenter';
 import { useWorkspaceDiagnostics } from './useWorkspaceDiagnostics';
 import { FONT_SIZE_MAX, FONT_SIZE_MIN, useWorkspaceLayout } from './useWorkspaceLayout';
 import { useMessageNavigation } from './useMessageNavigation';
 import { useArchiveSearch } from './useArchiveSearch';
 import { useCacheManagement } from './useCacheManagement';
+import { orderConversations } from './conversationOrdering';
 import 'katex/dist/katex.min.css';
 import '../../index.css';
 
@@ -35,6 +36,26 @@ interface ChatWorkspaceProps {
   initialMessageId?: string | null;
   initialSearchQuery?: string;
 }
+
+const mergeConversationPage = (
+  existing: Conversation[],
+  incoming: Conversation[]
+) => {
+  const byId = new Map(existing.map((conversation) => [conversation.id, conversation]));
+  incoming.forEach((conversation) => byId.set(conversation.id, conversation));
+  return [...byId.values()];
+};
+
+const mergeRemoteConversationPositions = (
+  existing: Map<string, number>,
+  incoming: Conversation[],
+  offset: number,
+  reset = false
+) => {
+  const positions = reset ? new Map<string, number>() : new Map(existing);
+  incoming.forEach((conversation, index) => positions.set(conversation.id, offset + index));
+  return positions;
+};
 
 export function ChatWorkspace({
   account,
@@ -94,6 +115,7 @@ export function ChatWorkspace({
 
   const [hasMoreConvs, setHasMoreConvs] = useState(true);
   const [isLoadingMoreConvs, setIsLoadingMoreConvs] = useState(false);
+  const [remoteConversationPositions, setRemoteConversationPositions] = useState(new Map<string, number>());
   const [conversationContextMenu, setConversationContextMenu] = useState<{ x: number; y: number; conversationId: string } | null>(null);
 
   const [isPanning, setIsPanning] = useState(false);
@@ -111,6 +133,7 @@ export function ChatWorkspace({
   const fileInputRef = useRef<HTMLInputElement>(null);
   const lastConversationListSyncAtRef = useRef(0);
   const conversationListSyncInFlightRef = useRef(false);
+	  const nextConversationOffsetRef = useRef(0);
 	  const conversationSelectionTokenRef = useRef(0);
 	  const selectConversationRef = useRef<(id: string, forceSync?: boolean, shouldSync?: boolean) => Promise<void>>(async () => {});
   const initializationStartedRef = useRef(false);
@@ -127,15 +150,22 @@ export function ChatWorkspace({
       mode: account.legacyMode || account.agentId,
     })
   ), [account.agentId, account.id, account.legacyMode]);
+  const reloadLocalConversationIndex = useCallback(async () => {
+    const refreshedLocalConversations = await invokeMode('db:getConversations');
+    if (Array.isArray(refreshedLocalConversations)) {
+      setConversations(refreshedLocalConversations);
+    }
+  }, [invokeMode]);
   const {
     cacheAll: handleCacheAll,
-    clearDirty: clearDirtyConversationMarker,
     clearUncached: clearUncachedConversationMarker,
     diagnostics: cacheDiagnostics,
     dirtyConversationIds,
     isRunning: isCachingAll,
+    newMessageConversationIds,
     refreshDiagnostics: updateCacheDiagnostics,
     refreshStats: updateStats,
+    resyncConversationIds,
     retryFailed: handleRetryFailedCache,
     stats: cacheStats,
     status: cacheRunStatus,
@@ -146,13 +176,18 @@ export function ChatWorkspace({
     invoke: invokeMode,
     refreshRevision: conversations,
   });
+  const orderedConversations = useMemo(() => orderConversations(
+    conversations,
+    remoteConversationPositions,
+    isLiveChatGPT ? newMessageConversationIds : new Set<string>()
+  ), [conversations, isLiveChatGPT, newMessageConversationIds, remoteConversationPositions]);
   const activeBranchSelections = useMemo(() => (
     activeConvId ? (branchSelectionsByConversation[activeConvId] || {}) : {}
   ), [activeConvId, branchSelectionsByConversation]);
   const { pathMessages } = useMemo(() => (
     buildLinearConversationPath(messages, conversationCurrentNodeId, activeBranchSelections)
   ), [messages, conversationCurrentNodeId, activeBranchSelections]);
-  const displayMessages = useMemo(() => buildDisplayMessages(pathMessages), [pathMessages]);
+  const displayMessages = useMemo(() => buildDisplayMessages(pathMessages, account.agentId), [account.agentId, pathMessages]);
   const citationRegistry = useMemo(() => buildCitationRegistry(pathMessages), [pathMessages]);
   const { push: pushOomDebug, updateStats: updateDiagnosticStats } = useWorkspaceDiagnostics();
   const {
@@ -267,10 +302,22 @@ export function ChatWorkspace({
   const loadConversations = useCallback(async () => {
     const localConvs = await invokeMode('db:getConversations');
     setConversations(localConvs);
+    nextConversationOffsetRef.current = 0;
+    setRemoteConversationPositions(new Map());
     try {
       const result = await invokeMode('api:syncConversations', { offset: 0, limit: 20 });
-      setConversations(result.conversations);
-      setHasMoreConvs(result.hasMore);
+      const remoteConversations = Array.isArray(result?.conversations) ? result.conversations : [];
+      if (!result?.remoteUnavailable) {
+        setConversations(mergeConversationPage(localConvs, remoteConversations));
+        setRemoteConversationPositions((previous) => mergeRemoteConversationPositions(
+          previous,
+          remoteConversations,
+          0,
+          true
+        ));
+        nextConversationOffsetRef.current = Number(result?.nextOffset ?? remoteConversations.length);
+      }
+      setHasMoreConvs(!result?.remoteUnavailable && !!result?.hasMore);
       lastConversationListSyncAtRef.current = Date.now();
     } catch (e) {
       console.error('Failed to sync conversations', e);
@@ -302,18 +349,28 @@ export function ChatWorkspace({
     if (isLoadingMoreConvs || !hasMoreConvs) return;
     setIsLoadingMoreConvs(true);
     try {
+      const offset = nextConversationOffsetRef.current;
       const result = await invokeMode('api:syncConversations', {
-        offset: conversations.length,
+        offset,
         limit: 20
       });
-      setConversations(result.conversations);
-      setHasMoreConvs(result.hasMore);
+      const remoteConversations = Array.isArray(result?.conversations) ? result.conversations : [];
+      if (!result?.remoteUnavailable) {
+        setConversations((previous) => mergeConversationPage(previous, remoteConversations));
+        setRemoteConversationPositions((previous) => mergeRemoteConversationPositions(
+          previous,
+          remoteConversations,
+          offset
+        ));
+        nextConversationOffsetRef.current = Number(result?.nextOffset ?? (offset + remoteConversations.length));
+      }
+      setHasMoreConvs(!result?.remoteUnavailable && !!result?.hasMore);
     } catch (e) {
       console.error('Failed to load more conversations', e);
     } finally {
       setIsLoadingMoreConvs(false);
     }
-  }, [conversations.length, hasMoreConvs, invokeMode, isLoadingMoreConvs]);
+  }, [hasMoreConvs, invokeMode, isLoadingMoreConvs]);
 
   const loadConversationState = useCallback(async (conversationId: string) => {
     return invokeMode('db:getConversationState', { conversationId });
@@ -338,17 +395,25 @@ export function ChatWorkspace({
     lastConversationListSyncAtRef.current = Date.now();
     try {
       const result = await invokeMode('api:syncConversations', { offset: 0, limit: 20 });
-      if (Array.isArray(result?.conversations)) {
-        setConversations(result.conversations);
+      if (Array.isArray(result?.conversations) && !result?.remoteUnavailable) {
+        setConversations((previous) => mergeConversationPage(previous, result.conversations));
+        setRemoteConversationPositions((previous) => mergeRemoteConversationPositions(
+          previous,
+          result.conversations,
+          0,
+          true
+        ));
+        nextConversationOffsetRef.current = Number(result?.nextOffset ?? result.conversations.length);
       }
-      setHasMoreConvs(!!result?.hasMore);
+      setHasMoreConvs(!result?.remoteUnavailable && !!result?.hasMore);
       await updateCacheDiagnostics();
+      await reloadLocalConversationIndex();
     } catch (error) {
       console.error('Failed to refresh conversation list', error);
     } finally {
       conversationListSyncInFlightRef.current = false;
     }
-  }, [invokeMode, isLiveChatGPT, updateCacheDiagnostics]);
+  }, [invokeMode, isLiveChatGPT, reloadLocalConversationIndex, updateCacheDiagnostics]);
 
   const refreshConversationListOnSwitch = useCallback(() => {
     void refreshConversationList(false);
@@ -422,20 +487,23 @@ export function ChatWorkspace({
       const syncedState = await loadConversationState(id);
       const syncedMsgs: Message[] = Array.isArray(syncedState?.allMessages) ? syncedState.allMessages : [];
       const syncedCurrentMsgs: Message[] = Array.isArray(syncedState?.currentMessages) ? syncedState.currentMessages : [];
+      const displaySyncedMsgs = syncedMsgs.length > 0 ? syncedMsgs : localMsgs;
+      const displayCurrentMsgs = syncedCurrentMsgs.length > 0 ? syncedCurrentMsgs : localCurrentMsgs;
       if (activeConvIdRef.current === id && conversationSelectionTokenRef.current === selectionToken) {
-        setMessages(syncedMsgs);
-        setConversationCurrentNodeId(syncedState?.currentNodeId || null);
-        if (Array.isArray(syncedMsgs) && syncedMsgs.length > 0) {
+        setMessages(displaySyncedMsgs);
+        setConversationCurrentNodeId(syncedState?.currentNodeId || localState?.currentNodeId || null);
+        if (displaySyncedMsgs.length > 0) {
           clearUncachedConversationMarker(id);
-          clearDirtyConversationMarker(id);
         }
-        if ((forceSync || isDirty) && syncedCurrentMsgs.length > 0) {
+        if ((forceSync || isDirty) && displayCurrentMsgs.length > 0) {
           setTimeout(() => {
             if (activeConvIdRef.current !== id) return;
-            virtuosoRef.current?.scrollToIndex({ index: syncedCurrentMsgs.length - 1, align: 'end', behavior: 'auto' });
+            virtuosoRef.current?.scrollToIndex({ index: displayCurrentMsgs.length - 1, align: 'end', behavior: 'auto' });
           }, 0);
         }
       }
+      await updateCacheDiagnostics();
+      await reloadLocalConversationIndex();
     } catch (error) {
       console.error('Failed to sync messages', error);
     } finally {
@@ -443,7 +511,7 @@ export function ChatWorkspace({
         setIsSyncing(false);
       }
     }
-  }, [account.agentName, canLiveSync, clearDirtyConversationMarker, clearUncachedConversationMarker, clearVisibleMessages, dirtyConversationIds, invokeMode, isAiMode, isLiveChatGPT, loadConversationState, refreshConversationListOnSwitch, saveVirtuosoState]);
+  }, [account.agentName, canLiveSync, clearUncachedConversationMarker, clearVisibleMessages, dirtyConversationIds, invokeMode, isAiMode, isLiveChatGPT, loadConversationState, refreshConversationListOnSwitch, reloadLocalConversationIndex, saveVirtuosoState, updateCacheDiagnostics]);
   useEffect(() => {
     selectConversationRef.current = selectConversation;
   }, [selectConversation]);
@@ -619,6 +687,8 @@ export function ChatWorkspace({
           setPastedImage(currentImage);
           setAttachedFiles(currentFiles);
         }
+        await reloadLocalConversationIndex();
+        await updateCacheDiagnostics();
       } else {
         // New conversation, need to refresh the list to find the new ID
         loadConversations();
@@ -661,8 +731,12 @@ export function ChatWorkspace({
   }, []);
 
   const handleDeleteConversation = async (id: string) => {
-    if (window.confirm(`Permanently delete this ${itemLabelSingular} from your local database?`)) {
-      await invokeMode('db:deleteConversation', { id });
+    if (window.confirm(`Remove this ${itemLabelSingular} from the local archive? An immutable recovery copy and audit record will be retained.`)) {
+      await invokeMode('db:deleteConversation', {
+        id,
+        confirmation: id,
+        reason: 'User confirmed removal from the archive viewer.',
+      });
       if (activeConvId === id) {
         setActiveConvId(null);
         setMessages([]);
@@ -926,14 +1000,22 @@ export function ChatWorkspace({
           </div>
           <div className="conversations-list" onMouseDown={(e) => startPanning(e, conversationsScrollerRef.current || (e.currentTarget as HTMLElement))}>
             <Virtuoso
-              data={conversations}
+              data={orderedConversations}
               endReached={loadMoreConversations}
               scrollerRef={handleConversationsScrollerRef}
               itemContent={(_index, conv) => (
                 <ConversationItem
                   key={conv.id}
                   conv={conv}
-                  markerState={uncachedConversationIds.has(conv.id) ? 'uncached' : canCacheAll && dirtyConversationIds.has(conv.id) ? 'dirty' : 'none'}
+                  markerState={canCacheAll
+                    ? (resyncConversationIds.has(conv.id)
+                      ? 'resync'
+                      : newMessageConversationIds.has(conv.id)
+                        ? 'new-messages'
+                        : uncachedConversationIds.has(conv.id)
+                          ? 'uncached'
+                          : 'none')
+                    : 'none'}
                   active={activeConvId === conv.id}
                   onClick={() => selectConversation(conv.id)}
                   onContextMenu={(e) => {
@@ -962,9 +1044,13 @@ export function ChatWorkspace({
                   <span className="stats-value">{cacheDiagnostics.uncachedCount}</span>
                   <span className="stats-subvalue">fail {cacheDiagnostics.failedCount} · unknown {cacheDiagnostics.unknownCount}</span>
                 </div>
-                <div className="cache-stats-line" title="Cached conversations that need a full sync">
-                  <span className="stats-label">Needs sync:</span>
-                  <span className="stats-value">{cacheDiagnostics.dirtyCount}</span>
+                <div className="cache-stats-line" title="Cached conversations with messages that have not been synced locally yet">
+                  <span className="stats-label">New messages:</span>
+                  <span className="stats-value">{cacheDiagnostics.newMessagesCount}</span>
+                </div>
+                <div className="cache-stats-line" title="Conversations whose local cache metadata is incomplete and needs a full sync">
+                  <span className="stats-label">Full resync:</span>
+                  <span className="stats-value">{cacheDiagnostics.resyncCount}</span>
                 </div>
                 {cacheRunStatus ? (
                   <div className="cache-stats-line" title={cacheRunStatus}>
@@ -1040,10 +1126,6 @@ export function ChatWorkspace({
         />
       ) : null}
       <div className={`main-content ${isSidebarOpen ? 'sidebar-open' : 'sidebar-closed'} ${isMessageMapOpen ? 'map-open' : 'map-closed'}`}>
-        <div className="workspace-account-label" title={`${account.agentName} / ${account.label}`}>
-          <span style={{ background: account.agentAccent }} aria-hidden="true" />
-          {account.agentName} / {account.label}
-        </div>
         <button
           className={`sidebar-toggle ${isSidebarOpen ? 'open' : 'closed'}`}
           onClick={toggleSidebar}
@@ -1074,6 +1156,7 @@ export function ChatWorkspace({
                     <MessageRow
                       key={msg.id}
                       msg={msg}
+                      assistantLabel={account.agentName}
                       highlightQuery={highlightQuery}
                       highlightCodeBlocks={highlightCodeBlocks}
                       isTarget={isTarget}

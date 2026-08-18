@@ -62,29 +62,6 @@ body {
   background: #343541;
 }
 
-.workspace-account-label {
-  position: absolute;
-  top: 17px;
-  left: 132px;
-  z-index: 10;
-  max-width: min(42vw, 520px);
-  overflow: hidden;
-  color: #b9bac6;
-  font-size: 0.78rem;
-  line-height: 24px;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  pointer-events: none;
-}
-
-.workspace-account-label span {
-  display: inline-block;
-  width: 8px;
-  height: 8px;
-  margin-right: 7px;
-  border-radius: 50%;
-}
-
 .sidebar-account-name {
   min-width: 0;
   flex: 1;
@@ -201,8 +178,12 @@ body {
   color: #ef4444;
 }
 
-.conversation-marker-dirty {
+.conversation-marker-new-messages {
   color: #fbbf24;
+}
+
+.conversation-marker-resync {
+  color: #3b82f6;
 }
 
 .conv-title {
@@ -697,6 +678,12 @@ body {
   color: #c5c5d2;
 }
 
+.message-model-label {
+  color: #aeb3c2;
+  font-size: 0.78em;
+  font-weight: 500;
+}
+
 .thinking-inline-toggle {
   border: none;
   background: transparent;
@@ -762,6 +749,77 @@ body {
   display: flex;
   flex-direction: column;
   gap: 0.75em;
+}
+
+.claude-artifacts {
+  margin-top: 12px;
+  border: 1px solid rgba(217, 119, 87, 0.38);
+  border-radius: 8px;
+  background: rgba(217, 119, 87, 0.08);
+  overflow: hidden;
+}
+
+.claude-artifacts-title {
+  padding: 8px 10px;
+  color: #f0b39b;
+  font-size: 0.78em;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+}
+
+.claude-artifact {
+  border-top: 1px solid rgba(217, 119, 87, 0.24);
+}
+
+.claude-artifact summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 9px 10px;
+  color: #f3d1c4;
+  cursor: pointer;
+  list-style-position: inside;
+}
+
+.claude-artifact summary:hover {
+  background: rgba(217, 119, 87, 0.12);
+}
+
+.claude-artifact-meta {
+  overflow: hidden;
+  color: #c5c5d2;
+  font-size: 0.86em;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.claude-artifact-body {
+  padding: 0 10px 10px;
+}
+
+.claude-artifact-body pre {
+  max-height: 520px;
+  margin: 0;
+  overflow: auto;
+  white-space: pre;
+}
+
+.claude-artifact-body code {
+  white-space: pre;
+}
+
+.claude-artifact-change + .claude-artifact-change {
+  margin-top: 10px;
+}
+
+.claude-artifact-change-label {
+  margin-bottom: 4px;
+  color: #c5c5d2;
+  font-size: 0.78em;
+  font-weight: 700;
+  text-transform: uppercase;
 }
 
 .branch-switcher {
@@ -835,14 +893,6 @@ body {
   font-family: inherit;
 }
 
-.large-code-fallback {
-  margin: 0;
-  background-color: #0d0d0d;
-  border-radius: 6px;
-  padding: 0.5em 1em;
-  overflow: auto;
-}
-
 .markdown-body > * {
   margin: 0;
   min-width: 0;
@@ -912,6 +962,31 @@ body {
   background-color: transparent;
   padding: 0;
   font-size: 100%;
+}
+
+.user-terminal-message {
+  min-width: 0;
+}
+
+.user-terminal-message pre {
+  max-width: 100%;
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0.75em 1em;
+  overflow: auto;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 6px;
+  background: rgba(0, 0, 0, 0.24);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.user-terminal-message code {
+  padding: 0;
+  background: transparent;
+  color: #e2e8f0;
+  font: inherit;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
 }
 
 .markdown-body ul, .markdown-body ol {
@@ -2197,7 +2272,4 @@ body {
     grid-template-columns: minmax(0, 1fr);
   }
 
-  .workspace-account-label {
-    max-width: calc(100vw - 130px);
-  }
 }

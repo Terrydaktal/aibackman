@@ -1,5 +1,8 @@
 const fs = require('fs');
 const crypto = require('crypto');
+const path = require('path');
+const { attachmentMarkdown } = require('./agents/utils.cjs');
+const { writeNormalizedArchive } = require('./archive/standard/index.cjs');
 
 function decodeHtmlEntities(text) {
   if (!text) return '';
@@ -37,8 +40,8 @@ function htmlToPlainText(html) {
     .trim();
 }
 
-function extractGoogleActivityTurnsFromHtml(htmlText, labels = null) {
-  const text = htmlToPlainText(htmlText);
+function extractGoogleActivityTurnsFromHtml(htmlText, labels = null, formatHtml = htmlToPlainText) {
+  const text = formatHtml(htmlText);
   if (!text) return [];
   const labelPairs = labels || [
     ['Your prompt:', 'user'],
@@ -74,6 +77,42 @@ function normalizeAiModeTitle(value) {
   return raw.replace(/^Searched for\s+/i, '').trim() || raw;
 }
 
+function inferGeminiTurnsFromTitle(title, html, formatHtml = htmlToPlainText) {
+  const promptMatch = String(title || '').trim().match(/^(?:Prompted|Asked)\s+([\s\S]+)$/i);
+  if (!promptMatch) return [];
+  const prompt = htmlToPlainText(promptMatch[1]);
+  const response = formatHtml(html);
+  return [
+    ...(prompt ? [{ role: 'user', content: prompt, sequence: 0 }] : []),
+    ...(response ? [{ role: 'assistant', content: response, sequence: 1 }] : []),
+  ];
+}
+
+function inferPromptOnlyTurnsFromTitle(title) {
+  const promptMatch = String(title || '').trim().match(/^Searched for\s+([\s\S]+)$/i);
+  if (!promptMatch) return [];
+  const prompt = htmlToPlainText(promptMatch[1]);
+  return prompt ? [{ role: 'user', content: prompt, sequence: 0 }] : [];
+}
+
+function collectTakeoutAttachments(entry, options = {}) {
+  const names = [
+    ...(Array.isArray(entry?.attachedFiles) ? entry.attachedFiles : []),
+    ...(typeof entry?.imageFile === 'string' ? [entry.imageFile] : []),
+  ].filter((value) => typeof value === 'string' && value.trim());
+  const uniqueNames = [...new Set(names.map((value) => path.basename(value.trim())))];
+  return uniqueNames.map((name) => {
+    const sourcePath = options.attachmentRoot ? path.join(options.attachmentRoot, name) : '';
+    const copied = options.assetStore?.add(sourcePath, `${entry?.time || ''}|${name}`, name);
+    return copied || {
+      name,
+      sizeBytes: null,
+      mimeType: 'application/octet-stream',
+      uri: null,
+    };
+  });
+}
+
 function buildTakeoutConversationRecord(entry, fallbackNowMs = Date.now(), options = {}) {
   const header = String(entry?.header || '').trim();
   const acceptedHeaders = options.acceptedHeaders || ['AI Mode'];
@@ -87,8 +126,25 @@ function buildTakeoutConversationRecord(entry, fallbackNowMs = Date.now(), optio
     ? options.normalizeTitle(titleRaw)
     : normalizeAiModeTitle(titleRaw);
   const html = Array.isArray(entry?.safeHtmlItem) ? String(entry.safeHtmlItem[0]?.html || '') : '';
-  const turns = extractGoogleActivityTurnsFromHtml(html, options.labels);
+  const formatHtml = typeof options.formatHtml === 'function' ? options.formatHtml : htmlToPlainText;
+  let turns = extractGoogleActivityTurnsFromHtml(html, options.labels, formatHtml);
+  if (turns.length === 0) {
+    if (options.inferPromptOnlyFromTitle === true) {
+      turns = inferPromptOnlyTurnsFromTitle(titleRaw);
+    } else if (options.inferPromptFromTitle === true) {
+      turns = inferGeminiTurnsFromTitle(titleRaw, html, formatHtml);
+    }
+  }
   if (turns.length === 0) return null;
+
+  const attachments = collectTakeoutAttachments(entry, options);
+  const attachmentLines = attachmentMarkdown(attachments);
+  if (attachmentLines.length > 0) {
+    const lastTurnIndex = turns.length - 1;
+    turns = turns.map((turn, idx) => idx === lastTurnIndex
+      ? { ...turn, content: [turn.content, ...attachmentLines].filter(Boolean).join('\n\n') }
+      : turn);
+  }
 
   const conversationSeed = `${timeIso}|${titleRaw}|${html.slice(0, 4000)}`;
   const conversationId = `${options.conversationPrefix || 'aimode'}-${buildDeterministicId(conversationSeed)}`;
@@ -105,7 +161,11 @@ function buildTakeoutConversationRecord(entry, fallbackNowMs = Date.now(), optio
       conversation_id: conversationId,
       role: turn.role,
       content: turn.content,
-      metadata_json: null,
+      metadata_json: JSON.stringify({
+        ...(options.messageMetadata && typeof options.messageMetadata === 'object' ? options.messageMetadata : {}),
+        ...(turn.model ? { model: turn.model } : {}),
+        ...(turn.effort ? { thinking_effort: turn.effort } : {}),
+      }),
       created_at: created,
       parent_id: previousMessageId,
     });
@@ -125,6 +185,7 @@ function buildTakeoutConversationRecord(entry, fallbackNowMs = Date.now(), optio
     is_deleted_on_web: 0,
     html,
     turns,
+    attachments,
     messages,
   };
 }
@@ -150,43 +211,16 @@ function parseAiModeTakeout(inputPath, options = {}) {
 
 function importAiModeTakeout(dbInstance, inputPath, options = {}) {
   const parsed = parseAiModeTakeout(inputPath, options);
-  let importedConversations = 0;
-  let importedMessages = 0;
-
-  if (options.replaceExisting !== false) dbInstance.clearAll();
-  dbInstance.db.transaction(() => {
-    for (const conversation of parsed.conversations) {
-      dbInstance.upsertConversation({
-        id: conversation.id,
-        title: conversation.title,
-        created_at: conversation.created_at,
-        updated_at: conversation.updated_at,
-        current_node_id: null,
-        is_deleted_on_web: conversation.is_deleted_on_web,
-      });
-
-      for (const message of conversation.messages) {
-        dbInstance.upsertMessage(message);
-        importedMessages += 1;
-      }
-
-      dbInstance.upsertConversation({
-        id: conversation.id,
-        title: conversation.title,
-        created_at: conversation.created_at,
-        updated_at: conversation.updated_at,
-        current_node_id: conversation.current_node_id,
-        is_deleted_on_web: conversation.is_deleted_on_web,
-      });
-      importedConversations += 1;
-    }
-  })();
-
-  return {
-    importedConversations,
-    importedMessages,
+  if (parsed.conversations.length === 0) {
+    throw new Error('Google Takeout contained no importable conversations for this provider.');
+  }
+  return writeNormalizedArchive({
+    db: dbInstance,
+    conversations: parsed.conversations,
+    replaceExisting: options.replaceExisting !== false,
+    sourcePath: inputPath,
     sourceItems: parsed.sourceItems,
-  };
+  });
 }
 
 module.exports = {

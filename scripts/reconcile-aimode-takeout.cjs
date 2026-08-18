@@ -4,6 +4,8 @@ const fs = require('fs');
 const path = require('path');
 const readline = require('readline/promises');
 const Database = require('better-sqlite3');
+const ChatDatabase = require('../electron/database.cjs');
+const { writeNormalizedArchive } = require('../electron/archive/standard/writer.cjs');
 const {
   buildDeterministicId,
   normalizeAiModeTitle,
@@ -412,6 +414,12 @@ function buildFinalDataset(report, options) {
 }
 
 function backupDatabase(dbPath) {
+  const source = new Database(dbPath);
+  try {
+    source.pragma('wal_checkpoint(FULL)');
+  } finally {
+    source.close();
+  }
   const dir = path.dirname(dbPath);
   const base = path.basename(dbPath);
   const stamp = new Date().toISOString().replace(/[:.]/g, '-');
@@ -421,45 +429,20 @@ function backupDatabase(dbPath) {
 }
 
 function writeDatabase(dbPath, chats) {
-  const db = new Database(dbPath);
+  const db = new ChatDatabase(dbPath);
   try {
-    db.exec('PRAGMA foreign_keys = OFF');
-    db.transaction(() => {
-      db.prepare('DELETE FROM messages').run();
-      db.prepare('DELETE FROM conversations').run();
-      db.prepare('DELETE FROM cache_failures').run();
-
-      const insertConversation = db.prepare(`
-        INSERT INTO conversations (id, title, created_at, updated_at, current_node_id, is_deleted_on_web)
-        VALUES (?, ?, ?, ?, ?, ?)
-      `);
-      const insertMessage = db.prepare(`
-        INSERT INTO messages (id, conversation_id, role, content, metadata_json, created_at, parent_id)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-      `);
-
-      for (const chat of chats) {
-        insertConversation.run(
-          chat.id,
-          chat.title,
-          chat.created_at,
-          chat.updated_at,
-          chat.current_node_id || null,
-          Number(chat.is_deleted_on_web || 0)
-        );
-        for (const msg of chat.messages) {
-          insertMessage.run(
-            msg.id,
-            msg.conversation_id,
-            msg.role,
-            msg.content,
-            msg.metadata_json ?? null,
-            msg.created_at,
-            msg.parent_id ?? null
-          );
-        }
-      }
-    })();
+    db.clearAll({
+      confirmation: 'CLEAR ENTIRE ARCHIVE',
+      reason: 'Apply the explicitly confirmed AI Mode Takeout reconciliation result.',
+      actor: 'reconcile-aimode-takeout',
+    });
+    writeNormalizedArchive({
+      db,
+      conversations: chats,
+      replaceExisting: false,
+      sourcePath: 'reconcile-aimode-takeout',
+      sourceItems: chats.length,
+    });
   } finally {
     db.close();
   }

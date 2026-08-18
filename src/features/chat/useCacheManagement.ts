@@ -13,9 +13,12 @@ interface CacheDiagnosticsResponse {
   uncachedCount?: unknown;
   failedCount?: unknown;
   unknownCount?: unknown;
+  newMessagesCount?: unknown;
+  resyncCount?: unknown;
   dirtyCount?: unknown;
   uncachedRows?: Array<{ id?: unknown }>;
-  dirtyRows?: Array<{ id?: unknown }>;
+  newMessageRows?: Array<{ id?: unknown }>;
+  resyncRows?: Array<{ id?: unknown }>;
 }
 
 interface CacheRunResult {
@@ -44,10 +47,14 @@ export function useCacheManagement({ enabled, invoke, refreshRevision }: UseCach
     uncachedCount: 0,
     failedCount: 0,
     unknownCount: 0,
+    newMessagesCount: 0,
+    resyncCount: 0,
     dirtyCount: 0,
   });
   const [uncachedConversationIds, setUncachedConversationIds] = useState<Set<string>>(new Set());
   const [dirtyConversationIds, setDirtyConversationIds] = useState<Set<string>>(new Set());
+  const [newMessageConversationIds, setNewMessageConversationIds] = useState<Set<string>>(new Set());
+  const [resyncConversationIds, setResyncConversationIds] = useState<Set<string>>(new Set());
   const [isRunning, setIsRunning] = useState(false);
   const [status, setStatus] = useState('');
 
@@ -66,10 +73,17 @@ export function useCacheManagement({ enabled, invoke, refreshRevision }: UseCach
       uncachedCount: Number(value.uncachedCount || 0),
       failedCount: Number(value.failedCount || 0),
       unknownCount: Number(value.unknownCount || 0),
+      newMessagesCount: Number(value.newMessagesCount || 0),
+      resyncCount: Number(value.resyncCount || 0),
       dirtyCount: Number(value.dirtyCount || 0),
     });
-    setUncachedConversationIds(new Set(idsFromRows(value.uncachedRows)));
-    setDirtyConversationIds(new Set(idsFromRows(value.dirtyRows)));
+    const uncachedIds = new Set(idsFromRows(value.uncachedRows));
+    const newMessageIds = new Set(idsFromRows(value.newMessageRows));
+    const resyncIds = new Set(idsFromRows(value.resyncRows));
+    setUncachedConversationIds(uncachedIds);
+    setNewMessageConversationIds(newMessageIds);
+    setResyncConversationIds(resyncIds);
+    setDirtyConversationIds(new Set([...newMessageIds, ...resyncIds]));
   }, [invoke]);
 
   const clearUncached = useCallback((conversationId: string) => {
@@ -83,6 +97,18 @@ export function useCacheManagement({ enabled, invoke, refreshRevision }: UseCach
 
   const clearDirty = useCallback((conversationId: string) => {
     setDirtyConversationIds((current) => {
+      if (!current.has(conversationId)) return current;
+      const next = new Set(current);
+      next.delete(conversationId);
+      return next;
+    });
+    setNewMessageConversationIds((current) => {
+      if (!current.has(conversationId)) return current;
+      const next = new Set(current);
+      next.delete(conversationId);
+      return next;
+    });
+    setResyncConversationIds((current) => {
       if (!current.has(conversationId)) return current;
       const next = new Set(current);
       next.delete(conversationId);
@@ -169,6 +195,8 @@ export function useCacheManagement({ enabled, invoke, refreshRevision }: UseCach
     clearUncached,
     diagnostics,
     dirtyConversationIds,
+    newMessageConversationIds,
+    resyncConversationIds,
     isRunning,
     refreshDiagnostics,
     refreshStats,

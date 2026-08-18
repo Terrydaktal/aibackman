@@ -1,4 +1,10 @@
 const { asUnixSeconds, compactTitle, findNamedFile, materializeBackupPath, parseJsonFile } = require('./utils.cjs');
+const {
+  isChatGptInternalProtocolMessage,
+  markChatGptInternalProtocolMetadata,
+} = require('../conversations/chatgpt-protocol.cjs');
+const { writeNormalizedArchive } = require('../archive/standard/index.cjs');
+const { formatChatGptContent } = require('../providers/formatters/chatgpt.cjs');
 
 function contentPartToMarkdown(part, conversationId) {
   if (typeof part === 'string') return part;
@@ -16,14 +22,14 @@ function contentPartToMarkdown(part, conversationId) {
 function messageContent(message, conversationId) {
   const content = message?.content;
   if (!content) return '';
-  if (typeof content === 'string') return content;
+  if (typeof content === 'string') return formatChatGptContent(content);
   if (Array.isArray(content.parts)) {
-    return content.parts
+    return formatChatGptContent(content.parts
       .map((part) => contentPartToMarkdown(part, conversationId))
       .filter(Boolean)
-      .join('\n\n');
+      .join('\n\n'));
   }
-  if (typeof content.text === 'string') return content.text;
+  if (typeof content.text === 'string') return formatChatGptContent(content.text);
   return '';
 }
 
@@ -38,12 +44,9 @@ function importBackup({ db, inputPath, replaceExisting = false }) {
   try {
     const sourceFile = findNamedFile(materialized.path, ['conversations.json']);
     const conversations = normalizeExportRoot(parseJsonFile(sourceFile));
-    let importedConversations = 0;
-    let importedMessages = 0;
+    const normalizedConversations = [];
 
-    if (replaceExisting) db.clearAll();
-    db.db.transaction(() => {
-      for (const rawConversation of conversations) {
+    for (const rawConversation of conversations) {
         const conversationId = String(rawConversation?.id || rawConversation?.conversation_id || '').trim();
         if (!conversationId) continue;
         const mapping = rawConversation.mapping && typeof rawConversation.mapping === 'object'
@@ -59,8 +62,11 @@ function importBackup({ db, inputPath, replaceExisting = false }) {
           if (!message) continue;
           const role = String(message.author?.role || '').toLowerCase();
           if (!['user', 'assistant', 'system', 'tool'].includes(role)) continue;
-          const content = messageContent(message, conversationId);
-          if (!content.trim() && role !== 'assistant') continue;
+          const isInternalProtocol = isChatGptInternalProtocolMessage({ ...message, role });
+          const content = isInternalProtocol ? '' : messageContent(message, conversationId);
+          const metadata = markChatGptInternalProtocolMetadata(message.metadata, { ...message, role });
+          const hasEmbeddedUi = Array.isArray(metadata?.embedded_ui) && metadata.embedded_ui.length > 0;
+          if (!content.trim() && role !== 'assistant' && !hasEmbeddedUi) continue;
           const createdAt = asUnixSeconds(message.create_time, asUnixSeconds(rawConversation.create_time));
           const messageId = messageIdByNodeId.get(nodeId);
           messages.push({
@@ -68,7 +74,7 @@ function importBackup({ db, inputPath, replaceExisting = false }) {
             conversation_id: conversationId,
             role,
             content,
-            metadata_json: message.metadata ? JSON.stringify(message.metadata) : null,
+            metadata_json: metadata ? JSON.stringify(metadata) : null,
             created_at: createdAt,
             parent_id: null,
           });
@@ -96,7 +102,7 @@ function importBackup({ db, inputPath, replaceExisting = false }) {
         const currentNodeId = rawConversation.current_node && mapping[rawConversation.current_node]
           ? resolveStoredAncestor(String(rawConversation.current_node))
           : ([...messages].sort((a, b) => a.created_at - b.created_at).at(-1)?.id || null);
-        db.upsertConversation({
+        normalizedConversations.push({
           id: conversationId,
           title: compactTitle(rawConversation.title, 'ChatGPT chat'),
           created_at: createdAt,
@@ -104,14 +110,17 @@ function importBackup({ db, inputPath, replaceExisting = false }) {
           last_synced_updated_at: updatedAt,
           current_node_id: currentNodeId,
           is_deleted_on_web: 0,
+          messages,
         });
-        for (const message of messages) db.upsertMessage(message);
-        importedConversations += 1;
-        importedMessages += messages.length;
-      }
-    })();
+    }
 
-    return { sourcePath: inputPath, sourceItems: conversations.length, importedConversations, importedMessages };
+    return writeNormalizedArchive({
+      db,
+      conversations: normalizedConversations,
+      replaceExisting,
+      sourcePath: inputPath,
+      sourceItems: conversations.length,
+    });
   } finally {
     materialized.cleanup();
   }

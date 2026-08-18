@@ -3,13 +3,17 @@ const fs = require('fs');
 const path = require('path');
 
 class AccountCatalog {
+  #db;
+
   constructor(dbPath) {
-    fs.mkdirSync(path.dirname(dbPath), { recursive: true });
-    this.db = new Database(dbPath);
-    this.db.pragma('journal_mode = WAL');
-    this.db.pragma('synchronous = NORMAL');
-    this.db.pragma('busy_timeout = 5000');
-    this.db.exec(`
+    fs.mkdirSync(path.dirname(dbPath), { recursive: true, mode: 0o700 });
+    fs.chmodSync(path.dirname(dbPath), 0o700);
+    this.#db = new Database(dbPath);
+    fs.chmodSync(dbPath, 0o600);
+    this.#db.pragma('journal_mode = WAL');
+    this.#db.pragma('synchronous = FULL');
+    this.#db.pragma('busy_timeout = 5000');
+    this.#db.exec(`
       CREATE TABLE IF NOT EXISTS accounts (
         id TEXT PRIMARY KEY,
         agent_id TEXT NOT NULL,
@@ -29,18 +33,18 @@ class AccountCatalog {
   }
 
   listAccounts() {
-    return this.db.prepare(`
+    return this.#db.prepare(`
       SELECT * FROM accounts
       ORDER BY agent_id, is_default DESC, label COLLATE NOCASE, id
     `).all();
   }
 
   getAccount(id) {
-    return this.db.prepare('SELECT * FROM accounts WHERE id = ?').get(id) || null;
+    return this.#db.prepare('SELECT * FROM accounts WHERE id = ?').get(id) || null;
   }
 
   updateLabel(id, label) {
-    this.db.prepare(`
+    this.#db.prepare(`
       UPDATE accounts
       SET label = ?, updated_at = CURRENT_TIMESTAMP
       WHERE id = ?
@@ -48,8 +52,17 @@ class AccountCatalog {
     return this.getAccount(id);
   }
 
+  updateDatabasePath(id, dbPath) {
+    this.#db.prepare(`
+      UPDATE accounts
+      SET db_path = ?, updated_at = CURRENT_TIMESTAMP
+      WHERE id = ?
+    `).run(dbPath, id);
+    return this.getAccount(id);
+  }
+
   upsertAccount(account) {
-    this.db.prepare(`
+    this.#db.prepare(`
       INSERT INTO accounts (
         id, agent_id, label, db_path, source_kind, source_config_json, legacy_mode, is_default
       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
@@ -76,11 +89,11 @@ class AccountCatalog {
   }
 
   deleteAccount(id) {
-    return this.db.prepare('DELETE FROM accounts WHERE id = ?').run(id);
+    return this.#db.prepare('DELETE FROM accounts WHERE id = ?').run(id);
   }
 
   close() {
-    this.db.close();
+    this.#db.close();
   }
 }
 

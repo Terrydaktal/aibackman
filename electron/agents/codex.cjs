@@ -3,9 +3,10 @@ const os = require('os');
 const path = require('path');
 const readline = require('readline');
 const { asUnixSeconds, compactTitle, fileFingerprint, parseJsonFile, stableId } = require('./utils.cjs');
+const { writeNormalizedConversation } = require('../archive/standard/index.cjs');
 
 const DEFAULT_ROOT = path.join(os.homedir(), '.codex');
-const CODEX_ROUTING_VERSION = 3;
+const CODEX_ROUTING_VERSION = 4;
 
 function listJsonlFiles(root) {
   if (!fs.existsSync(root)) return [];
@@ -64,6 +65,8 @@ async function parseSession(filePath) {
   let cwd = '';
   let accountId = null;
   const accountIds = new Set();
+  let currentModel = null;
+  let currentEffort = null;
   let sequence = 0;
   let parseErrors = 0;
   const visible = [];
@@ -86,6 +89,12 @@ async function parseSession(filePath) {
       accountId = String(eventAccountId);
       accountIds.add(accountId);
     }
+    const eventPayload = event.payload && typeof event.payload === 'object' ? event.payload : {};
+    const contextModel = event.model || eventPayload.model || eventPayload.model_slug || eventPayload.model_name;
+    const contextEffort = event.effort || event.reasoning_effort || eventPayload.effort
+      || eventPayload.reasoning_effort || eventPayload.thinking_effort;
+    if (contextModel) currentModel = String(contextModel).trim() || currentModel;
+    if (contextEffort) currentEffort = String(contextEffort).trim() || currentEffort;
     if (event.type !== 'event_msg') continue;
     const eventType = event.payload?.type;
     if (eventType !== 'user_message' && eventType !== 'agent_message') continue;
@@ -96,6 +105,8 @@ async function parseSession(filePath) {
       role: eventType === 'user_message' ? 'user' : 'assistant',
       content,
       phase: event.payload?.phase || null,
+      model: currentModel,
+      effort: currentEffort,
       createdAt: asUnixSeconds(event.timestamp, Date.now() / 1000 + sequence * 0.001),
     });
     sequence += 1;
@@ -113,7 +124,13 @@ function buildSessionSnapshot(session) {
       conversation_id: session.sessionId,
       role: message.role,
       content: message.content,
-      metadata_json: JSON.stringify({ phase: message.phase, cwd: session.cwd, source: 'codex-local' }),
+      metadata_json: JSON.stringify({
+        phase: message.phase,
+        cwd: session.cwd,
+        source: 'codex-local',
+        ...(message.model ? { model: message.model } : {}),
+        ...(message.effort ? { thinking_effort: message.effort } : {}),
+      }),
       created_at: message.createdAt,
       parent_id: parentId,
     };
@@ -140,8 +157,10 @@ function buildSessionSnapshot(session) {
 function importSession(db, session) {
   const snapshot = buildSessionSnapshot(session);
   if (!snapshot) return 0;
-  db.importConversationSnapshot(snapshot.conversation, snapshot.messages, { replaceMessages: true });
-  return snapshot.messages.length;
+  return writeNormalizedConversation(db, {
+    ...snapshot.conversation,
+    messages: snapshot.messages,
+  }, { replaceMessages: true }).importedMessages;
 }
 
 async function refreshLocal({ db, sourceConfig = {}, onProgress }) {
@@ -299,7 +318,7 @@ async function refreshAllLocal({ accounts, getDatabase, onProgress }) {
 
 module.exports = {
   id: 'codex',
-  name: 'Codex',
+  name: 'Codex CLI',
   description: 'Local Codex CLI sessions',
   accent: '#111827',
   capabilities: { localBackup: true },

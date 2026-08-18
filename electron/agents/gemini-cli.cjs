@@ -12,9 +12,10 @@ const {
   localGoogleAccountId,
   readGoogleAccounts,
 } = require('./google-accounts.cjs');
+const { writeNormalizedConversation } = require('../archive/standard/index.cjs');
 
 const DEFAULT_SESSIONS_ROOT = path.join(DEFAULT_GEMINI_ROOT, 'tmp');
-const LOCAL_ROUTING_VERSION = 1;
+const LOCAL_ROUTING_VERSION = 2;
 
 function discoverAccounts(options = {}) {
   const geminiRoot = options.geminiRoot || DEFAULT_GEMINI_ROOT;
@@ -125,7 +126,10 @@ function messageMetadata(event, projectName) {
     source: 'gemini-cli-local',
     originalId: event.id,
     project: projectName,
-    model: event.model || null,
+    ...(event.model || event.model_slug || event.model_name ? { model: event.model || event.model_slug || event.model_name } : {}),
+    ...(event.thinking_effort || event.reasoning_effort || event.effort || event.thinking_level
+      ? { thinking_effort: event.thinking_effort || event.reasoning_effort || event.effort || event.thinking_level }
+      : {}),
     ...(thoughts.length > 0 ? { thoughts } : {}),
   });
 }
@@ -285,11 +289,10 @@ async function refreshAllLocal({ accounts, getDatabase, onProgress }) {
         const parsed = await parseSessionGroup(group);
         results.get(owner.id).parseErrors += parsed.parseErrors;
         if (parsed.messages.length > 0) {
-          getDatabase(owner).importConversationSnapshot(
-            parsed.conversation,
-            parsed.messages,
-            { replaceMessages: true }
-          );
+          writeNormalizedConversation(getDatabase(owner), {
+            ...parsed.conversation,
+            messages: parsed.messages,
+          }, { replaceMessages: true });
           results.get(owner.id).importedConversations += 1;
           results.get(owner.id).importedMessages += parsed.messages.length;
           imported = true;

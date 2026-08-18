@@ -130,17 +130,27 @@ export function ArchiveHome({ onOpenAccount }: ArchiveHomeProps) {
     const selectedPath = await chooseBackupPath();
     if (!selectedPath) return;
     setBusyAccountId(`new:${addingAgent.id}`);
+    let createdAccountId: string | null = null;
     try {
       const account = await window.electronAPI.invoke('archive:createAccount', {
         agentId: addingAgent.id,
         label: newAccountLabel.trim() || `${addingAgent.name} backup`,
         sourceKind: 'backup',
       });
+      createdAccountId = account.id;
       await window.electronAPI.invoke('archive:importBackup', { accountId: account.id, path: selectedPath });
+      createdAccountId = null;
       setAddingAgent(null);
       setNewAccountLabel('');
       await loadOverview();
     } catch (createError) {
+      if (createdAccountId) {
+        try {
+          await window.electronAPI.invoke('archive:deleteAccount', { accountId: createdAccountId });
+        } catch (cleanupError) {
+          console.error('Failed to remove empty backup account after import failure:', cleanupError);
+        }
+      }
       setError(String((createError as Error)?.message || createError));
     } finally {
       setBusyAccountId(null);

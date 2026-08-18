@@ -10,23 +10,58 @@ const createAiModeBridge = require('./bridges/ai-mode.cjs');
 const createChatGptRuntime = require('./bridges/chatgpt.cjs');
 const {
   buildOrderedVisibleTurns,
-  getLinearMessages: getLinearConversationMessages,
+  createStoredMessageIdResolver,
   shouldPreserveCachedSnapshot,
 } = require('./conversations/chatgpt-tree.cjs');
+const {
+  readConversation,
+  readConversationState,
+  readConversations,
+  getLinearMessages: getStandardLinearMessages,
+  writeConversationIndex,
+  writeConversationIndexes,
+} = require('./archive/standard/index.cjs');
 const {
   buildDeterministicId,
   importAiModeTakeout,
   normalizeAiModeTitle,
 } = require('./aimode-takeout.cjs');
+const { mimeTypeForPath } = require('./agents/utils.cjs');
+const { getAgentPlugin } = require('./agents/registry.cjs');
+const { writeNormalizedConversation } = require('./archive/standard/index.cjs');
+const { STANDARD_CACHE_FORMAT_VERSION } = require('./archive/standard/cacheVersion.cjs');
+const { createBuildInfo, readBuildInfo, verifyBuildInfo } = require('./diagnostics/build-info.cjs');
+const { createDiagnosticRuntime } = require('./diagnostics/runtime.cjs');
 
 const APPLICATION_NAME = 'aibackman';
 const LEGACY_APPLICATION_NAME = 'chatgpt';
+const chatgptSiteScraper = getAgentPlugin('chatgpt')?.siteScraper;
 const isDev = process.env.NODE_ENV === 'development';
 const OOM_DEBUG = process.env.AIBACKMAN_OOM_DEBUG === '1';
 const OOM_TRACE_GC = process.env.AIBACKMAN_TRACE_GC === '1';
-const DEBUG_MODE = process.env.AIBACKMAN_DEBUG === '1' || OOM_DEBUG;
+const DIAGNOSTIC_MODE = process.env.AIBACKMAN_DIAGNOSTIC_MODE
+  || (OOM_DEBUG ? 'diagnostic-build' : process.env.AIBACKMAN_DEBUG === '1' ? 'runtime-activated' : 'release-minimal');
+const DIAGNOSTICS_REQUESTED = process.env.AIBACKMAN_DIAGNOSTICS === '1'
+  || process.env.AIBACKMAN_DEBUG === '1'
+  || OOM_DEBUG;
+const DEBUG_MODE = DIAGNOSTICS_REQUESTED && DIAGNOSTIC_MODE !== 'release-minimal';
+const REMOTE_DEBUGGING_ENABLED = DEBUG_MODE && process.env.AIBACKMAN_REMOTE_DEBUG === '1';
+const CHROMIUM_LOGGING_ENABLED = DEBUG_MODE && process.env.AIBACKMAN_CHROMIUM_LOGGING === '1';
 const DEBUG_SESSION_ID = `${new Date().toISOString().replace(/[:.]/g, '-')}-${process.pid}`;
 let debugRuntimePaths = null;
+let diagnosticRuntime = null;
+const persistedBuildInfo = readBuildInfo(path.join(__dirname, '..', 'dist', 'build-info.json'));
+const persistedBuildVerification = persistedBuildInfo
+  ? verifyBuildInfo({ root: path.join(__dirname, '..'), buildInfo: persistedBuildInfo })
+  : { valid: false, reason: 'missing-build-info' };
+if (process.env.NODE_ENV === 'production' && !persistedBuildVerification.valid) {
+  throw new Error(
+    `The production build is stale (${persistedBuildVerification.reason}). Run npm run build before starting Electron.`
+  );
+}
+const buildInfo = persistedBuildVerification.valid
+  ? persistedBuildInfo
+  : createBuildInfo({ mode: DIAGNOSTIC_MODE });
 
 function configureApplicationStorage() {
   const appDataPath = app.getPath('appData');
@@ -52,56 +87,33 @@ function configureApplicationStorage() {
   app.setPath('userData', userDataPath);
 }
 
-function serializeDebugPayload(payload) {
-  const seen = new WeakSet();
-  return JSON.stringify(payload, (_key, value) => {
-    if (typeof value === 'bigint') return value.toString();
-    if (value instanceof Error) {
-      return { name: value.name, message: value.message, stack: value.stack };
-    }
-    if (value && typeof value === 'object') {
-      if (seen.has(value)) return '[circular]';
-      seen.add(value);
-    }
-    return value;
-  });
-}
-
 function appendDebugEvent(event, payload = {}) {
-  if (!DEBUG_MODE || !debugRuntimePaths?.events) return;
-  try {
-    fs.appendFileSync(debugRuntimePaths.events, `${serializeDebugPayload({
-      ts: new Date().toISOString(),
-      pid: process.pid,
-      event,
-      payload,
-    })}\n`);
-  } catch (error) {
-    console.warn('[debug] Failed to persist diagnostic event:', error);
-  }
+  diagnosticRuntime?.record(event, payload);
 }
 
 function initializeDebugRuntime() {
   if (!DEBUG_MODE) return;
   try {
-    const debugDir = path.resolve(
-      process.env.AIBACKMAN_DEBUG_DIR || path.join(app.getPath('userData'), 'debug')
-    );
-    const crashDumps = path.join(debugDir, 'crashes');
-    fs.mkdirSync(crashDumps, { recursive: true });
-    debugRuntimePaths = {
-      directory: debugDir,
-      events: path.join(debugDir, `events-${DEBUG_SESSION_ID}.jsonl`),
-      chromium: path.join(debugDir, `chromium-${DEBUG_SESSION_ID}.log`),
-      crashDumps,
-    };
+    diagnosticRuntime = createDiagnosticRuntime({
+      app,
+      mode: DIAGNOSTIC_MODE,
+      enabled: true,
+      buildInfo,
+      rootPath: process.env.AIBACKMAN_DEBUG_DIR || null,
+    });
+    debugRuntimePaths = diagnosticRuntime.start();
+    const crashDumps = debugRuntimePaths.crashDumps;
     app.setPath('crashDumps', crashDumps);
 
-    app.commandLine.appendSwitch('remote-debugging-address', '127.0.0.1');
-    app.commandLine.appendSwitch('remote-debugging-port', process.env.AIBACKMAN_REMOTE_DEBUG_PORT || '9222');
-    app.commandLine.appendSwitch('enable-logging', 'file');
-    app.commandLine.appendSwitch('log-file', debugRuntimePaths.chromium);
-    app.commandLine.appendSwitch('log-level', '0');
+    if (REMOTE_DEBUGGING_ENABLED) {
+      app.commandLine.appendSwitch('remote-debugging-address', '127.0.0.1');
+      app.commandLine.appendSwitch('remote-debugging-port', process.env.AIBACKMAN_REMOTE_DEBUG_PORT || '9222');
+    }
+    if (CHROMIUM_LOGGING_ENABLED) {
+      app.commandLine.appendSwitch('enable-logging', 'file');
+      app.commandLine.appendSwitch('log-file', debugRuntimePaths.chromium);
+      app.commandLine.appendSwitch('log-level', '0');
+    }
     if (process.env.AIBACKMAN_VERBOSE_LOGGING === '1') app.commandLine.appendSwitch('v', '1');
 
     crashReporter.start({
@@ -113,16 +125,23 @@ function initializeDebugRuntime() {
       rateLimit: false,
       globalExtra: {
         debug_session: DEBUG_SESSION_ID,
+        build_id: buildInfo.build_id,
+        diagnostic_mode: DIAGNOSTIC_MODE,
         electron_version: process.versions.electron || '',
       },
     });
-    appendDebugEvent('debug-runtime-started', {
+    diagnosticRuntime.record('debug-runtime-started', {
       argv: process.argv,
       versions: process.versions,
       paths: debugRuntimePaths,
-      remoteDebuggingPort: process.env.AIBACKMAN_REMOTE_DEBUG_PORT || '9222',
+      mode: DIAGNOSTIC_MODE,
+      build: buildInfo,
+      remoteDebuggingPort: REMOTE_DEBUGGING_ENABLED
+        ? process.env.AIBACKMAN_REMOTE_DEBUG_PORT || '9222'
+        : null,
+      chromiumLogging: CHROMIUM_LOGGING_ENABLED,
     });
-    console.info('[debug] Persistent diagnostics:', debugRuntimePaths);
+    console.info('[debug] Persistent diagnostics:', { mode: DIAGNOSTIC_MODE, paths: debugRuntimePaths });
   } catch (error) {
     console.error('[debug] Failed to initialize persistent diagnostics:', error);
   }
@@ -170,6 +189,7 @@ const AI_MODE_HISTORY_BUTTON_SELECTOR = 'button.UTNPFf[aria-label="AI Mode histo
 const AI_MODE_HISTORY_DIALOG_SELECTOR = '[role="dialog"][aria-label="AI Mode history"], .ho072b[aria-label="AI Mode history"]';
 const AI_MODE_HISTORY_ITEM_SELECTOR = '#aim-lhs-panel-threads-view-container button.qqMZif[data-thread-id], ul[data-xid="threads-list-root"] button.qqMZif[data-thread-id], button.qqMZif[data-thread-id]';
 let aiModeBridge = null;
+let aiModeSiteScraper = null;
 
 function createWindow() {
   mainWindow = new BrowserWindow({
@@ -213,7 +233,9 @@ function createWindow() {
       const response = await chatgptRuntime.fetchImageResponse(fileId, conversationId || undefined);
       if (!response.ok) {
         const errorText = await response.text().catch(() => '');
-        console.error(`Image fetch failed (${response.status}) for ${fileId}:`, errorText.slice(0, 300));
+        if (![400, 404, 422].includes(response.status)) {
+          console.warn(`Image fetch failed (${response.status}) for ${fileId}:`, errorText.slice(0, 300));
+        }
         return new Response(errorText || 'Failed to load image', { status: response.status });
       }
 
@@ -246,6 +268,34 @@ function createWindow() {
     }
   });
 
+  protocol.handle('archive-asset', async (request) => {
+    try {
+      const parsed = new URL(request.url);
+      const requestedPath = parsed.searchParams.get('path');
+      if (!requestedPath) return new Response('Missing archive asset path', { status: 400 });
+      const userDataRoot = path.resolve(app.getPath('userData'));
+      const assetPath = path.resolve(requestedPath);
+      if (!assetPath.startsWith(`${userDataRoot}${path.sep}`)) {
+        return new Response('Archive asset path is outside managed storage', { status: 403 });
+      }
+      const stat = fs.lstatSync(assetPath);
+      if (!stat.isFile() || stat.isSymbolicLink()) return new Response('Archive asset not found', { status: 404 });
+      const body = fs.readFileSync(assetPath);
+      return new Response(body, {
+        status: 200,
+        headers: {
+          'Access-Control-Allow-Origin': '*',
+          'Content-Type': mimeTypeForPath(assetPath),
+          'Content-Disposition': 'inline',
+          'Content-Length': String(body.length),
+        },
+      });
+    } catch (error) {
+      console.warn('Archive asset request failed:', error);
+      return new Response('Archive asset not found', { status: 404 });
+    }
+  });
+
   // Use Electron's Chromium UA, but drop the Electron token to reduce fingerprint mismatch.
   const normalizedUA = chatgptRuntime.ensureAppUserAgent();
   mainWindow.webContents.setUserAgent(normalizedUA);
@@ -261,15 +311,65 @@ function createWindow() {
 }
 
 function getLinearMessages(conversationId, dbInstance = db) {
-  return getLinearConversationMessages(dbInstance, conversationId);
+  return getStandardLinearMessages(dbInstance, conversationId);
 }
 
 function buildOrderedVisibleTurnsFromConversationData(data, conversationId) {
   return buildOrderedVisibleTurns(data, conversationId, chatgptRuntime.renderMessageContent);
 }
 
+function buildStoredChatGptSnapshot(data, conversationId, dbInstance = db) {
+  const resolveStoredMessageId = createStoredMessageIdResolver(data);
+  const messages = Object.entries(data.mapping || {})
+    .filter(([, node]) => node?.message)
+    .map(([nodeId, node]) => {
+      const messageId = String(node.message.id || nodeId);
+      return {
+        id: messageId,
+        conversation_id: conversationId,
+        role: node.message.author?.role || 'assistant',
+        content: chatgptRuntime.isChatGptInternalProtocolMessage(node.message)
+          ? ''
+          : chatgptRuntime.renderMessageContent(node.message, conversationId) || '',
+        metadata_json: chatgptRuntime.mergeEmbeddedUiMetadataJson(
+          messageId,
+          chatgptRuntime.sanitizeMetadata(node.message.metadata, node.message),
+          dbInstance
+        ),
+        created_at: node.message.create_time || 0,
+        parent_id: resolveStoredMessageId(node.parent),
+      };
+    });
+
+  return {
+    currentNodeId: resolveStoredMessageId(data.current_node),
+    messages,
+  };
+}
+
 function shouldPreserveCachedConversationSnapshot(existingMessages, remoteTurns) {
   return shouldPreserveCachedSnapshot(existingMessages, remoteTurns);
+}
+
+function createChatGptCacheConversationAdapter(targetDb) {
+  return {
+    getLinear: (conversationId) => getLinearMessages(conversationId, targetDb),
+    buildRemoteTurns: buildOrderedVisibleTurnsFromConversationData,
+    shouldPreserve: shouldPreserveCachedConversationSnapshot,
+    writeSnapshot: (conversation, data) => {
+      const snapshot = buildStoredChatGptSnapshot(data, conversation.id, targetDb);
+      const { messages } = snapshot;
+      if (messages.length === 0) return false;
+      writeNormalizedConversation(targetDb, {
+        ...conversation,
+        current_node_id: snapshot.currentNodeId,
+        last_synced_updated_at: conversation.updated_at ?? null,
+        cache_format_version: STANDARD_CACHE_FORMAT_VERSION,
+        messages,
+      });
+      return true;
+    },
+  };
 }
 
 function sleep(ms) {
@@ -325,6 +425,18 @@ async function syncLiveAccountIdentities() {
 }
 
 function setupIpc() {
+  ipcMain.handle('diagnostics:rendererSnapshot', async (event, payload = {}) => {
+    if (!diagnosticRuntime?.active) return { accepted: false, reason: 'diagnostics-disabled' };
+    diagnosticRuntime.record('renderer-snapshot', {
+      label: String(payload?.label || 'workspace').slice(0, 100),
+      sequence: Number(payload?.sequence || 0),
+      dropped: Number(payload?.dropped || 0),
+      stats: payload?.stats || null,
+      recent_events: Array.isArray(payload?.recent_events) ? payload.recent_events.slice(-50) : [],
+    }, { component: 'renderer' });
+    return { accepted: true };
+  });
+
   ipcMain.handle('auth:login', async () => {
     const success = await auth.login();
     if (success) {
@@ -371,40 +483,9 @@ function setupIpc() {
     ipcMain,
     auth,
     db,
+    getDatabase: getDatabaseForMode,
     resolveAccount: getAccountForPayload,
-    conversations: {
-      getLinear: (conversationId) => getLinearMessages(conversationId),
-      buildRemoteTurns: buildOrderedVisibleTurnsFromConversationData,
-      shouldPreserve: shouldPreserveCachedConversationSnapshot,
-      writeSnapshot: (conversation, data) => {
-        let wroteAnyMessage = false;
-        db.db.transaction(() => {
-          db.upsertConversation({
-            ...conversation,
-            current_node_id: data.current_node,
-            last_synced_updated_at: conversation.updated_at ?? null,
-          });
-          Object.values(data.mapping).forEach((node) => {
-            if (!node.message) return;
-            wroteAnyMessage = true;
-            db.upsertMessage({
-              id: node.message.id,
-              conversation_id: conversation.id,
-              role: node.message.author?.role || 'assistant',
-              content: chatgptRuntime.renderMessageContent(node.message, conversation.id) || '',
-              metadata_json: chatgptRuntime.mergeEmbeddedUiMetadataJson(
-                node.message.id,
-                chatgptRuntime.sanitizeMetadata(node.message.metadata),
-                db
-              ),
-              created_at: node.message.create_time || 0,
-              parent_id: node.parent,
-            });
-          });
-        })();
-        return wroteAnyMessage;
-      },
-    },
+    createConversations: createChatGptCacheConversationAdapter,
   });
 
   ipcMain.handle('db:getMessages', async (event, arg1, arg2) => {
@@ -420,15 +501,7 @@ function setupIpc() {
     const mode = typeof arg1 === 'object' ? arg1 : arg2;
     if (!conversationId) throw new Error('Missing conversationId');
     const targetDb = getDatabaseForMode(mode);
-    const conversation = targetDb.getConversation(conversationId) || null;
-    const allMessages = targetDb.getMessages(conversationId);
-    const currentMessages = getLinearMessages(conversationId, targetDb);
-    return {
-      conversation,
-      currentNodeId: conversation?.current_node_id || null,
-      allMessages,
-      currentMessages,
-    };
+    return readConversationState(targetDb, conversationId);
   });
 
   ipcMain.handle('api:prewarmConversation', async (event, payload) => {
@@ -451,7 +524,7 @@ function setupIpc() {
         if (!ref) {
           return { success: false, reason: 'AI Mode conversation ref not found' };
         }
-        const opened = await aiModeBridge.openConversation(ref);
+        const opened = await aiModeSiteScraper.openConversation(ref);
         return {
           success: !!opened,
           reason: opened ? '' : 'Could not open AI Mode conversation in bridge'
@@ -566,7 +639,7 @@ function setupIpc() {
           hasMore = offset < data.total;
         } else { hasMore = false; }
       }
-      const localConvs = db.getConversations();
+      const localConvs = readConversations(db);
       let markedCount = 0;
       localConvs.forEach(conv => {
         if (!conv.is_deleted_on_web && !allApiIds.has(conv.id)) {
@@ -574,7 +647,7 @@ function setupIpc() {
           markedCount++;
         } else if (conv.is_deleted_on_web && allApiIds.has(conv.id)) {
           const updated = { ...conv, is_deleted_on_web: 0 };
-          db.upsertConversation(updated);
+          writeConversationIndex(db, updated);
         }
       });
       return { success: true, markedCount };
@@ -590,17 +663,17 @@ function setupIpc() {
     const account = getAccountForPayload(payload);
     const targetDb = getDatabaseForMode(payload);
     if (!account?.capabilities.liveSync) {
-      const conversations = targetDb.getConversations();
-      return { conversations, total: conversations.length, hasMore: false };
+      const conversations = readConversations(targetDb);
+      return { conversations, total: conversations.length, hasMore: false, nextOffset: conversations.length };
     }
     const mode = normalizeWorkspaceMode(payload);
     const offset = Number(payload?.offset || 0);
     const limit = Number(payload?.limit || 20);
     if (mode === 'aimode') {
       try {
-        const refs = await aiModeBridge.fetchConversationIndex(3000);
+        const refs = await aiModeSiteScraper.listConversations(3000);
         const now = Date.now() / 1000;
-        const existingConvs = aiDb.getConversations();
+        const existingConvs = readConversations(aiDb);
         const byTitle = new Map();
         for (const conv of existingConvs) {
           const normalizedTitle = normalizeAiModeTitle(conv.title || '').toLowerCase();
@@ -610,8 +683,8 @@ function setupIpc() {
         }
         const takenIds = new Set();
 
-        aiDb.db.transaction(() => {
-          for (const ref of refs) {
+        const conversationIndexes = [];
+        for (const ref of refs) {
             const threadId = String(ref.threadId || '').trim();
             const normalizedTitle = normalizeAiModeTitle(ref.title || '').toLowerCase();
             let id = null;
@@ -622,7 +695,7 @@ function setupIpc() {
 
             if (!id && threadId) {
               const candidateLiveId = aiModeBridge.deriveConversationId(ref);
-              if (aiDb.getConversation(candidateLiveId)) {
+              if (readConversation(aiDb, candidateLiveId)) {
                 id = candidateLiveId;
               }
             }
@@ -647,11 +720,11 @@ function setupIpc() {
             if (threadId) {
               aiModeBridge.threadIdToConversationId.set(threadId, id);
             }
-            const existing = aiDb.getConversation(id);
+            const existing = readConversation(aiDb, id);
             const createdAt = Number(existing?.created_at || now);
             const visualIndex = Number.isFinite(Number(ref.visualIndex)) ? Number(ref.visualIndex) : 0;
             const orderedUpdatedAt = now - (visualIndex * 0.001);
-            aiDb.upsertConversation({
+            conversationIndexes.push({
               id,
               title: normalizeAiModeTitle(ref.title),
               created_at: createdAt,
@@ -659,8 +732,8 @@ function setupIpc() {
               current_node_id: existing?.current_node_id || null,
               is_deleted_on_web: 0,
             });
-          }
-        })();
+        }
+        writeConversationIndexes(aiDb, conversationIndexes);
         const removed = aiModeBridge.cleanupShadowConversations();
         if (removed > 0) {
           console.info(`[aimode-sync] removed ${removed} duplicate shadow conversations`);
@@ -668,7 +741,7 @@ function setupIpc() {
       } catch (error) {
         console.warn('AI Mode remote conversation sync failed; using local data only:', error);
       }
-      const localConversations = aiDb.getConversations();
+      const localConversations = readConversations(aiDb);
       const convById = new Map(localConversations.map((c) => [c.id, c]));
       const ordered = [];
       const seen = new Set();
@@ -692,34 +765,58 @@ function setupIpc() {
         conversations: ordered,
         total: ordered.length,
         hasMore: false,
+        nextOffset: ordered.length,
       };
     }
     try {
-      const response = await auth.fetchWithAuth(`https://chatgpt.com/backend-api/conversations?offset=${offset}&limit=${limit}&order=updated`);
-      const data = await response.json();
+      const data = await chatgptSiteScraper.listConversations({ auth, offset, limit });
       if (data.items) {
-        db.db.transaction(() => {
-          data.items.forEach(item => {
-            const existing = db.getConversation(item.id);
-            db.upsertConversation({
-              id: item.id,
-              title: item.title,
-              created_at: item.create_time,
-              updated_at: item.update_time,
-              last_synced_updated_at: existing ? existing.last_synced_updated_at : null,
-              current_node_id: existing ? existing.current_node_id : null
-            });
-          });
-        })();
+        const remoteIndexes = data.items.map((item) => {
+          const existing = readConversation(targetDb, item.id);
+          return {
+            id: item.id,
+            title: item.title,
+            // Conversation-list responses can omit timestamps for older
+            // chats. Never replace valid local cache metadata with null.
+            created_at: item.create_time ?? existing?.created_at ?? null,
+            updated_at: item.update_time ?? existing?.updated_at ?? null,
+            last_synced_updated_at: existing ? existing.last_synced_updated_at : null,
+            current_node_id: existing ? existing.current_node_id : null,
+            // An index row is not a cache. Only a successful live snapshot
+            // may stamp the current cache format.
+            cache_format_version: existing ? existing.cache_format_version : null,
+          };
+        });
+        writeConversationIndexes(targetDb, remoteIndexes);
+        const conversationsById = new Map(readConversations(targetDb).map((conversation) => [conversation.id, conversation]));
+        const nextOffset = offset + remoteIndexes.length;
+        return {
+          // Keep the exact order supplied by ChatGPT instead of returning
+          // every cached row sorted by local timestamps.
+          conversations: remoteIndexes
+            .map((conversation) => conversationsById.get(conversation.id))
+            .filter(Boolean),
+          total: data.total,
+          hasMore: remoteIndexes.length > 0 && nextOffset < data.total,
+          nextOffset,
+        };
       }
       return { 
-        conversations: db.getConversations(),
+        conversations: readConversations(targetDb),
         total: data.total,
-        hasMore: (offset + limit) < data.total
+        hasMore: (offset + limit) < data.total,
+        nextOffset: offset + limit,
       };
     } catch (error) {
-      console.error('Sync failed:', error);
-      throw error;
+      console.warn('ChatGPT remote conversation sync failed; using local data only:', error);
+      const conversations = readConversations(targetDb);
+      return {
+        conversations,
+        total: conversations.length,
+        hasMore: false,
+        nextOffset: 0,
+        remoteUnavailable: true,
+      };
     }
   });
 
@@ -809,14 +906,14 @@ function setupIpc() {
           return getLinearMessages(conversationId, aiDb);
         }
 
-        const opened = await aiModeBridge.openConversation(ref);
+        const opened = await aiModeSiteScraper.openConversation(ref);
         if (!opened) {
           throw new Error('Could not open AI Mode conversation in bridge');
         }
-        let remoteTurns = await aiModeBridge.scrapeMessages();
+        let remoteTurns = await aiModeSiteScraper.scrapeMessages();
         if (remoteTurns.length <= 2) {
           await sleep(450);
-          const retryTurns = await aiModeBridge.scrapeMessages();
+          const retryTurns = await aiModeSiteScraper.scrapeMessages();
           if (Array.isArray(retryTurns) && retryTurns.length > remoteTurns.length) {
             remoteTurns = retryTurns;
           }
@@ -855,40 +952,38 @@ function setupIpc() {
             return getLinearMessages(conversationId, aiDb);
           }
 
-          aiDb.db.transaction(() => {
-            const existing = aiDb.getConversation(conversationId);
-            const baseCreated = Number(existing?.created_at || Date.now() / 1000);
-            // Replace the conversation snapshot atomically to avoid duplicate growth
-            // when repeated refreshes scrape slightly different DOM fragments.
-            aiDb.db.prepare('DELETE FROM messages WHERE conversation_id = ?').run(conversationId);
-            let prevMessageId = null;
-            let lastMessageId = null;
-            remoteTurns.forEach((turn, idx) => {
-              const role = turn.role === 'assistant' ? 'assistant' : 'user';
-              const content = String(turn.content || '').trim();
-              if (!content) return;
-              const msgId = `aimsg-live-${buildDeterministicId(`${conversationId}|${idx}|${role}|${content}`)}`;
-              aiDb.upsertMessage({
-                id: msgId,
-                conversation_id: conversationId,
-                role,
-                content,
-                metadata_json: null,
-                created_at: baseCreated + (idx * 0.001),
-                parent_id: prevMessageId,
-              });
-              prevMessageId = msgId;
-              lastMessageId = msgId;
+          const existing = readConversation(aiDb, conversationId);
+          const baseCreated = Number(existing?.created_at || Date.now() / 1000);
+          let prevMessageId = null;
+          const messages = [];
+          remoteTurns.forEach((turn, idx) => {
+            const role = turn.role === 'assistant' ? 'assistant' : 'user';
+            const content = String(turn.content || '').trim();
+            if (!content) return;
+            const msgId = `aimsg-live-${buildDeterministicId(`${conversationId}|${idx}|${role}|${content}`)}`;
+            messages.push({
+              id: msgId,
+              conversation_id: conversationId,
+              role,
+              content,
+              metadata_json: null,
+              created_at: baseCreated + (idx * 0.001),
+              parent_id: prevMessageId,
             });
-            aiDb.upsertConversation({
+            prevMessageId = msgId;
+          });
+          if (messages.length > 0) {
+            writeNormalizedConversation(aiDb, {
+              ...(existing || { id: conversationId }),
               id: conversationId,
               title: normalizeAiModeTitle(ref.title || existing?.title || 'AI Mode Chat'),
               created_at: baseCreated,
               updated_at: Date.now() / 1000,
-              current_node_id: lastMessageId || existing?.current_node_id || null,
+              current_node_id: messages.at(-1)?.id || existing?.current_node_id || null,
               is_deleted_on_web: 0,
-            });
-          })();
+              messages,
+            }, { replaceMessages: true });
+          }
         }
         lastSync.set(key, now);
       } catch (error) {
@@ -897,12 +992,12 @@ function setupIpc() {
       return getLinearMessages(conversationId, aiDb);
     }
     const now = Date.now();
-    if (!force && lastSync.has(conversationId) && now - lastSync.get(conversationId) < 30000) {
-      return getLinearMessages(conversationId);
+    const syncKey = `chatgpt:${account?.id || 'default'}:${conversationId}`;
+    if (!force && lastSync.has(syncKey) && now - lastSync.get(syncKey) < 30000) {
+      return getLinearMessages(conversationId, targetDb);
     }
     try {
-      const response = await auth.fetchWithAuth(`https://chatgpt.com/backend-api/conversation/${conversationId}`);
-      const data = await response.json();
+      const data = await chatgptSiteScraper.fetchConversation({ auth, conversationId });
       if (data.mapping && data.current_node) {
         const embeddedUiMessageIds = chatgptRuntime.getEmbeddedUiMessageIds(data);
         const hasEmbeddedUiPayload = Object.values(data.mapping).some((node) => node?.message && chatgptRuntime.messageContainsEmbeddedUi(node.message));
@@ -912,65 +1007,50 @@ function setupIpc() {
         if (capturedEmbeddedUi.length > 0) {
           capturedEmbeddedUi = await chatgptRuntime.captureEmbeddedUiSnapshots(chatgptRuntime.getBridgeWindow(), capturedEmbeddedUi, { timeoutMs: chatgptRuntime.deepResearchCaptureTimeoutMs });
         }
-        const existingMessages = getLinearMessages(conversationId);
+        const existingMessages = getLinearMessages(conversationId, targetDb);
         const remoteTurns = buildOrderedVisibleTurnsFromConversationData(data, conversationId);
         if (shouldPreserveCachedConversationSnapshot(existingMessages, remoteTurns)) {
           if (capturedEmbeddedUi.length > 0) {
-            chatgptRuntime.attachEmbeddedUiToConversation(conversationId, capturedEmbeddedUi, embeddedUiMessageIds);
+            chatgptRuntime.attachEmbeddedUiToConversation(conversationId, capturedEmbeddedUi, embeddedUiMessageIds, targetDb);
           }
-          lastSync.set(conversationId, now);
+          lastSync.set(syncKey, now);
           return existingMessages;
         }
-        db.db.transaction(() => {
-          const existingConv = db.getConversation(conversationId);
-          if (existingConv) {
-            db.upsertConversation({
-              ...existingConv,
-              current_node_id: data.current_node,
-              last_synced_updated_at: existingConv.updated_at ?? existingConv.last_synced_updated_at ?? null,
-            });
-          }
-          Object.values(data.mapping).forEach(node => {
-            if (node.message) {
-              const content = chatgptRuntime.renderMessageContent(node.message, conversationId);
-              db.upsertMessage({
-                id: node.message.id,
-                conversation_id: conversationId,
-                role: node.message.author?.role || 'assistant',
-                content: content || '',
-                metadata_json: chatgptRuntime.mergeEmbeddedUiMetadataJson(
-                  node.message.id,
-                  chatgptRuntime.sanitizeMetadata(node.message.metadata),
-                  db
-                ),
-                created_at: node.message.create_time || 0,
-                parent_id: node.parent
-              });
-            }
+        const existingConv = readConversation(targetDb, conversationId);
+        const snapshot = buildStoredChatGptSnapshot(data, conversationId, targetDb);
+        const { messages } = snapshot;
+        if (existingConv && messages.length > 0) {
+          writeNormalizedConversation(targetDb, {
+            ...existingConv,
+            current_node_id: snapshot.currentNodeId,
+            last_synced_updated_at: existingConv.updated_at ?? existingConv.last_synced_updated_at ?? null,
+            cache_format_version: STANDARD_CACHE_FORMAT_VERSION,
+            messages,
           });
-        })();
-        if (capturedEmbeddedUi.length > 0) {
-          chatgptRuntime.attachEmbeddedUiToConversation(conversationId, capturedEmbeddedUi, embeddedUiMessageIds);
         }
-        lastSync.set(conversationId, now);
+        if (capturedEmbeddedUi.length > 0) {
+          chatgptRuntime.attachEmbeddedUiToConversation(conversationId, capturedEmbeddedUi, embeddedUiMessageIds, targetDb);
+        }
+        lastSync.set(syncKey, now);
       }
-      return getLinearMessages(conversationId);
+      return getLinearMessages(conversationId, targetDb);
     } catch (error) {
       console.warn('Message sync failed; using cached messages:', error);
-      return getLinearMessages(conversationId);
+      return getLinearMessages(conversationId, targetDb);
     }
   });
 }
 
 protocol.registerSchemesAsPrivileged([
-  { scheme: 'chatgpt-image', privileges: { standard: true, secure: true, supportFetchAPI: true, bypassCSP: true } }
+  { scheme: 'chatgpt-image', privileges: { standard: true, secure: true, supportFetchAPI: true, bypassCSP: true } },
+  { scheme: 'archive-asset', privileges: { standard: true, secure: true, supportFetchAPI: true, bypassCSP: true } },
 ]);
 
 app.whenReady().then(async () => {
   try {
     auth = new ChatGPTAuth(null);
-    db = new ChatDatabase('chatgpt.db');
-    aiDb = new ChatDatabase('aimode.db');
+    db = new ChatDatabase('chatgpt.db', { diagnostics: diagnosticRuntime, accountId: 'chatgpt-default' });
+    aiDb = new ChatDatabase('aimode.db', { diagnostics: diagnosticRuntime, accountId: 'google-ai-mode-default' });
     chatgptRuntime = createChatGptRuntime({
       app,
       BrowserWindow,
@@ -1001,9 +1081,11 @@ app.whenReady().then(async () => {
         historyItem: AI_MODE_HISTORY_ITEM_SELECTOR,
       },
     });
+    aiModeSiteScraper = getAgentPlugin('google-ai-mode')?.siteScraper?.createSiteScraper(aiModeBridge);
     accountManager = new AccountManager({
       userDataPath: app.getPath('userData'),
       legacyDatabases: { chatgpt: db, aimode: aiDb },
+      diagnostics: diagnosticRuntime,
     });
     await accountManager.initialize();
     setupIpc();
@@ -1034,8 +1116,29 @@ app.on('window-all-closed', () => {
   if (process.platform !== 'darwin') app.quit();
 });
 
-app.on('before-quit', () => {
-  if (!accountManager) return;
-  accountManager.close();
-  accountManager = null;
+let quitCleanupPromise = null;
+let quitCleanupComplete = false;
+
+function closeArchiveManager() {
+  if (accountManager) {
+    accountManager.close();
+    accountManager = null;
+  }
+}
+
+app.on('before-quit', (event) => {
+  if (quitCleanupComplete || !diagnosticRuntime?.active) {
+    closeArchiveManager();
+    quitCleanupComplete = true;
+    return;
+  }
+  event.preventDefault();
+  if (quitCleanupPromise) return;
+  closeArchiveManager();
+  quitCleanupPromise = diagnosticRuntime.stop('application-quit')
+    .catch((error) => console.error('[debug] Failed to finish diagnostic shutdown:', error))
+    .finally(() => {
+      quitCleanupComplete = true;
+      app.quit();
+    });
 });

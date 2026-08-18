@@ -1,4 +1,12 @@
 const path = require('path');
+const crypto = require('crypto');
+const {
+  isChatGptInternalProtocolMessage,
+  markChatGptInternalProtocolMetadata,
+} = require('../conversations/chatgpt-protocol.cjs');
+const { readMessages } = require('../archive/standard/reader.cjs');
+const { writeMessageMetadata } = require('../archive/standard/writer.cjs');
+const { formatChatGptContent } = require('../providers/formatters/chatgpt.cjs');
 
 function createChatGptRuntime({
   app,
@@ -120,6 +128,39 @@ function buildBridgeFastModeScript() {
         }
       };
 
+      const TOOL_CALL_KEYS = new Set([
+        'calculator', 'click', 'computer', 'file_search', 'find', 'image_query',
+        'open', 'python', 'search_model_queries', 'search_query', 'screenshot',
+        'shell', 'web',
+      ]);
+      const isToolProtocolNode = (message) => {
+        const role = message?.author?.role;
+        if (role === 'tool') return true;
+        if (role !== 'assistant') return false;
+        const metadata = message?.metadata || {};
+        const parts = Array.isArray(message?.content?.parts) ? message.content.parts : [];
+        const text = parts.filter((part) => typeof part === 'string').join('\n').trim();
+        if (text.startsWith('{') || text.startsWith('[')) {
+          try {
+            const parsed = JSON.parse(text);
+            const candidates = Array.isArray(parsed) ? parsed : [parsed];
+            if (candidates.some((candidate) => (
+              candidate && typeof candidate === 'object' && !Array.isArray(candidate)
+              && Object.keys(candidate).some((key) => TOOL_CALL_KEYS.has(key))
+            ))) return true;
+          } catch {
+            // Treat malformed content as ordinary text and let the normal
+            // renderer decide how to display it.
+          }
+        }
+        return parts.length === 0 && (
+          metadata.message_type === 'next'
+          || typeof metadata.reasoning_status === 'string'
+          || typeof metadata.reasoning_title === 'string'
+          || !!metadata.finish_details
+          || metadata.is_complete === true
+        );
+      };
       const isVisibleNode = (node) => {
         const message = node?.message;
         const role = message?.author?.role;
@@ -130,7 +171,10 @@ function buildBridgeFastModeScript() {
         ));
         const isThinkingArtifact = metadata?.is_thinking_preamble_message === true
           || metadata?.is_visually_hidden_from_conversation === true;
-        return (role === 'user' || role === 'assistant') && hasVisibleContent && !isThinkingArtifact;
+        return (role === 'user' || role === 'assistant')
+          && hasVisibleContent
+          && !isThinkingArtifact
+          && !isToolProtocolNode(message);
       };
 
       const countVisibleMessages = (data) => {
@@ -310,9 +354,17 @@ function buildBridgeFastModeScript() {
 async function installBridgeFastMode(win) {
   if (!BRIDGE_FAST_MODE || !win || win.isDestroyed()) return;
   try {
+    const alreadyInstalled = await win.webContents.executeJavaScript(
+      'Boolean(window.__codexBridgeFastModeInstalled)',
+      true
+    );
+    if (alreadyInstalled) return;
     await win.webContents.executeJavaScript(buildBridgeFastModeScript(), true);
   } catch (error) {
-    console.warn('Bridge fast mode injection failed:', error);
+    // The preload is authoritative. This post-load path is only a
+    // compatibility fallback, so a renderer navigation race must not flood
+    // the application's normal logs.
+    if (DEBUG_MODE) console.debug('Bridge fast mode fallback skipped:', error?.message || error);
   }
 }
 
@@ -350,7 +402,9 @@ async function fetchImageResponse(fileId, conversationId) {
 
       if (!metaResponse.ok) {
         const errorText = await metaResponse.text().catch(() => '');
-        console.error(`Image meta fetch failed (${metaResponse.status}) for ${fileId} via ${url}:`, errorText.slice(0, 300));
+        if (![400, 404, 422].includes(metaResponse.status)) {
+          console.warn(`Image meta fetch failed (${metaResponse.status}) for ${fileId} via ${url}:`, errorText.slice(0, 300));
+        }
         continue;
       }
 
@@ -364,7 +418,9 @@ async function fetchImageResponse(fileId, conversationId) {
       if (fileResponse.ok) return fileResponse;
 
       const downloadError = await fileResponse.text().catch(() => '');
-      console.error(`Image download URL fetch failed (${fileResponse.status}) for ${fileId}:`, downloadError.slice(0, 300));
+      if (![400, 404, 422].includes(fileResponse.status)) {
+        console.warn(`Image download URL fetch failed (${fileResponse.status}) for ${fileId}:`, downloadError.slice(0, 300));
+      }
     } catch (error) {
       console.error(`Image download URL resolution failed for ${fileId}:`, error);
     }
@@ -493,7 +549,8 @@ function attachRendererDiagnostics(label, webContents) {
     appendDebugEvent('renderer-console', {
       label,
       level: details.level,
-      message: String(details.message || '').slice(0, 12000),
+      message_length: String(details.message || '').length,
+      message_sha256: crypto.createHash('sha256').update(String(details.message || '')).digest('hex'),
       lineNumber: details.lineNumber,
       sourceId: details.sourceId,
     });
@@ -634,7 +691,6 @@ async function navigateBridgeTo(url, options = {}) {
         });
       } catch {}
     }
-    await installBridgeFastMode(win);
     return win;
   }
 
@@ -649,9 +705,8 @@ async function navigateBridgeTo(url, options = {}) {
     }
   }
 
-  // We don't wait for did-finish-load, the composer poller is faster
-  await sleep(100);
-  await installBridgeFastMode(win);
+  // The preload installs fast mode at document start. The did-finish-load
+  // listener is retained as a compatibility fallback for older renderers.
   return win;
 }
 
@@ -866,11 +921,11 @@ async function captureChatGptEmbeddedUi(win, conversationId, { timeoutMs = 0 } =
   }
 }
 
-function attachEmbeddedUiToConversation(conversationId, entries, preferredMessageIds = []) {
+function attachEmbeddedUiToConversation(conversationId, entries, preferredMessageIds = [], dbInstance = db) {
   const embeddedUi = sanitizeEmbeddedUiEntries(entries);
-  if (!conversationId || embeddedUi.length === 0 || !db) return 0;
+  if (!conversationId || embeddedUi.length === 0 || !dbInstance) return 0;
 
-  const messages = db.getMessages(conversationId);
+  const messages = readMessages(dbInstance, conversationId, { currentPath: false });
   const preferred = new Set((Array.isArray(preferredMessageIds) ? preferredMessageIds : []).filter(Boolean));
   let targets = messages.filter((message) => preferred.has(message.id));
 
@@ -897,7 +952,14 @@ function attachEmbeddedUiToConversation(conversationId, entries, preferredMessag
 
   if (targets.length === 0) return 0;
 
-  db.db.transaction(() => {
+  dbInstance.runArchiveOperation({
+    type: 'attach-chatgpt-embedded-ui',
+    actor: 'chatgpt-site-scraper',
+    reason: 'Attach captured ChatGPT embedded UI to exactly one stored message.',
+    entityType: 'conversation',
+    entityId: conversationId,
+    details: { targetMessages: targets.map((message) => message.id) },
+  }, () => {
     const targetIds = new Set(targets.map((message) => message.id));
     for (const message of messages) {
       if (targetIds.has(message.id)) continue;
@@ -905,14 +967,14 @@ function attachEmbeddedUiToConversation(conversationId, entries, preferredMessag
       if (!Array.isArray(metadata.embedded_ui)) continue;
       delete metadata.embedded_ui;
       const serialized = Object.keys(metadata).length > 0 ? JSON.stringify(metadata) : null;
-      db.db.prepare('UPDATE messages SET metadata_json = ? WHERE id = ?').run(serialized, message.id);
+      writeMessageMetadata(dbInstance, message.id, serialized);
     }
     for (const message of targets) {
       const metadata = parseMetadataJson(message.metadata_json);
       metadata.embedded_ui = embeddedUi;
-      db.db.prepare('UPDATE messages SET metadata_json = ? WHERE id = ?').run(JSON.stringify(metadata), message.id);
+      writeMessageMetadata(dbInstance, message.id, metadata);
     }
-  })();
+  });
 
   return targets.length;
 }
@@ -1845,7 +1907,7 @@ function renderMessageContent(message, conversationId) {
     appendChatImageMarkdown(lines, fileId, conversationId, seenImageFileIds);
   }
 
-  return lines.join('\n');
+  return formatChatGptContent(lines.join('\n'));
 }
 
 const DEEP_RESEARCH_IFRAME_HOST = 'connector_openai_deep_research.web-sandbox.oaiusercontent.com';
@@ -2332,9 +2394,7 @@ function getEmbeddedUiMessageIds(data) {
 
 function mergeEmbeddedUiMetadataJson(messageId, freshMetadataJson, dbInstance = db) {
   const fresh = parseMetadataJson(freshMetadataJson);
-  const existingRow = messageId
-    ? dbInstance?.db.prepare('SELECT metadata_json FROM messages WHERE id = ?').get(messageId)
-    : null;
+  const existingRow = messageId ? dbInstance?.getMessage(messageId) : null;
   const existing = parseMetadataJson(existingRow?.metadata_json);
 
   if (!fresh.embedded_ui && Array.isArray(existing.embedded_ui) && existing.embedded_ui.length > 0) {
@@ -2345,6 +2405,14 @@ function mergeEmbeddedUiMetadataJson(messageId, freshMetadataJson, dbInstance = 
 }
 
 const METADATA_KEY_WHITELIST = new Set([
+  // Model selection and reasoning effort
+  'model',
+  'model_slug',
+  'default_model_slug',
+  'requested_model_slug',
+  'thinking_effort',
+  'reasoning_effort',
+  'effort',
   // Citation/source resolution
   'content_references',
   'citations',
@@ -2414,9 +2482,12 @@ function sanitizeContentReferences(value) {
   return output;
 }
 
-function sanitizeMetadata(metadata) {
-  if (!metadata || typeof metadata !== 'object') return null;
-  const output = {};
+function sanitizeMetadata(metadata, message = null) {
+  const output = metadata && typeof metadata === 'object' ? {} : null;
+  if (!output) {
+    const markedOnly = markChatGptInternalProtocolMetadata(null, message);
+    return markedOnly ? JSON.stringify(markedOnly) : null;
+  }
 
   for (const key of METADATA_KEY_WHITELIST) {
     if (!(key in metadata)) continue;
@@ -2442,6 +2513,11 @@ function sanitizeMetadata(metadata) {
     if (value !== undefined && value !== null && value !== '') {
       output[key] = value;
     }
+  }
+
+  const marked = markChatGptInternalProtocolMetadata(output, message);
+  if (marked) {
+    for (const [key, value] of Object.entries(marked)) output[key] = value;
   }
 
   if (Object.keys(output).length === 0) return null;
@@ -2474,6 +2550,7 @@ function sanitizeMetadata(metadata) {
     getBridgeWindow: () => bridgeWindow,
     getComposerStatus: () => bridgeComposerStatus,
     getEmbeddedUiMessageIds,
+    isChatGptInternalProtocolMessage,
     logRendererMetrics,
     mergeEmbeddedUiMetadataJson,
     messageContainsEmbeddedUi,

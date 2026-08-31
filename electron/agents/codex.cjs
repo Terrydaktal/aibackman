@@ -1,12 +1,99 @@
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
-const readline = require('readline');
-const { asUnixSeconds, compactTitle, fileFingerprint, parseJsonFile, stableId } = require('./utils.cjs');
+const { Worker } = require('worker_threads');
+const { compactTitle, fileFingerprint, parseJsonFile, stableId } = require('./utils.cjs');
 const { writeNormalizedConversation } = require('../archive/standard/index.cjs');
 
 const DEFAULT_ROOT = path.join(os.homedir(), '.codex');
-const CODEX_ROUTING_VERSION = 4;
+const CODEX_ROUTING_VERSION = 5;
+const SESSION_WORKER_PATH = path.join(__dirname, 'codex-session-worker.cjs');
+const REFRESH_WORKER_PATH = path.join(__dirname, 'codex-refresh-worker.cjs');
+
+class CodexSessionParserClient {
+  constructor() {
+    this.nextRequestId = 1;
+    this.pending = new Map();
+    this.closed = false;
+    this.failure = null;
+    this.worker = new Worker(SESSION_WORKER_PATH);
+    this.worker.on('message', ({ requestId, session, error }) => {
+      const request = this.pending.get(requestId);
+      if (!request) return;
+      this.pending.delete(requestId);
+      if (error) request.reject(new Error(error));
+      else request.resolve(session);
+    });
+    this.worker.once('error', (error) => this.fail(error));
+    this.worker.once('exit', (code) => {
+      if (!this.closed && code !== 0) this.fail(new Error(`Codex parser worker exited with code ${code}.`));
+    });
+  }
+
+  fail(error) {
+    this.failure = error;
+    for (const request of this.pending.values()) request.reject(error);
+    this.pending.clear();
+  }
+
+  parse(filePath) {
+    if (this.failure) return Promise.reject(this.failure);
+    if (this.closed) return Promise.reject(new Error('Codex parser worker is closed.'));
+    const requestId = this.nextRequestId;
+    this.nextRequestId += 1;
+    return new Promise((resolve, reject) => {
+      this.pending.set(requestId, { resolve, reject });
+      this.worker.postMessage({ requestId, filePath });
+    });
+  }
+
+  async close() {
+    if (this.closed) return;
+    this.closed = true;
+    await this.worker.terminate();
+  }
+}
+
+function createLazySessionParser() {
+  let client = null;
+  return {
+    parse(filePath) {
+      if (!client) client = new CodexSessionParserClient();
+      return client.parse(filePath);
+    },
+    async close() {
+      if (client) await client.close();
+    },
+  };
+}
+
+function runRefreshWorker(workerData, onProgress) {
+  return new Promise((resolve, reject) => {
+    const worker = new Worker(REFRESH_WORKER_PATH, { workerData });
+    let settled = false;
+    worker.on('message', (message) => {
+      if (message?.type === 'progress') {
+        onProgress?.(message.progress);
+        return;
+      }
+      if (message?.type !== 'result' || settled) return;
+      settled = true;
+      if (message.error) reject(new Error(message.error));
+      else resolve(message.result);
+    });
+    worker.once('error', (error) => {
+      if (settled) return;
+      settled = true;
+      reject(error);
+    });
+    worker.once('exit', (code) => {
+      if (settled) return;
+      settled = true;
+      if (code === 0) reject(new Error('Codex refresh worker exited without returning a result.'));
+      else reject(new Error(`Codex refresh worker exited with code ${code}.`));
+    });
+  });
+}
 
 function listJsonlFiles(root) {
   if (!fs.existsSync(root)) return [];
@@ -47,72 +134,6 @@ function discoverAccounts() {
     sourceConfig: { codexRoot: DEFAULT_ROOT, sessionsRoot, remoteAccountId: null },
   });
   return discovered;
-}
-
-function extractAccountId(event) {
-  const payload = event?.payload || {};
-  return event?.account_id
-    || payload.account_id
-    || payload.info?.account_id
-    || payload.info?.total_token_usage?.account_id
-    || null;
-}
-
-async function parseSession(filePath) {
-  const stream = fs.createReadStream(filePath, { encoding: 'utf8' });
-  const lines = readline.createInterface({ input: stream, crlfDelay: Infinity });
-  let sessionId = path.basename(filePath, '.jsonl').replace(/^rollout-[^-]+-/, '');
-  let cwd = '';
-  let accountId = null;
-  const accountIds = new Set();
-  let currentModel = null;
-  let currentEffort = null;
-  let sequence = 0;
-  let parseErrors = 0;
-  const visible = [];
-
-  for await (const line of lines) {
-    if (!line.trim()) continue;
-    let event;
-    try {
-      event = JSON.parse(line);
-    } catch {
-      parseErrors += 1;
-      continue;
-    }
-    if (event.type === 'session_meta') {
-      sessionId = String(event.payload?.id || event.payload?.session_id || sessionId);
-      cwd = String(event.payload?.cwd || '');
-    }
-    const eventAccountId = extractAccountId(event);
-    if (eventAccountId) {
-      accountId = String(eventAccountId);
-      accountIds.add(accountId);
-    }
-    const eventPayload = event.payload && typeof event.payload === 'object' ? event.payload : {};
-    const contextModel = event.model || eventPayload.model || eventPayload.model_slug || eventPayload.model_name;
-    const contextEffort = event.effort || event.reasoning_effort || eventPayload.effort
-      || eventPayload.reasoning_effort || eventPayload.thinking_effort;
-    if (contextModel) currentModel = String(contextModel).trim() || currentModel;
-    if (contextEffort) currentEffort = String(contextEffort).trim() || currentEffort;
-    if (event.type !== 'event_msg') continue;
-    const eventType = event.payload?.type;
-    if (eventType !== 'user_message' && eventType !== 'agent_message') continue;
-    const content = String(event.payload?.message || '').trim();
-    if (!content) continue;
-    visible.push({
-      sequence,
-      role: eventType === 'user_message' ? 'user' : 'assistant',
-      content,
-      phase: event.payload?.phase || null,
-      model: currentModel,
-      effort: currentEffort,
-      createdAt: asUnixSeconds(event.timestamp, Date.now() / 1000 + sequence * 0.001),
-    });
-    sequence += 1;
-  }
-
-  return { sessionId, cwd, accountId, accountIds: [...accountIds], visible, parseErrors };
 }
 
 function buildSessionSnapshot(session) {
@@ -163,7 +184,7 @@ function importSession(db, session) {
   }, { replaceMessages: true }).importedMessages;
 }
 
-async function refreshLocal({ db, sourceConfig = {}, onProgress }) {
+async function refreshLocalDirect({ db, sourceConfig = {}, onProgress }) {
   const sessionsRoot = sourceConfig.sessionsRoot || path.join(DEFAULT_ROOT, 'sessions');
   const targetAccountId = sourceConfig.remoteAccountId || null;
   const files = listJsonlFiles(sessionsRoot);
@@ -171,41 +192,50 @@ async function refreshLocal({ db, sourceConfig = {}, onProgress }) {
   let importedMessages = 0;
   let skippedFiles = 0;
   let parseErrors = 0;
+  const sessionParser = createLazySessionParser();
 
-  for (let index = 0; index < files.length; index += 1) {
-    const filePath = files[index];
-    const fingerprint = fileFingerprint(filePath);
-    const sourceKey = `codex:${filePath}`;
-    const sourceItem = db.getSourceItem(sourceKey);
-    const metadata = sourceItemMetadata(sourceItem);
-    if (sourceItem?.fingerprint === fingerprint && metadata.routingVersion === CODEX_ROUTING_VERSION) {
-      skippedFiles += 1;
-      continue;
-    }
+  try {
+    for (let index = 0; index < files.length; index += 1) {
+      const filePath = files[index];
+      const fingerprint = fileFingerprint(filePath);
+      const sourceKey = `codex:${filePath}`;
+      const sourceItem = db.getSourceItem(sourceKey);
+      const metadata = sourceItemMetadata(sourceItem);
+      if (sourceItem?.fingerprint === fingerprint && metadata.routingVersion === CODEX_ROUTING_VERSION) {
+        skippedFiles += 1;
+        continue;
+      }
 
-    const session = await parseSession(filePath);
-    parseErrors += session.parseErrors;
-    const sessionAccountIds = new Set(session.accountIds || []);
-    const belongsToTarget = targetAccountId
-      ? sessionAccountIds.has(targetAccountId)
-      : sessionAccountIds.size === 0;
-    if (belongsToTarget && session.visible.length > 0) {
-      const messageCount = importSession(db, session);
-      importedConversations += 1;
-      importedMessages += messageCount;
+      const session = await sessionParser.parse(filePath);
+      parseErrors += session.parseErrors;
+      const sessionAccountIds = new Set(session.accountIds || []);
+      const belongsToTarget = targetAccountId
+        ? sessionAccountIds.has(targetAccountId)
+        : sessionAccountIds.size === 0;
+      const shouldImport = belongsToTarget && !session.isSubagent && session.visible.length > 0;
+      if (shouldImport) {
+        const messageCount = importSession(db, session);
+        importedConversations += 1;
+        importedMessages += messageCount;
+      }
+      db.upsertSourceItem({
+        sourceKey,
+        sourcePath: filePath,
+        fingerprint,
+        metadata: {
+          accountId: session.accountId,
+          accountIds: session.accountIds,
+          imported: shouldImport,
+          isSubagent: session.isSubagent,
+          parentSessionId: session.parentSessionId,
+          sessionId: session.sessionId,
+          routingVersion: CODEX_ROUTING_VERSION,
+        },
+      });
+      onProgress?.({ current: index + 1, total: files.length, filePath });
     }
-    db.upsertSourceItem({
-      sourceKey,
-      sourcePath: filePath,
-      fingerprint,
-      metadata: {
-        accountId: session.accountId,
-        accountIds: session.accountIds,
-        imported: belongsToTarget,
-        routingVersion: CODEX_ROUTING_VERSION,
-      },
-    });
-    onProgress?.({ current: index + 1, total: files.length, filePath });
+  } finally {
+    await sessionParser.close();
   }
 
   return { importedConversations, importedMessages, skippedFiles, parseErrors, sourceItems: files.length };
@@ -219,7 +249,7 @@ function sourceItemMetadata(sourceItem) {
   }
 }
 
-async function refreshAllLocal({ accounts, getDatabase, onProgress }) {
+async function refreshAllLocalDirect({ accounts, getDatabase, onProgress }) {
   const results = new Map(accounts.map((account) => [account.id, {
     account,
     importedConversations: 0,
@@ -234,75 +264,84 @@ async function refreshAllLocal({ accounts, getDatabase, onProgress }) {
     if (!groups.has(sessionsRoot)) groups.set(sessionsRoot, []);
     groups.get(sessionsRoot).push(account);
   }
+  const sessionParser = createLazySessionParser();
 
-  for (const [sessionsRoot, groupAccounts] of groups) {
-    const files = listJsonlFiles(sessionsRoot);
-    const accountByRemoteId = new Map(groupAccounts
-      .filter((account) => account.sourceConfig?.remoteAccountId)
-      .map((account) => [String(account.sourceConfig.remoteAccountId), account]));
-    const fallbackAccount = groupAccounts.find((account) => !account.sourceConfig?.remoteAccountId) || null;
+  try {
+    for (const [sessionsRoot, groupAccounts] of groups) {
+      const files = listJsonlFiles(sessionsRoot);
+      const accountByRemoteId = new Map(groupAccounts
+        .filter((account) => account.sourceConfig?.remoteAccountId)
+        .map((account) => [String(account.sourceConfig.remoteAccountId), account]));
+      const fallbackAccount = groupAccounts.find((account) => !account.sourceConfig?.remoteAccountId) || null;
 
-    for (let index = 0; index < files.length; index += 1) {
-      const filePath = files[index];
-      const fingerprint = fileFingerprint(filePath);
-      const sourceKey = `codex:${filePath}`;
-      const sourceState = new Map(groupAccounts.map((account) => {
-        const sourceItem = getDatabase(account).getSourceItem(sourceKey);
-        const metadata = sourceItemMetadata(sourceItem);
-        return [account.id, {
-          current: sourceItem?.fingerprint === fingerprint
-            && metadata.routingVersion === CODEX_ROUTING_VERSION,
-          metadata,
-        }];
-      }));
-      if ([...sourceState.values()].every((state) => state.current)) {
-        for (const account of groupAccounts) {
-          if (sourceState.get(account.id).metadata.imported === true) {
-            results.get(account.id).skippedFiles += 1;
+      for (let index = 0; index < files.length; index += 1) {
+        const filePath = files[index];
+        const fingerprint = fileFingerprint(filePath);
+        const sourceKey = `codex:${filePath}`;
+        const sourceState = new Map(groupAccounts.map((account) => {
+          const sourceItem = getDatabase(account).getSourceItem(sourceKey);
+          const metadata = sourceItemMetadata(sourceItem);
+          return [account.id, {
+            current: sourceItem?.fingerprint === fingerprint
+              && metadata.routingVersion === CODEX_ROUTING_VERSION,
+            metadata,
+          }];
+        }));
+        if ([...sourceState.values()].every((state) => state.current)) {
+          for (const account of groupAccounts) {
+            if (sourceState.get(account.id).metadata.imported === true) {
+              results.get(account.id).skippedFiles += 1;
+            }
           }
+          continue;
         }
-        continue;
-      }
 
-      const session = await parseSession(filePath);
-      const sessionAccountIds = new Set(session.accountIds || []);
-      const targetAccounts = sessionAccountIds.size > 0
-        ? [...sessionAccountIds].map((accountId) => accountByRemoteId.get(accountId)).filter(Boolean)
-        : (fallbackAccount ? [fallbackAccount] : []);
-      const targetIds = new Set(targetAccounts.map((account) => account.id));
+        const session = await sessionParser.parse(filePath);
+        const sessionAccountIds = new Set(session.accountIds || []);
+        const targetAccounts = sessionAccountIds.size > 0
+          ? [...sessionAccountIds].map((accountId) => accountByRemoteId.get(accountId)).filter(Boolean)
+          : (fallbackAccount ? [fallbackAccount] : []);
+        const targetIds = new Set(targetAccounts.map((account) => account.id));
 
-      for (const account of groupAccounts) {
-        const targetResult = results.get(account.id);
-        const targetDb = getDatabase(account);
-        const belongsToTarget = targetIds.has(account.id);
-        if (belongsToTarget) targetResult.parseErrors += session.parseErrors;
-        targetResult.sourceItems += 1;
-        if (!sourceState.get(account.id).current && belongsToTarget && session.visible.length > 0) {
-          targetResult.importedMessages += importSession(targetDb, session);
-          targetResult.importedConversations += 1;
-        } else if (sourceState.get(account.id).current && belongsToTarget) {
-          targetResult.skippedFiles += 1;
+        for (const account of groupAccounts) {
+          const targetResult = results.get(account.id);
+          const targetDb = getDatabase(account);
+          const belongsToTarget = targetIds.has(account.id);
+          const shouldImport = belongsToTarget && !session.isSubagent && session.visible.length > 0;
+          if (belongsToTarget) targetResult.parseErrors += session.parseErrors;
+          targetResult.sourceItems += 1;
+          if (!sourceState.get(account.id).current && shouldImport) {
+            targetResult.importedMessages += importSession(targetDb, session);
+            targetResult.importedConversations += 1;
+          } else if (sourceState.get(account.id).current && belongsToTarget) {
+            targetResult.skippedFiles += 1;
+          }
+          targetDb.upsertSourceItem({
+            sourceKey,
+            sourcePath: filePath,
+            fingerprint,
+            metadata: {
+              accountId: session.accountId,
+              accountIds: session.accountIds,
+              imported: shouldImport,
+              processed: true,
+              isSubagent: session.isSubagent,
+              parentSessionId: session.parentSessionId,
+              sessionId: session.sessionId,
+              routingVersion: CODEX_ROUTING_VERSION,
+            },
+          });
         }
-        targetDb.upsertSourceItem({
-          sourceKey,
-          sourcePath: filePath,
-          fingerprint,
-          metadata: {
-            accountId: session.accountId,
-            accountIds: session.accountIds,
-            imported: belongsToTarget && session.visible.length > 0,
-            processed: true,
-            routingVersion: CODEX_ROUTING_VERSION,
-          },
+        onProgress?.({
+          accountId: targetAccounts[0]?.id || fallbackAccount?.id || groupAccounts[0]?.id,
+          current: index + 1,
+          total: files.length,
+          filePath,
         });
       }
-      onProgress?.({
-        accountId: targetAccounts[0]?.id || fallbackAccount?.id || groupAccounts[0]?.id,
-        current: index + 1,
-        total: files.length,
-        filePath,
-      });
     }
+  } finally {
+    await sessionParser.close();
   }
 
   return {
@@ -316,6 +355,24 @@ async function refreshAllLocal({ accounts, getDatabase, onProgress }) {
   };
 }
 
+async function refreshLocal({ db, sourceConfig = {}, onProgress }) {
+  return runRefreshWorker({
+    mode: 'single',
+    dbPath: db.path,
+    sourceConfig,
+  }, onProgress);
+}
+
+async function refreshAllLocal({ accounts, getDatabase, onProgress }) {
+  return runRefreshWorker({
+    mode: 'all',
+    accounts: accounts.map((account) => ({
+      account,
+      dbPath: getDatabase(account).path,
+    })),
+  }, onProgress);
+}
+
 module.exports = {
   id: 'codex',
   name: 'Codex CLI',
@@ -325,4 +382,6 @@ module.exports = {
   discoverAccounts,
   refreshLocal,
   refreshAllLocal,
+  refreshLocalDirect,
+  refreshAllLocalDirect,
 };

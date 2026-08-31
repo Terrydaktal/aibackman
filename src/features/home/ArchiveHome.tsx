@@ -12,6 +12,9 @@ interface ArchiveHomeProps {
   onOpenAccount: (account: AgentAccount, target?: ArchiveNavigationTarget) => void;
 }
 
+type GlobalSearchSort = 'relevance' | 'date_desc' | 'date_asc';
+type GlobalSearchRole = 'all' | 'user' | 'assistant';
+
 const resultPreview = (content: string, query: string) => {
   const normalized = String(content || '').replace(/\s+/g, ' ').trim();
   const index = normalized.toLowerCase().indexOf(query.trim().toLowerCase());
@@ -21,6 +24,24 @@ const resultPreview = (content: string, query: string) => {
 };
 
 const formatCount = (value: number | undefined) => new Intl.NumberFormat().format(Number(value || 0));
+
+const archiveDate = (value: number | string | null | undefined) => {
+  if (value == null || value === '') return null;
+  const numeric = typeof value === 'number' ? value : Number(value);
+  const date = Number.isFinite(numeric)
+    ? new Date(numeric < 10_000_000_000 ? numeric * 1000 : numeric)
+    : new Date(value);
+  return Number.isNaN(date.getTime()) ? null : date;
+};
+
+const formatArchiveDate = (value: number | string | null | undefined) => {
+  const date = archiveDate(value);
+  if (!date) return 'Not recorded';
+  return new Intl.DateTimeFormat(undefined, {
+    dateStyle: 'medium',
+    timeStyle: 'short',
+  }).format(date);
+};
 
 const summarizeRefresh = (label: string, result: unknown, itemLabel: string) => {
   const resultRecord = result && typeof result === 'object' ? result as Record<string, unknown> : null;
@@ -45,6 +66,8 @@ export function ArchiveHome({ onOpenAccount }: ArchiveHomeProps) {
   const [searchResults, setSearchResults] = useState<GlobalSearchResult[]>([]);
   const [searchTotal, setSearchTotal] = useState(0);
   const [searching, setSearching] = useState(false);
+  const [searchSort, setSearchSort] = useState<GlobalSearchSort>('relevance');
+  const [searchRole, setSearchRole] = useState<GlobalSearchRole>('all');
   const [busyAccountId, setBusyAccountId] = useState<string | null>(null);
   const [addingAgent, setAddingAgent] = useState<AgentOverview | null>(null);
   const [newAccountLabel, setNewAccountLabel] = useState('');
@@ -79,7 +102,12 @@ export function ArchiveHome({ onOpenAccount }: ArchiveHomeProps) {
     if (!trimmed) return;
     const timer = window.setTimeout(async () => {
       try {
-        const output = await window.electronAPI.invoke('archive:globalSearch', { query: trimmed, limit: 200 });
+        const output = await window.electronAPI.invoke('archive:globalSearch', {
+          query: trimmed,
+          limit: 200,
+          sort: searchSort,
+          role: searchRole,
+        });
         if (searchTokenRef.current !== token) return;
         setSearchResults(Array.isArray(output?.results) ? output.results : []);
         setSearchTotal(Number(output?.total || 0));
@@ -91,7 +119,7 @@ export function ArchiveHome({ onOpenAccount }: ArchiveHomeProps) {
       }
     }, 220);
     return () => window.clearTimeout(timer);
-  }, [query]);
+  }, [query, searchRole, searchSort]);
 
   const handleQueryChange = (value: string) => {
     setQuery(value);
@@ -252,7 +280,41 @@ export function ArchiveHome({ onOpenAccount }: ArchiveHomeProps) {
           {query ? <button onClick={() => handleQueryChange('')} title="Clear search" aria-label="Clear search">×</button> : null}
         </div>
         {query.trim() ? (
-          <div className="global-search-summary">{searching ? 'Searching...' : `${formatCount(searchTotal)} matches`}</div>
+          <div className="global-search-toolbar">
+            <div className="global-search-summary">{searching ? 'Searching...' : `${formatCount(searchTotal)} matches`}</div>
+            <div className="global-search-controls">
+              <label className="global-search-filter">
+                <span>Messages</span>
+                <select
+                  aria-label="Filter search results by sender"
+                  value={searchRole}
+                  onChange={(event) => {
+                    setSearchRole(event.target.value as GlobalSearchRole);
+                    setSearching(true);
+                  }}
+                >
+                  <option value="all">All messages</option>
+                  <option value="user">User messages</option>
+                  <option value="assistant">Assistant messages</option>
+                </select>
+              </label>
+              <label className="global-search-sort">
+                <span>Sort by</span>
+                <select
+                  aria-label="Sort search results"
+                  value={searchSort}
+                  onChange={(event) => {
+                    setSearchSort(event.target.value as GlobalSearchSort);
+                    setSearching(true);
+                  }}
+                >
+                  <option value="relevance">Relevance</option>
+                  <option value="date_desc">Date: newest first</option>
+                  <option value="date_asc">Date: oldest first</option>
+                </select>
+              </label>
+            </div>
+          </div>
         ) : null}
       </section>
 
@@ -261,17 +323,24 @@ export function ArchiveHome({ onOpenAccount }: ArchiveHomeProps) {
 
       {query.trim() ? (
         <section className="global-search-results" aria-label="Global search results">
-          {searchResults.map((result) => (
-            <button key={`${result.account_id}:${result.id}`} className="global-search-result" onClick={() => openSearchResult(result)}>
-              <span className="global-result-source">
-                <i style={{ background: result.agent_accent }} />
-                {result.agent_name} / {result.account_label}
-              </span>
-              <strong>{result.conversation_title || `Untitled ${archiveItemLabel(result.agent_id)}`}</strong>
-              <span className="global-result-preview">{resultPreview(result.content, query)}</span>
-              <span className="global-result-role">{result.role}</span>
-            </button>
-          ))}
+          {searchResults.map((result) => {
+            const messageDate = archiveDate(result.created_at);
+            return (
+              <button key={`${result.account_id}:${result.id}`} className="global-search-result" onClick={() => openSearchResult(result)}>
+                <span className="global-result-source">
+                  <i style={{ background: result.agent_accent }} />
+                  {result.agent_name} / {result.account_label}
+                </span>
+                <strong>{result.conversation_title || `Untitled ${archiveItemLabel(result.agent_id)}`}</strong>
+                <span className="global-result-message-meta">
+                  <span className="global-result-role">{result.role}</span>
+                  <span aria-hidden="true">·</span>
+                  <time dateTime={messageDate?.toISOString()}>{formatArchiveDate(result.created_at)}</time>
+                </span>
+                <span className="global-result-preview">{resultPreview(result.content, query)}</span>
+              </button>
+            );
+          })}
           {!searching && searchResults.length === 0 ? <div className="archive-empty">No matching messages.</div> : null}
         </section>
       ) : (
@@ -317,6 +386,14 @@ export function ArchiveHome({ onOpenAccount }: ArchiveHomeProps) {
                       <span className="account-card-kind">{account.sourceKind}</span>
                       <span className="account-card-stats">
                         {formatCount(account.stats?.conversationCount)} {archiveItemLabel(agent.id, true)} · {formatCount(account.stats?.messageCount)} messages
+                      </span>
+                      <span className="account-card-dates">
+                        <span>
+                          Last message: <time dateTime={archiveDate(account.stats?.latestMessageAt)?.toISOString()}>{formatArchiveDate(account.stats?.latestMessageAt)}</time>
+                        </span>
+                        <span>
+                          Last backup: <time dateTime={archiveDate(account.stats?.lastBackupAt)?.toISOString()}>{formatArchiveDate(account.stats?.lastBackupAt)}</time>
+                        </span>
                       </span>
                     </button>
                     <div className="account-card-actions">

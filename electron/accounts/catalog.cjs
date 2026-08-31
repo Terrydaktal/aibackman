@@ -23,6 +23,7 @@ class AccountCatalog {
         source_config_json TEXT,
         legacy_mode TEXT,
         is_default INTEGER NOT NULL DEFAULT 0,
+        last_backup_at DATETIME,
         created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
         updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
       );
@@ -30,6 +31,10 @@ class AccountCatalog {
       CREATE INDEX IF NOT EXISTS idx_accounts_agent_label
         ON accounts(agent_id, label COLLATE NOCASE);
     `);
+    const accountColumns = new Set(this.#db.prepare('PRAGMA table_info(accounts)').all().map((column) => column.name));
+    if (!accountColumns.has('last_backup_at')) {
+      this.#db.exec('ALTER TABLE accounts ADD COLUMN last_backup_at DATETIME');
+    }
   }
 
   listAccounts() {
@@ -61,11 +66,20 @@ class AccountCatalog {
     return this.getAccount(id);
   }
 
+  recordBackup(id, timestamp = new Date().toISOString()) {
+    this.#db.prepare(`
+      UPDATE accounts
+      SET last_backup_at = ?, updated_at = CURRENT_TIMESTAMP
+      WHERE id = ?
+    `).run(timestamp, id);
+    return this.getAccount(id);
+  }
+
   upsertAccount(account) {
     this.#db.prepare(`
       INSERT INTO accounts (
-        id, agent_id, label, db_path, source_kind, source_config_json, legacy_mode, is_default
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        id, agent_id, label, db_path, source_kind, source_config_json, legacy_mode, is_default, last_backup_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(id) DO UPDATE SET
         agent_id = excluded.agent_id,
         label = excluded.label,
@@ -74,6 +88,7 @@ class AccountCatalog {
         source_config_json = excluded.source_config_json,
         legacy_mode = excluded.legacy_mode,
         is_default = excluded.is_default,
+        last_backup_at = COALESCE(excluded.last_backup_at, accounts.last_backup_at),
         updated_at = CURRENT_TIMESTAMP
     `).run(
       account.id,
@@ -83,7 +98,8 @@ class AccountCatalog {
       account.sourceKind,
       account.sourceConfig == null ? null : JSON.stringify(account.sourceConfig),
       account.legacyMode || null,
-      account.isDefault ? 1 : 0
+      account.isDefault ? 1 : 0,
+      account.lastBackupAt || null
     );
     return this.getAccount(account.id);
   }

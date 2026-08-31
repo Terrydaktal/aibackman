@@ -56,7 +56,6 @@ export function useMessageNavigation({
   const [targetMessageId, setTargetMessageId] = useState<string | null>(initialMessageId);
   const [targetOccurrence, setTargetOccurrence] = useState<number | null>(null);
   const [activeHighlightQuery, setActiveHighlightQuery] = useState(initialSearchQuery);
-  const [nativeHighlightRevision, setNativeHighlightRevision] = useState(0);
   const [viewportVisibleMessageIds, setViewportVisibleMessageIds] = useState<string[]>([]);
   const [isNearBottom, setIsNearBottom] = useState(true);
   const [nativeHighlightsSupported] = useState(() => supportsNativeSearchHighlights());
@@ -167,7 +166,6 @@ export function useMessageNavigation({
       const target = nativeSearchTargetRef.current;
       const ranges = target.messageId ? result.rangesByMessage.get(target.messageId) : undefined;
       registerNativeSearchHighlights(result.records, ranges?.[target.occurrence ?? 0] || null);
-      setNativeHighlightRevision((revision) => revision + 1);
       pushDebug('native-search-highlights', {
         queryLen: query.length,
         ranges: result.records.length,
@@ -447,7 +445,6 @@ export function useMessageNavigation({
   }, [
     displayMessages,
     mapSearchNeedleActive,
-    nativeHighlightRevision,
     nativeHighlightsSupported,
     targetMessageId,
     targetOccurrence,
@@ -455,18 +452,24 @@ export function useMessageNavigation({
 
   useEffect(() => {
     let timer: number | undefined;
+    const scroller = scrollerRef.current;
     const handleMouseDown = (event: MouseEvent) => {
       if (event.button !== 0) return;
       const target = event.target as Element | null;
       if (target?.closest('.content-nav-item') || target?.closest('.content-nav-search')) return;
       clearTarget();
     };
+    const handleScrollIntent = () => clearTarget();
     if (targetMessageId) {
       timer = window.setTimeout(() => window.addEventListener('mousedown', handleMouseDown), 1000);
+      scroller?.addEventListener('wheel', handleScrollIntent, { passive: true });
+      scroller?.addEventListener('touchstart', handleScrollIntent, { passive: true });
     }
     return () => {
       if (timer !== undefined) window.clearTimeout(timer);
       window.removeEventListener('mousedown', handleMouseDown);
+      scroller?.removeEventListener('wheel', handleScrollIntent);
+      scroller?.removeEventListener('touchstart', handleScrollIntent);
     };
   }, [clearTarget, targetMessageId]);
 

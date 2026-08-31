@@ -153,6 +153,7 @@ class AccountManager {
       sourceConfig,
       legacyMode: row.legacy_mode,
       isDefault: !!row.is_default,
+      lastBackupAt: row.last_backup_at || null,
       capabilities,
     };
   }
@@ -222,10 +223,16 @@ class AccountManager {
   }
 
   getArchiveOverview() {
-    const accounts = this.listAccounts().map((account) => ({
-      ...account,
-      stats: this.getDatabase(account).getStats(),
-    }));
+    const accounts = this.listAccounts().map((account) => {
+      const database = this.getDatabase(account);
+      return {
+        ...account,
+        stats: {
+          ...database.getStats(),
+          lastBackupAt: account.lastBackupAt || database.getLatestBackupAt(),
+        },
+      };
+    });
     const agents = listAgentPlugins().map((plugin) => ({
       id: plugin.id,
       name: plugin.name,
@@ -339,6 +346,7 @@ class AccountManager {
         ...account,
         sourceConfig: { ...account.sourceConfig, lastImportPath: result.sourcePath || inputPath },
       });
+      this.catalog.recordBackup(account.id);
       const stats = db.getStats();
       try {
         this.auditJournal.append({
@@ -404,7 +412,10 @@ class AccountManager {
       });
       const result = (batch.results || []).find((entry) => entry.account?.id === account.id);
       if (!result) throw new Error(`No refresh result was returned for ${account.label}.`);
-      return result;
+      for (const entry of batch.results || []) {
+        if (entry?.success !== false && entry?.account?.id) this.catalog.recordBackup(entry.account.id);
+      }
+      return { ...result, account: this.getAccount(account.id) };
     }
     const db = this.getDatabase(account);
     const result = await backupParser.refreshLocal({
@@ -412,7 +423,8 @@ class AccountManager {
       sourceConfig: account.sourceConfig,
       onProgress,
     });
-    return { success: true, account, ...result, stats: db.getStats() };
+    this.catalog.recordBackup(account.id);
+    return { success: true, account: this.getAccount(account.id), ...result, stats: db.getStats() };
   }
 
   async refreshAllLocal(agentId = null, onProgress) {
@@ -435,6 +447,9 @@ class AccountManager {
           getDatabase: (account) => this.getDatabase(account),
           onProgress,
         });
+        for (const entry of batch.results || []) {
+          if (entry?.success !== false && entry?.account?.id) this.catalog.recordBackup(entry.account.id);
+        }
         results.push(...(batch.results || []));
         continue;
       }
@@ -460,35 +475,73 @@ class AccountManager {
     return { success: true, accountCount: accounts.length, results };
   }
 
-  async globalSearch(query, limit = 200) {
+  async globalSearch(query, limit = 200, sort = 'relevance', role = 'all') {
     const trimmed = String(query || '').trim();
     if (!trimmed) return { total: 0, total_is_lower_bound: false, results: [] };
+    const resultLimit = Math.max(1, Math.min(1000, Number(limit) || 200));
+    const normalizedSort = ['relevance', 'date_asc', 'date_desc'].includes(sort)
+      ? sort
+      : 'relevance';
+    const normalizedRole = ['all', 'user', 'assistant'].includes(role) ? role : 'all';
     const accounts = this.listAccounts();
     const searches = await Promise.all(accounts.map(async (account) => {
-      const output = await this.getDatabase(account).searchMessages(trimmed);
+      const output = await this.getDatabase(account).searchMessages(
+        trimmed,
+        normalizedSort,
+        resultLimit,
+        normalizedRole
+      );
       return { account, output };
     }));
     const total = searches.reduce((sum, entry) => sum + Number(entry.output.total || 0), 0);
     const results = [];
-    let index = 0;
-    while (results.length < limit) {
-      let added = false;
-      for (const { account, output } of searches) {
-        const result = output.results?.[index];
-        if (!result) continue;
-        results.push({
-          ...result,
-          account_id: account.id,
-          account_label: account.label,
-          agent_id: account.agentId,
-          agent_name: account.agentName,
-          agent_accent: account.agentAccent,
-        });
-        added = true;
-        if (results.length >= limit) break;
+    const decorate = (result, account) => ({
+      ...result,
+      account_id: account.id,
+      account_label: account.label,
+      agent_id: account.agentId,
+      agent_name: account.agentName,
+      agent_accent: account.agentAccent,
+    });
+    if (normalizedSort === 'relevance') {
+      let index = 0;
+      while (results.length < resultLimit) {
+        let added = false;
+        for (const { account, output } of searches) {
+          const result = output.results?.[index];
+          if (!result) continue;
+          results.push(decorate(result, account));
+          added = true;
+          if (results.length >= resultLimit) break;
+        }
+        if (!added) break;
+        index += 1;
       }
-      if (!added) break;
-      index += 1;
+    } else {
+      const timestamp = (value) => {
+        if (value == null || value === '') return null;
+        const numeric = Number(value);
+        if (Number.isFinite(numeric)) return numeric;
+        const parsed = Date.parse(value);
+        return Number.isNaN(parsed) ? null : parsed / 1000;
+      };
+      results.push(...searches.flatMap(({ account, output }) => (
+        (output.results || []).map((result) => decorate(result, account))
+      )));
+      results.sort((left, right) => {
+        const leftTime = timestamp(left.created_at);
+        const rightTime = timestamp(right.created_at);
+        if (leftTime == null && rightTime == null) {
+          return `${left.account_id}:${left.id}`.localeCompare(`${right.account_id}:${right.id}`);
+        }
+        if (leftTime == null) return 1;
+        if (rightTime == null) return -1;
+        if (leftTime !== rightTime) {
+          return normalizedSort === 'date_asc' ? leftTime - rightTime : rightTime - leftTime;
+        }
+        return `${left.account_id}:${left.id}`.localeCompare(`${right.account_id}:${right.id}`);
+      });
+      results.splice(resultLimit);
     }
     return {
       total,

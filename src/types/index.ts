@@ -35,6 +35,8 @@ export interface AccountStats {
   messageCount: number;
   cachedCount: number;
   latestUpdatedAt: number | null;
+  latestMessageAt: number | null;
+  lastBackupAt: string | null;
 }
 
 export interface AgentAccount {
@@ -47,6 +49,7 @@ export interface AgentAccount {
   sourceConfig: Record<string, unknown>;
   legacyMode: string | null;
   isDefault: boolean;
+  lastBackupAt: string | null;
   capabilities: AgentCapabilities;
   stats?: AccountStats;
 }
@@ -71,6 +74,7 @@ export interface GlobalSearchResult {
   conversation_title: string;
   role: string;
   content: string;
+  created_at: number | string | null;
   account_id: string;
   account_label: string;
   agent_id: string;

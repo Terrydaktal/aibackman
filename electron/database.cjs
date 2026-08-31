@@ -28,6 +28,32 @@ const DB_SEARCH_REBUILD_ROOTS = [
 const ARCHIVE_GUARD_STATES = new WeakMap();
 const DESTRUCTIVE_ARCHIVE_CAPABILITY = Symbol('destructive-archive-capability');
 
+function archiveMessageRowsEqual(existing, incoming) {
+  if (!existing) return false;
+  const sameNullableText = (left, right) => String(left ?? '') === String(right ?? '');
+  const sameTimestamp = (left, right) => {
+    if (left == null && right == null) return true;
+    const leftNumber = Number(left);
+    const rightNumber = Number(right);
+    if (Number.isFinite(leftNumber) && Number.isFinite(rightNumber)) return leftNumber === rightNumber;
+    return String(left ?? '') === String(right ?? '');
+  };
+  return String(existing.conversation_id || '') === String(incoming.conversation_id || '')
+    && String(existing.role || '') === String(incoming.role || '')
+    && String(existing.content || '') === String(incoming.content || '')
+    && sameNullableText(existing.metadata_json, incoming.metadata_json)
+    && sameTimestamp(existing.created_at, incoming.created_at)
+    && sameNullableText(existing.parent_id, incoming.parent_id);
+}
+
+function normalizeSearchSort(sort) {
+  return ['relevance', 'date_asc', 'date_desc'].includes(sort) ? sort : 'relevance';
+}
+
+function normalizeSearchRole(role) {
+  return ['all', 'user', 'assistant'].includes(role) ? role : 'all';
+}
+
 function installArchiveGuardFunctions(db) {
   const state = {
     contextWriteAllowed: false,
@@ -290,15 +316,26 @@ class DbSearchWorker {
     }
   }
 
-  search(query, limit = 100) {
+  search(query, limit = 100, sort = 'relevance', role = 'all') {
     this.ensureStarted();
     const id = this.nextRequestId++;
-    const payload = JSON.stringify({ id, command: 'search', query, limit });
+    const normalizedSort = normalizeSearchSort(sort);
+    const normalizedRole = normalizeSearchRole(role);
+    const payload = JSON.stringify({
+      id,
+      command: 'search',
+      query,
+      limit,
+      sort: normalizedSort,
+      role: normalizedRole,
+    });
     const taskId = this.diagnostics?.taskStart(`db-search-${id}`, {
       worker: 'db-search',
       request_id: id,
       query_length: String(query || '').length,
       limit,
+      sort: normalizedSort,
+      role: normalizedRole,
       database_instance_id: this.databaseInstanceId,
     }) || `db-search-${id}`;
     return new Promise((resolve, reject) => {
@@ -348,6 +385,10 @@ class ChatDatabase {
   #dbPath;
   #diagnosticResourceId = null;
   #activeOperationId = null;
+  #mutationVersion = 0;
+  #statsCache = null;
+  #statsDataVersion = null;
+  #statsMutationVersion = -1;
 
   constructor(filename = 'chatgpt.db', {
     diagnostics = null,
@@ -788,6 +829,7 @@ class ChatDatabase {
         return result;
       });
       const result = execute();
+      this.#mutationVersion += 1;
       try {
         this.auditJournal.append({
           action: 'operation-completed',
@@ -1215,12 +1257,29 @@ class ChatDatabase {
   }
 
   getStats() {
+    const dataVersion = Number(this.#db.pragma('data_version', { simple: true }) || 0);
+    if (
+      this.#statsCache
+      && this.#statsDataVersion === dataVersion
+      && this.#statsMutationVersion === this.#mutationVersion
+    ) {
+      return { ...this.#statsCache };
+    }
     const row = this.#db.prepare(`
       WITH eligible_messages AS (
         SELECT
           m.conversation_id,
           m.role,
           m.created_at,
+          CASE
+            WHEN typeof(m.created_at) IN ('integer', 'real') THEN CAST(m.created_at AS REAL)
+            WHEN m.created_at IS NULL THEN NULL
+            WHEN instr(CAST(m.created_at AS TEXT), '-') = 0
+              AND instr(CAST(m.created_at AS TEXT), 'T') = 0
+              AND instr(CAST(m.created_at AS TEXT), ':') = 0
+            THEN CAST(m.created_at AS REAL)
+            ELSE (julianday(m.created_at) - 2440587.5) * 86400.0
+          END AS created_at_unix,
           m.id,
           COALESCE(json_extract(m.metadata_json, '$.source'), '') AS source,
           COALESCE(json_extract(m.metadata_json, '$.phase'), '') AS phase
@@ -1281,6 +1340,7 @@ class ChatDatabase {
           )
         ) + (SELECT COUNT(*) FROM codex_responses) AS message_count,
         (SELECT COUNT(DISTINCT conversation_id) FROM messages) AS cached_count,
+        (SELECT MAX(created_at_unix) FROM eligible_messages) AS latest_message_at,
         (
           SELECT MAX(
             CASE
@@ -1296,12 +1356,39 @@ class ChatDatabase {
           FROM conversations
         ) AS latest_updated_at
     `).get();
-    return {
+    const stats = {
       conversationCount: Number(row?.conversation_count || 0),
       messageCount: Number(row?.message_count || 0),
       cachedCount: Number(row?.cached_count || 0),
       latestUpdatedAt: row?.latest_updated_at == null ? null : Number(row.latest_updated_at),
+      latestMessageAt: row?.latest_message_at == null ? null : Number(row.latest_message_at),
     };
+    this.#statsCache = stats;
+    this.#statsDataVersion = dataVersion;
+    this.#statsMutationVersion = this.#mutationVersion;
+    return { ...stats };
+  }
+
+  getLatestBackupAt() {
+    const operation = this.#db.prepare(`
+      SELECT occurred_at
+      FROM archive_audit_log
+      WHERE action = 'operation-completed'
+        AND operation_type IN (
+          'merge-normalized-archive',
+          'merge-conversation-snapshot',
+          'merge-conversation-index',
+          'merge-conversation-index-page',
+          'upsert-source-item'
+        )
+      ORDER BY sequence DESC
+      LIMIT 1
+    `).get();
+    if (operation?.occurred_at) return operation.occurred_at;
+    return this.#db.prepare(`
+      SELECT MAX(imported_at) AS imported_at
+      FROM source_items
+    `).get()?.imported_at || null;
   }
 
   getSourceItem(sourceKey) {
@@ -1339,11 +1426,17 @@ class ChatDatabase {
       entityId: conversation.id,
       details: { incomingMessages: incomingMessages.length, replacementRequested: !!replaceMessages },
     }, () => {
-      const existingMessageIds = new Set(this.#db.prepare(`
-        SELECT id FROM messages WHERE conversation_id = ?
-      `).all(conversation.id).map((row) => row.id));
+      const existingMessages = new Map(this.#db.prepare(`
+        SELECT id, conversation_id, role, content, metadata_json, created_at, parent_id
+        FROM messages
+        WHERE conversation_id = ?
+      `).all(conversation.id).map((row) => [row.id, row]));
+      const existingMessageIds = new Set(existingMessages.keys());
       const incomingMessageIds = new Set(incomingMessages.map((message) => message.id));
       const preservedMessageIds = [...existingMessageIds].filter((id) => !incomingMessageIds.has(id));
+      const changedMessages = incomingMessages.filter((message) => (
+        !archiveMessageRowsEqual(existingMessages.get(message.id), message)
+      ));
 
       this.upsertConversation(conversation);
       if (replaceMessages && preservedMessageIds.length > 0) {
@@ -1353,10 +1446,12 @@ class ChatDatabase {
           samplePreservedMessageIds: preservedMessageIds.slice(0, 20),
         });
       }
-      for (const message of incomingMessages) this.upsertMessage(message);
+      for (const message of changedMessages) this.upsertMessage(message);
       this.upsertConversation(conversation);
       return {
-        importedMessages: incomingMessages.length,
+        importedMessages: changedMessages.length,
+        examinedMessages: incomingMessages.length,
+        unchangedMessages: incomingMessages.length - changedMessages.length,
         preservedMessages: preservedMessageIds.length,
         replacementPrevented: !!replaceMessages && preservedMessageIds.length > 0,
       };
@@ -1535,6 +1630,10 @@ class ChatDatabase {
     });
   }
 
+  get path() {
+    return this.#dbPath;
+  }
+
   close() {
     this.searchWorker.stop();
     this.diagnostics?.resourceClose(this.#diagnosticResourceId, {
@@ -1596,31 +1695,68 @@ class ChatDatabase {
     });
   }
 
-  async searchMessages(query) {
+  async searchMessages(query, sort = 'relevance', limit = 100, role = 'all') {
     const trimmed = String(query || '').trim();
     if (!trimmed) {
       return { total: 0, results: [] };
     }
 
     try {
-      return await this.searchWorker.search(trimmed, 100);
+      return await this.searchWorker.search(
+        trimmed,
+        limit,
+        normalizeSearchSort(sort),
+        normalizeSearchRole(role)
+      );
     } catch (error) {
       console.warn('db-search helper failed, falling back to LIKE search:', error);
+      const normalizedSort = normalizeSearchSort(sort);
+      const normalizedRole = normalizeSearchRole(role);
+      const rolePredicate = normalizedRole === 'all'
+        ? "m.role IN ('user', 'assistant')"
+        : 'm.role = ?';
+      const orderBy = normalizedSort === 'date_asc'
+        ? 'created_at IS NULL, created_at ASC, id ASC'
+        : 'created_at IS NULL, created_at DESC, id ASC';
+      const matchPattern = `%${trimmed}%`;
+      const resultParams = normalizedRole === 'all'
+        ? [matchPattern, limit]
+        : [matchPattern, normalizedRole, limit];
       const results = this.#db.prepare(`
-        SELECT m.id, m.conversation_id, m.role, m.content, c.title as conversation_title
-        FROM messages m
-        JOIN conversations c ON m.conversation_id = c.id
-        WHERE m.content LIKE ?
-          AND m.role IN ('user', 'assistant')
-        ORDER BY m.created_at DESC
-        LIMIT 100
-      `).all(`%${trimmed}%`);
+        WITH matches AS (
+          SELECT
+            m.id,
+            m.conversation_id,
+            m.role,
+            m.content,
+            c.title AS conversation_title,
+            CASE
+              WHEN typeof(m.created_at) IN ('integer', 'real') THEN CAST(m.created_at AS REAL)
+              WHEN m.created_at IS NULL THEN NULL
+              WHEN instr(CAST(m.created_at AS TEXT), '-') = 0
+                AND instr(CAST(m.created_at AS TEXT), 'T') = 0
+                AND instr(CAST(m.created_at AS TEXT), ':') = 0
+              THEN CAST(m.created_at AS REAL)
+              ELSE (julianday(m.created_at) - 2440587.5) * 86400.0
+            END AS created_at
+          FROM messages m
+          JOIN conversations c ON m.conversation_id = c.id
+          WHERE m.content LIKE ?
+            AND ${rolePredicate}
+        )
+        SELECT * FROM matches
+        ORDER BY ${orderBy}
+        LIMIT ?
+      `).all(...resultParams);
+      const countParams = normalizedRole === 'all'
+        ? [matchPattern]
+        : [matchPattern, normalizedRole];
       const total = this.#db.prepare(`
         SELECT COUNT(*) as count
         FROM messages m
         WHERE m.content LIKE ?
-          AND m.role IN ('user', 'assistant')
-      `).get(`%${trimmed}%`)?.count || results.length;
+          AND ${rolePredicate}
+      `).get(...countParams)?.count || results.length;
       return { total, total_is_lower_bound: false, results };
     }
   }

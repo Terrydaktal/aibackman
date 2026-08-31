@@ -24,6 +24,7 @@ struct SearchRow {
     role: String,
     content: String,
     conversation_title: String,
+    created_at: Option<f64>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -39,6 +40,8 @@ struct ServerRequest {
     command: String,
     query: Option<String>,
     limit: Option<usize>,
+    sort: Option<String>,
+    role: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -53,6 +56,50 @@ struct ServerResponse {
 struct RankedSearchRow {
     row: SearchRow,
     score: f64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SearchSort {
+    Relevance,
+    DateAsc,
+    DateDesc,
+}
+
+impl SearchSort {
+    fn parse(value: Option<&str>) -> Result<Self, Box<dyn std::error::Error>> {
+        match value.unwrap_or("relevance") {
+            "relevance" => Ok(Self::Relevance),
+            "date_asc" => Ok(Self::DateAsc),
+            "date_desc" => Ok(Self::DateDesc),
+            other => Err(format!("unknown search sort: {other}").into()),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SearchRole {
+    All,
+    User,
+    Assistant,
+}
+
+impl SearchRole {
+    fn parse(value: Option<&str>) -> Result<Self, Box<dyn std::error::Error>> {
+        match value.unwrap_or("all") {
+            "all" => Ok(Self::All),
+            "user" => Ok(Self::User),
+            "assistant" => Ok(Self::Assistant),
+            other => Err(format!("unknown search role: {other}").into()),
+        }
+    }
+
+    fn sql_predicate(self) -> &'static str {
+        match self {
+            Self::All => "m.role IN ('user', 'assistant')",
+            Self::User => "m.role = 'user'",
+            Self::Assistant => "m.role = 'assistant'",
+        }
+    }
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -75,10 +122,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .ok()
                 .and_then(|value| value.parse::<usize>().ok())
                 .unwrap_or(100);
+            let sort = SearchSort::parse(flag_value(&args, "--sort").as_deref())?;
+            let role = SearchRole::parse(flag_value(&args, "--role").as_deref())?;
 
             let conn = Connection::open(db_path)?;
             ensure_index(&conn, false)?;
-            let output = search_messages(&conn, &query, limit)?;
+            let output = search_messages(&conn, &query, limit, sort, role)?;
             println!("{}", serde_json::to_string(&output)?);
         }
         "serve" => {
@@ -128,11 +177,18 @@ fn handle_server_request(conn: &Connection, request: ServerRequest) -> ServerRes
         };
     }
 
-    match search_messages(
-        conn,
-        request.query.as_deref().unwrap_or_default(),
-        request.limit.unwrap_or(100),
-    ) {
+    let output = SearchSort::parse(request.sort.as_deref()).and_then(|sort| {
+        SearchRole::parse(request.role.as_deref()).and_then(|role| {
+            search_messages(
+                conn,
+                request.query.as_deref().unwrap_or_default(),
+                request.limit.unwrap_or(100),
+                sort,
+                role,
+            )
+        })
+    });
+    match output {
         Ok(output) => ServerResponse {
             id: request.id,
             ok: true,
@@ -153,6 +209,12 @@ fn take_flag_value(args: &[String], flag: &str) -> Result<String, Box<dyn std::e
         .find(|window| window[0] == flag)
         .map(|window| window[1].clone())
         .ok_or_else(|| format!("missing required flag {flag}").into())
+}
+
+fn flag_value(args: &[String], flag: &str) -> Option<String> {
+    args.windows(2)
+        .find(|window| window[0] == flag)
+        .map(|window| window[1].clone())
 }
 
 fn ensure_index(conn: &Connection, rebuild: bool) -> Result<(), Box<dyn std::error::Error>> {
@@ -181,6 +243,8 @@ fn search_messages(
     conn: &Connection,
     query: &str,
     limit: usize,
+    sort: SearchSort,
+    role: SearchRole,
 ) -> Result<SearchOutput, Box<dyn std::error::Error>> {
     let search_query = SearchQuery::new(query);
     if search_query.is_empty() {
@@ -191,18 +255,42 @@ fn search_messages(
         });
     }
 
-    if is_fts_only_query(&search_query, query) {
-        let match_query = prepare_fts_query(&search_query, SearchMode::Prefix).match_query;
-        let preview_limit = limit.min(SHORT_QUERY_PREVIEW_LIMIT).max(1) as i64;
+    if sort != SearchSort::Relevance {
+        let prepared = prepare_fts_query(&search_query, SearchMode::Prefix);
+        let output_limit = limit.max(1);
         let (total, total_is_lower_bound) = if is_short_preview_query(query) {
-            lower_bound_search_count(conn, &match_query, preview_limit as usize)?
+            lower_bound_search_count(conn, &prepared.match_query, output_limit, role)?
         } else {
-            count_search_rows(conn, &match_query)?
+            count_search_rows(conn, &prepared.match_query, role)?
         };
         return Ok(SearchOutput {
             total,
             total_is_lower_bound,
-            results: fetch_search_rows(conn, &match_query, preview_limit)?
+            results: fetch_search_rows(
+                conn,
+                &prepared.match_query,
+                output_limit as i64,
+                sort,
+                role,
+            )?
+            .into_iter()
+            .map(|item| item.row)
+            .collect(),
+        });
+    }
+
+    if is_fts_only_query(&search_query, query) {
+        let match_query = prepare_fts_query(&search_query, SearchMode::Prefix).match_query;
+        let preview_limit = limit.min(SHORT_QUERY_PREVIEW_LIMIT).max(1) as i64;
+        let (total, total_is_lower_bound) = if is_short_preview_query(query) {
+            lower_bound_search_count(conn, &match_query, preview_limit as usize, role)?
+        } else {
+            count_search_rows(conn, &match_query, role)?
+        };
+        return Ok(SearchOutput {
+            total,
+            total_is_lower_bound,
+            results: fetch_search_rows(conn, &match_query, preview_limit, sort, role)?
                 .into_iter()
                 .map(|item| item.row)
                 .collect(),
@@ -210,13 +298,13 @@ fn search_messages(
     }
 
     let strict = prepare_fts_query(&search_query, SearchMode::Prefix);
-    let (total, total_is_lower_bound) = count_search_rows(conn, &strict.match_query)?;
+    let (total, total_is_lower_bound) = count_search_rows(conn, &strict.match_query, role)?;
     let output_limit = limit.min(RANKED_RESULT_LIMIT).max(1);
     let strict_fetch_limit = ranked_fetch_limit(output_limit, total) as i64;
 
     let mut raw_rows = Vec::new();
     let mut seen_ids = HashSet::new();
-    for item in fetch_search_rows(conn, &strict.match_query, strict_fetch_limit)? {
+    for item in fetch_search_rows(conn, &strict.match_query, strict_fetch_limit, sort, role)? {
         if seen_ids.insert(item.row.id.clone()) {
             raw_rows.push(item);
         }
@@ -314,16 +402,34 @@ fn fetch_search_rows(
     conn: &Connection,
     match_query: &str,
     fetch_limit: i64,
+    sort: SearchSort,
+    role: SearchRole,
 ) -> Result<Vec<RankedSearchRow>, Box<dyn std::error::Error>> {
+    let order = match sort {
+        SearchSort::Relevance => "rank, relevance_score DESC",
+        SearchSort::DateAsc => "created_at_score IS NULL, created_at_score ASC, m.id ASC",
+        SearchSort::DateDesc => "created_at_score IS NULL, created_at_score DESC, m.id ASC",
+    };
     let sql = format!(
-        "SELECT m.id, m.conversation_id, m.role, m.content, c.title AS conversation_title, CAST(m.created_at AS REAL) AS created_at_score
+        "SELECT m.id, m.conversation_id, m.role, m.content, c.title AS conversation_title,
+                CAST(m.created_at AS REAL) AS relevance_score,
+                CASE
+                  WHEN typeof(m.created_at) IN ('integer', 'real') THEN CAST(m.created_at AS REAL)
+                  WHEN m.created_at IS NULL THEN NULL
+                  WHEN instr(CAST(m.created_at AS TEXT), '-') = 0
+                    AND instr(CAST(m.created_at AS TEXT), 'T') = 0
+                    AND instr(CAST(m.created_at AS TEXT), ':') = 0
+                  THEN CAST(m.created_at AS REAL)
+                  ELSE (julianday(m.created_at) - 2440587.5) * 86400.0
+                END AS created_at_score
          FROM messages_fts
          JOIN messages m ON messages_fts.rowid = m.rowid
          JOIN conversations c ON c.id = m.conversation_id
          WHERE messages_fts MATCH ?1
-           AND m.role IN ('user', 'assistant')
-         ORDER BY rank, created_at_score DESC
-         LIMIT ?2"
+           AND {role_predicate}
+         ORDER BY {order}
+         LIMIT ?2",
+        role_predicate = role.sql_predicate()
     );
 
     let mut stmt = conn.prepare(&sql)?;
@@ -334,6 +440,7 @@ fn fetch_search_rows(
             role: sql_row.get(2)?,
             content: sql_row.get(3)?,
             conversation_title: sql_row.get::<_, Option<String>>(4)?.unwrap_or_default(),
+            created_at: sql_row.get(6)?,
         };
         Ok(RankedSearchRow {
             score: sql_row.get::<_, Option<f64>>(5)?.unwrap_or_default(),
@@ -347,13 +454,17 @@ fn fetch_search_rows(
 fn count_search_rows(
     conn: &Connection,
     match_query: &str,
+    role: SearchRole,
 ) -> Result<(usize, bool), Box<dyn std::error::Error>> {
-    let sql = "SELECT COUNT(*)
+    let sql = format!(
+        "SELECT COUNT(*)
          FROM messages_fts
          JOIN messages m ON messages_fts.rowid = m.rowid
          WHERE messages_fts MATCH ?1
-           AND m.role IN ('user', 'assistant')";
-    let count = conn.query_row(sql, params![match_query], |row| row.get::<_, i64>(0))?;
+           AND {}",
+        role.sql_predicate()
+    );
+    let count = conn.query_row(&sql, params![match_query], |row| row.get::<_, i64>(0))?;
     Ok((count.max(0) as usize, false))
 }
 
@@ -361,16 +472,20 @@ fn lower_bound_search_count(
     conn: &Connection,
     match_query: &str,
     lower_bound: usize,
+    role: SearchRole,
 ) -> Result<(usize, bool), Box<dyn std::error::Error>> {
-    let sql = "SELECT 1
+    let sql = format!(
+        "SELECT 1
          FROM messages_fts
          JOIN messages m ON messages_fts.rowid = m.rowid
          WHERE messages_fts MATCH ?1
-           AND m.role IN ('user', 'assistant')
-         LIMIT ?2";
+           AND {}
+         LIMIT ?2",
+        role.sql_predicate()
+    );
     let probe_limit = (lower_bound + 1) as i64;
     let count = conn
-        .prepare(sql)?
+        .prepare(&sql)?
         .query_map(params![match_query, probe_limit], |_| Ok(()))?
         .count();
     Ok((count.min(lower_bound), count > lower_bound))

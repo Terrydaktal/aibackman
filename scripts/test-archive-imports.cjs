@@ -169,6 +169,60 @@ async function main() {
     ), true);
     const search = await chatgptDb.searchMessages('beta');
     assert.equal(search.total, 1);
+    assert.equal(search.results[0].created_at, 102);
+
+    const searchOrderDb = createDatabase(root, 'search-order');
+    databases.push(searchOrderDb);
+    for (const [suffix, createdAt, role] of [
+      ['middle', 200, 'assistant'],
+      ['newest', 300, 'user'],
+      ['oldest', 100, 'user'],
+    ]) {
+      searchOrderDb.importConversationSnapshot(
+        {
+          id: `search-${suffix}`,
+          title: `Search ${suffix}`,
+          created_at: createdAt,
+          updated_at: createdAt,
+          last_synced_updated_at: createdAt,
+          current_node_id: `search-message-${suffix}`,
+        },
+        [{
+          id: `search-message-${suffix}`,
+          conversation_id: `search-${suffix}`,
+          role,
+          content: 'chronologyneedle',
+          created_at: createdAt,
+          parent_id: null,
+        }]
+      );
+    }
+    const oldestSearch = await searchOrderDb.searchMessages('chronologyneedle', 'date_asc');
+    assert.deepEqual(oldestSearch.results.map((result) => result.id), [
+      'search-message-oldest',
+      'search-message-middle',
+      'search-message-newest',
+    ]);
+    const newestSearch = await searchOrderDb.searchMessages('chronologyneedle', 'date_desc');
+    assert.deepEqual(newestSearch.results.map((result) => result.id), [
+      'search-message-newest',
+      'search-message-middle',
+      'search-message-oldest',
+    ]);
+    const userSearch = await searchOrderDb.searchMessages('chronologyneedle', 'date_asc', 100, 'user');
+    assert.equal(userSearch.total, 2);
+    assert.deepEqual(userSearch.results.map((result) => result.id), [
+      'search-message-oldest',
+      'search-message-newest',
+    ]);
+    const assistantSearch = await searchOrderDb.searchMessages(
+      'chronologyneedle',
+      'date_asc',
+      100,
+      'assistant'
+    );
+    assert.equal(assistantSearch.total, 1);
+    assert.deepEqual(assistantSearch.results.map((result) => result.id), ['search-message-middle']);
 
     const cacheDiagnosticsDb = createDatabase(root, 'cache-diagnostics');
     databases.push(cacheDiagnosticsDb);
@@ -615,6 +669,23 @@ async function main() {
       { timestamp: '2026-02-02T00:00:01Z', type: 'event_msg', payload: { type: 'user_message', message: 'unattributed question' } },
       { timestamp: '2026-02-02T00:00:02Z', type: 'event_msg', payload: { type: 'agent_message', message: 'unattributed answer', phase: 'final' } },
     ].map((entry) => JSON.stringify(entry)).join('\n'));
+    const codexSubagentPath = path.join(sessionsRoot, 'rollout-subagent.jsonl');
+    fs.writeFileSync(codexSubagentPath, [
+      {
+        timestamp: '2026-02-03T00:00:00Z',
+        type: 'session_meta',
+        payload: {
+          id: 'codex-subagent-session',
+          session_id: 'codex-session',
+          parent_thread_id: 'codex-session',
+          thread_source: 'subagent',
+          cwd: '/tmp/project',
+        },
+      },
+      { timestamp: '2026-02-03T00:00:01Z', type: 'event_msg', account_id: 'account-one', payload: { type: 'user_message', message: 'subagent task' } },
+      { timestamp: '2026-02-03T00:00:02Z', type: 'session_meta', payload: { id: 'codex-session', cwd: '/tmp/project' } },
+      { timestamp: '2026-02-03T00:00:03Z', type: 'event_msg', payload: { type: 'agent_message', message: 'subagent result', phase: 'final' } },
+    ].map((entry) => JSON.stringify(entry)).join('\n'));
     const codexDb = createDatabase(root, 'codex');
     databases.push(codexDb);
     const codexResult = await codex.refreshLocal({
@@ -623,6 +694,8 @@ async function main() {
     });
     assert.equal(codexResult.importedConversations, 1);
     assert.equal(codexDb.getStats().messageCount, 2);
+    assert.equal(codexDb.getConversation('codex-subagent-session'), undefined);
+    assert.equal(JSON.parse(codexDb.getSourceItem(`codex:${codexSubagentPath}`).metadata_json).isSubagent, true);
     assert.equal(JSON.parse(codexDb.getMessages('codex-session')[1].metadata_json).model, 'gpt-5.2-codex');
     assert.equal(JSON.parse(codexDb.getMessages('codex-session')[1].metadata_json).thinking_effort, 'high');
     const staleCodexDb = createDatabase(root, 'codex-stale');
@@ -644,7 +717,22 @@ async function main() {
       db: codexDb,
       sourceConfig: { sessionsRoot, remoteAccountId: 'account-one' },
     });
-    assert.equal(repeatedCodexResult.skippedFiles, 2);
+    assert.equal(repeatedCodexResult.skippedFiles, 3);
+    const originalCodexMessageId = codexDb.getMessages('codex-session')[0].id;
+    fs.appendFileSync(codexSessionPath, `\n${JSON.stringify({
+      timestamp: '2026-02-01T00:00:06Z',
+      type: 'event_msg',
+      payload: { type: 'user_message', message: 'codex follow-up' },
+    })}`);
+    const appendedCodexResult = await codex.refreshLocal({
+      db: codexDb,
+      sourceConfig: { sessionsRoot, remoteAccountId: 'account-one' },
+    });
+    assert.equal(appendedCodexResult.importedConversations, 1);
+    assert.equal(appendedCodexResult.importedMessages, 1);
+    assert.equal(codexDb.getMessages('codex-session').length, 4);
+    assert.equal(codexDb.getRecoveryRecords('message-revision', originalCodexMessageId).length, 0);
+    assert.equal(codexDb.getStats().latestMessageAt, Date.parse('2026-02-01T00:00:06Z') / 1000);
 
     const antigravityRoot = path.join(root, 'antigravity');
     const conversationId = 'antigravity-conversation';
@@ -679,6 +767,7 @@ async function main() {
       sourceKind: 'backup',
     });
     await accountManager.importBackup(managedBackup.id, chatgptExport);
+    assert.ok(accountManager.getAccount(managedBackup.id).lastBackupAt);
     const managedCodex = accountManager.createAccount({
       agentId: 'codex',
       label: 'Managed Codex sessions',
@@ -695,11 +784,67 @@ async function main() {
     assert.equal(refreshAll.accountCount, 2);
     assert.equal(accountManager.getDatabase(managedCodex).getStats().conversationCount, 1);
     assert.equal(accountManager.getDatabase(managedUnattributed).getStats().conversationCount, 1);
+    assert.ok(accountManager.getAccount(managedCodex.id).lastBackupAt);
+    const managedCodexOverview = accountManager.getArchiveOverview().agents
+      .flatMap((agent) => agent.accounts)
+      .find((account) => account.id === managedCodex.id);
+    assert.ok(managedCodexOverview.stats.latestMessageAt);
+    assert.ok(managedCodexOverview.stats.lastBackupAt);
     const repeatedRefreshAll = await accountManager.refreshAllLocal('codex');
     assert.equal(repeatedRefreshAll.results.reduce((sum, result) => sum + result.importedConversations, 0), 0);
     const globalSearch = await accountManager.globalSearch('beta');
     assert.equal(globalSearch.total, 1);
     assert.equal(globalSearch.results[0].account_id, managedBackup.id);
+    const managedSearchDb = accountManager.getDatabase(managedBackup);
+    for (const [suffix, createdAt, role] of [
+      ['oldest', 50, 'user'],
+      ['newest', 500, 'assistant'],
+    ]) {
+      managedSearchDb.importConversationSnapshot(
+        {
+          id: `managed-search-${suffix}`,
+          title: `Managed search ${suffix}`,
+          created_at: createdAt,
+          updated_at: createdAt,
+          last_synced_updated_at: createdAt,
+          current_node_id: `managed-search-message-${suffix}`,
+        },
+        [{
+          id: `managed-search-message-${suffix}`,
+          conversation_id: `managed-search-${suffix}`,
+          role,
+          content: 'globalchronologyneedle',
+          created_at: createdAt,
+          parent_id: null,
+        }]
+      );
+    }
+    const globalOldestSearch = await accountManager.globalSearch('globalchronologyneedle', 200, 'date_asc');
+    assert.deepEqual(globalOldestSearch.results.map((result) => result.id), [
+      'managed-search-message-oldest',
+      'managed-search-message-newest',
+    ]);
+    const globalNewestSearch = await accountManager.globalSearch('globalchronologyneedle', 200, 'date_desc');
+    assert.deepEqual(globalNewestSearch.results.map((result) => result.id), [
+      'managed-search-message-newest',
+      'managed-search-message-oldest',
+    ]);
+    const globalUserSearch = await accountManager.globalSearch(
+      'globalchronologyneedle',
+      200,
+      'date_desc',
+      'user'
+    );
+    assert.equal(globalUserSearch.total, 1);
+    assert.deepEqual(globalUserSearch.results.map((result) => result.id), ['managed-search-message-oldest']);
+    const globalAssistantSearch = await accountManager.globalSearch(
+      'globalchronologyneedle',
+      200,
+      'date_desc',
+      'assistant'
+    );
+    assert.equal(globalAssistantSearch.total, 1);
+    assert.deepEqual(globalAssistantSearch.results.map((result) => result.id), ['managed-search-message-newest']);
     const repeatedManagedImport = await accountManager.importBackup(managedBackup.id, chatgptExport);
     assert.ok(repeatedManagedImport.preImportSnapshotPath);
     assert.equal(fs.existsSync(repeatedManagedImport.preImportSnapshotPath), true);

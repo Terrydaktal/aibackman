@@ -35,7 +35,7 @@ function registerArchiveIpc({
   ipcMain.handle('archive:getOverview', async () => accountManager.getArchiveOverview());
 
   ipcMain.handle('archive:globalSearch', async (_event, payload) => (
-    accountManager.globalSearch(payload?.query, Number(payload?.limit || 200))
+    accountManager.globalSearch(payload?.query, Number(payload?.limit || 200), payload?.sort, payload?.role)
   ));
 
   ipcMain.handle('archive:createAccount', async (_event, payload) => (

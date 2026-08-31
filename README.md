@@ -32,6 +32,10 @@ Backup accounts are read-only in the viewer. Multiple backups from the same prov
 │   ├── agents/
 │   │   ├── registry.cjs      # Compatibility entry point to provider registry
 │   │   ├── utils.cjs         # Safe ZIP/materialization and adapter helpers
+│   │   ├── codex.cjs         # Codex account routing and normalized local import
+│   │   ├── codex-session-parser.cjs # Streaming rollout parser
+│   │   ├── codex-session-worker.cjs # Off-main-thread JSONL parsing
+│   │   ├── codex-refresh-worker.cjs # Off-main-thread archive refresh and writes
 │   │   ├── firefox-indexeddb.cjs # Firefox structured-clone IndexedDB decoder
 │   │   └── google-accounts.cjs   # Shared Google local-account discovery
 │   ├── archive/
@@ -213,14 +217,25 @@ errors after each local refresh. A local provider such as Antigravity has no
 provider email to discover, so its default label is `Local Antigravity` and
 can be renamed manually.
 
+The complete Codex refresh—including JSONL parsing and SQLite archive writes—runs
+outside Electron's main process, so a large first import cannot freeze the UI.
+Subagent rollout files are fingerprinted and recorded as processed but are not
+rendered as separate user chats or replayed into their parent conversation. The
+archive writer compares normalized message rows before issuing SQLite updates,
+keeping unchanged history out of the revision and audit triggers. Every account
+card shows the newest archived message time and the last successful import,
+local refresh, or live archive write.
+
 Codex reads all system sessions and routes them by the account IDs found in session events. Sessions without an account ID are kept in the `Local sessions (unattributed)` account.
 
 ### Global search
 
 1. Search from the home page.
 2. The account manager queries all account databases concurrently.
-3. Results include provider, account, chat, role, and message identity.
-4. Selecting a result opens the correct account, chat, message, and highlight query.
+3. Results include provider, account, chat, role, message timestamp, and message identity.
+4. Results can show all messages, user messages only, or assistant messages only.
+5. Relevance is the default order; results can also be ordered by message date, oldest or newest first.
+6. Selecting a result opens the correct account, chat, message, and highlight query.
 
 ### Live synchronization
 

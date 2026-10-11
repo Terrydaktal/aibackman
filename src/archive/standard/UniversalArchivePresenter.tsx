@@ -510,8 +510,8 @@ const formatThinkingEffortLabel = (value: string): string => {
   return normalized === 'max' || normalized === 'maximum' ? 'xhigh' : value.trim();
 };
 
-const MODEL_EFFORT_AGENT_LABELS = new Set(['Codex CLI', 'Antigravity CLI', 'Grok', 'Gemini', 'Gemini CLI', 'Claude', 'DeepSeek']);
-const MODEL_EFFORT_SOURCES = new Set(['codex-local', 'antigravity-local', 'grok-export', 'gemini-web-export', 'gemini-cli-local', 'claude-export', 'deepseek-export']);
+const MODEL_EFFORT_AGENT_LABELS = new Set(['Codex CLI', 'Antigravity CLI', 'Pi CLI', 'Grok', 'Gemini', 'Gemini CLI', 'Claude', 'DeepSeek']);
+const MODEL_EFFORT_SOURCES = new Set(['codex-local', 'antigravity-local', 'pi-local', 'grok-export', 'gemini-web-export', 'gemini-cli-local', 'claude-export', 'deepseek-export']);
 
 const getMetadataText = (value: unknown): string => {
   if (typeof value === 'string') return value.trim();

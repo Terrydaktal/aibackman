@@ -1,4 +1,4 @@
-const SESSION_AGENT_IDS = new Set(['gemini-cli', 'codex', 'antigravity']);
+const SESSION_AGENT_IDS = new Set(['gemini-cli', 'codex', 'antigravity', 'pi']);
 
 export function archiveItemLabel(agentId: string, plural = false) {
   const isSessionAgent = SESSION_AGENT_IDS.has(String(agentId || ''));

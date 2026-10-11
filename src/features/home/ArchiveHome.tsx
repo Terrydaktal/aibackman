@@ -53,10 +53,14 @@ const summarizeRefresh = (label: string, result: unknown, itemLabel: string) => 
   const importedMessages = rows.reduce((sum, row) => sum + readNumber(row, 'importedMessages'), 0);
   const skippedFiles = rows.reduce((sum, row) => sum + readNumber(row, 'skippedFiles'), 0);
   const parseErrors = rows.reduce((sum, row) => sum + readNumber(row, 'parseErrors'), 0);
+  const failedFiles = rows.reduce((sum, row) => sum + readNumber(row, 'failedFiles'), 0);
+  const unsupportedFiles = rows.reduce((sum, row) => sum + readNumber(row, 'unsupportedFiles'), 0);
+  const unreadableDirectories = rows.reduce((sum, row) => sum + readNumber(row, 'unreadableDirectories'), 0);
+  const issues = `${parseErrors ? `; ${formatCount(parseErrors)} parse errors` : ''}${failedFiles ? `; ${formatCount(failedFiles)} files need another refresh` : ''}${unsupportedFiles ? `; ${formatCount(unsupportedFiles)} unsupported files` : ''}${unreadableDirectories ? `; ${formatCount(unreadableDirectories)} folders could not be read` : ''}`;
   if (importedConversations || importedMessages) {
-    return `${label}: imported ${formatCount(importedConversations)} ${itemLabel} and ${formatCount(importedMessages)} messages${skippedFiles ? `; skipped ${formatCount(skippedFiles)} unchanged files` : ''}${parseErrors ? `; ${formatCount(parseErrors)} parse errors` : ''}.`;
+    return `${label}: imported ${formatCount(importedConversations)} ${itemLabel} and ${formatCount(importedMessages)} messages${skippedFiles ? `; skipped ${formatCount(skippedFiles)} unchanged files` : ''}${issues}.`;
   }
-  return `${label}: no changes found${skippedFiles ? `; ${formatCount(skippedFiles)} files were unchanged` : ''}${parseErrors ? `; ${formatCount(parseErrors)} parse errors` : ''}.`;
+  return `${label}: ${issues ? 'no sessions imported' : 'no changes found'}${skippedFiles ? `; ${formatCount(skippedFiles)} files were unchanged` : ''}${issues}.`;
 };
 
 export function ArchiveHome({ onOpenAccount }: ArchiveHomeProps) {

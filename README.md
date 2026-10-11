@@ -17,6 +17,7 @@ The existing live ChatGPT and Google AI Mode bridges remain available for their 
 | ChatHub | No | ChatHub Chromium or Firefox browser profile / IndexedDB directory | No |
 | Codex | No | No | `~/.codex/sessions/**/*.jsonl`, separated by discovered account |
 | Antigravity | No | No | `~/.gemini/antigravity-cli` transcripts |
+| Pi CLI | No | Pi JSONL file, `.pi` directory, or project folder | Project `.pi/sessions`, `~/.pi/sessions`, and `~/.pi/agent/sessions` |
 | Gemini CLI | No | No | `~/.gemini/tmp` session files |
 
 Backup accounts are read-only in the viewer. Multiple backups from the same provider can coexist. Reimporting always merges into that account: a missing conversation or message is never interpreted as a deletion. Local providers fingerprint source files and skip unchanged sessions.
@@ -36,6 +37,9 @@ Backup accounts are read-only in the viewer. Multiple backups from the same prov
 │   │   ├── codex-session-parser.cjs # Streaming rollout parser
 │   │   ├── codex-session-worker.cjs # Off-main-thread JSONL parsing
 │   │   ├── codex-refresh-worker.cjs # Off-main-thread archive refresh and writes
+│   │   ├── pi.cjs            # Pi provider, directory discovery, incremental merge
+│   │   ├── pi-session-parser.cjs # Pi JSONL v1-v3 -> standard messages and branches
+│   │   ├── pi-refresh-worker.cjs # Pi discovery, parsing, and archive writes off the UI thread
 │   │   ├── firefox-indexeddb.cjs # Firefox structured-clone IndexedDB decoder
 │   │   └── google-accounts.cjs   # Shared Google local-account discovery
 │   ├── archive/
@@ -88,6 +92,7 @@ Backup accounts are read-only in the viewer. Multiple backups from the same prov
 │   └── index.css
 ├── scripts/
 │   ├── test-archive-imports.cjs       # Provider/account regression suite
+│   ├── test-pi-backups.cjs            # Pi discovery/import/merge checks with synthetic sessions
 │   ├── test-archive-safety.cjs        # Deletion/overwrite/recovery suite
 │   ├── test-diagnostics.cjs           # Fault injection, bounds, privacy, and shutdown
 │   ├── test-debuggability-performance.cjs # Optional/always-on overhead gates
@@ -230,6 +235,26 @@ local refresh, or live archive write.
 
 Codex reads all system sessions and routes them by the account IDs found in session events. Sessions without an account ID are kept in the `Local sessions (unattributed)` account.
 
+Pi CLI has a `Local Pi sessions` card. Select `Refresh local` to discover and
+back up sessions from `.pi` folders anywhere under your home directory, including
+`tasks` and `Dev`. It supports project `.pi/sessions`, `~/.pi/sessions`, and the
+standard `~/.pi/agent/sessions` layout. Discovery inspects directory names only;
+the importer reads session JSONL when you request a refresh. It does not read
+Pi authentication or configuration files. Hidden directories other than `.pi`,
+dependency/build directories, and symlinks are excluded from automatic scanning.
+Use `Import backup` to select a session file, `sessions` directory, `.pi` directory,
+or project folder explicitly, including a location outside the home directory.
+
+Pi sessions use the same SQLite archive, search, viewer, and Markdown export as
+other providers. The parser retains branches, original messages preceding
+compaction, tool output, and recorded model/thinking levels. It never rewrites
+Pi's source files. Refresh runs in a worker, skips unchanged files using file
+metadata, merges new entries, and retries incomplete or changing files on the
+next refresh. Older copies cannot rewind a newer archived conversation, and
+missing source files do not remove archived messages. Refresh reports skipped,
+failed, and unsupported files without printing chat contents. Startup creates
+the card without scanning or importing transcripts.
+
 ### Global search
 
 1. Search from the home page.
@@ -259,6 +284,7 @@ chats. The same GUI can be started directly with `npm run aibackdiff`.
 - `npm run build`: TypeScript check plus production renderer build into `dist/`.
 - `npm run lint`: run ESLint, including strict React hooks/compiler checks.
 - `npm run test:archive`: test all backup/local adapters, account refresh, cross-account search, destructive-write guards, audit records, snapshots, and restoration under Electron's native Node ABI.
+- `npm run test:pi`: test Pi directory discovery, JSONL versions and branches, incremental merge, worker refresh, and account integration using synthetic sessions only.
 - `npm run test:archive:safety`: run only the destructive-write, audit, snapshot, and recovery regression suite.
 - `npm run test:diagnostics`: test diagnostic mode bounds, redaction, build identity, supervisor control, and shutdown.
 - `npm run test:debuggability:performance`: enforce disabled/activated diagnostic and always-on audit budgets.

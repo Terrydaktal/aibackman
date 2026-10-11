@@ -126,11 +126,11 @@ function registerArchiveIpc({
 
   ipcMain.handle('archive:chooseBackupPath', async () => {
     const result = await dialog.showOpenDialog(getMainWindow(), {
-      title: 'Select an official AI backup',
+      title: 'Select an AI backup or local session folder',
       defaultPath: path.join(app.getPath('home'), 'Desktop', 'backups'),
       properties: ['openFile', 'openDirectory'],
       filters: [
-        { name: 'AI backup files', extensions: ['json', 'zip'] },
+        { name: 'AI backup files', extensions: ['json', 'jsonl', 'zip'] },
         { name: 'All files', extensions: ['*'] },
       ],
     });

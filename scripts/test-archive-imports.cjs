@@ -557,7 +557,7 @@ async function main() {
     assert.match(grokDb.getMessages('grok-conversation').at(-1).content, /archive-asset:\/\//);
     assert.equal(JSON.parse(grokDb.getMessages('grok-conversation').at(-1).metadata_json).thinking_effort, 'high');
     assert.deepEqual(listAgentPlugins().filter((plugin) => ['claude', 'deepseek', 'grok'].includes(plugin.id)).map((plugin) => plugin.name), ['Claude', 'DeepSeek', 'Grok']);
-    const expectedProviderIds = ['chatgpt', 'google-ai-mode', 'gemini', 'gemini-cli', 'codex', 'antigravity', 'claude', 'deepseek', 'grok', 'chathub'];
+    const expectedProviderIds = ['chatgpt', 'google-ai-mode', 'gemini', 'gemini-cli', 'codex', 'antigravity', 'pi', 'claude', 'deepseek', 'grok', 'chathub'];
     for (const providerId of expectedProviderIds) {
       const plugin = listAgentPlugins().find((candidate) => candidate.id === providerId);
       assert.ok(plugin, `missing provider plugin: ${providerId}`);

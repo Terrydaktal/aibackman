@@ -7,6 +7,7 @@ const providerDefinitions = [
   ['gemini-cli', require('../agents/gemini-cli.cjs'), require('./backup-parsers/gemini-cli.cjs'), require('./scrapers/gemini-cli.cjs')],
   ['codex', require('../agents/codex.cjs'), require('./backup-parsers/codex.cjs'), require('./scrapers/codex.cjs')],
   ['antigravity', require('../agents/antigravity.cjs'), require('./backup-parsers/antigravity.cjs'), require('./scrapers/antigravity.cjs')],
+  ['pi', require('../agents/pi.cjs'), require('./backup-parsers/pi.cjs'), require('./scrapers/pi.cjs')],
   ['claude', require('../agents/claude.cjs'), require('./backup-parsers/claude.cjs'), require('./scrapers/claude.cjs')],
   ['deepseek', require('../agents/deepseek.cjs'), require('./backup-parsers/deepseek.cjs'), require('./scrapers/deepseek.cjs')],
   ['grok', require('../agents/grok.cjs'), require('./backup-parsers/grok.cjs'), require('./scrapers/grok.cjs')],

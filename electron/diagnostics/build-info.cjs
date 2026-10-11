@@ -37,7 +37,7 @@ function listFiles(root, relative = '') {
   for (const entry of entries) {
     if (entry.name === '.git' || entry.name === 'node_modules' || entry.name === 'dist') continue;
     const child = path.join(relative, entry.name);
-    if (entry.isDirectory()) result.push(...listFiles(root, child));
+    if (entry.isDirectory() && (!relative ? ['electron', 'src', 'scripts', 'public'].includes(entry.name) : true)) result.push(...listFiles(root, child));
     else if (entry.isFile()) result.push(child);
   }
   return result;
@@ -50,13 +50,14 @@ function sourceDigest(root) {
       file.startsWith('electron/')
       || file.startsWith('src/')
       || file.startsWith('scripts/')
-      || /^(package\.json|package-lock\.json|vite\.config\.[cm]?[jt]s|tsconfig.*\.json)$/.test(file)
+      || file.startsWith('public/')
+      || /^(index\.html|package\.json|package-lock\.json|vite\.config\.[cm]?[jt]s|tsconfig.*\.json)$/.test(file)
     ))
     .sort();
   for (const file of files) {
     hash.update(file);
     hash.update('\0');
-    hash.update(readText(path.join(root, file)));
+    hash.update(fs.readFileSync(path.join(root, file)));
     hash.update('\0');
   }
   return { digest: hash.digest('hex'), files };
@@ -71,7 +72,7 @@ function artifactDigest(root) {
     for (const entry of fs.readdirSync(current, { withFileTypes: true })) {
       const child = path.join(relative, entry.name);
       if (entry.isDirectory()) visit(child);
-      else if (entry.isFile() && entry.name !== 'build-info.json') files.push(child);
+      else if (entry.isFile() && !['build-info.json', 'launch-cache.json'].includes(entry.name) && !entry.name.startsWith('launch-cache.json.')) files.push(child);
     }
   };
   visit();
@@ -90,8 +91,9 @@ function createBuildInfo({ root = path.resolve(__dirname, '../..'), mode = 'rele
   const pkg = JSON.parse(readText(path.join(root, 'package.json')) || '{}');
   const source = sourceDigest(root);
   const revision = gitValue(root, ['rev-parse', 'HEAD']) || 'unavailable';
-  const diffDigest = gitValue(root, ['diff', '--binary', 'HEAD'])
-    ? crypto.createHash('sha256').update(gitValue(root, ['diff', '--binary', 'HEAD'])).digest('hex')
+  const diff = gitValue(root, ['diff', '--binary', 'HEAD']);
+  const diffDigest = diff
+    ? crypto.createHash('sha256').update(diff).digest('hex')
     : '';
   const dirty = Boolean(gitValue(root, ['status', '--porcelain']));
   const canonical = JSON.stringify({

@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Resolve the installed symlink so launching works from any directory.
+launcher_path="$(readlink -f -- "${BASH_SOURCE[0]}")"
+project_dir="$(dirname -- "$(dirname -- "$launcher_path")")"
+cd -- "$project_dir"
+
+export ELECTRON_OZONE_PLATFORM_HINT="${ELECTRON_OZONE_PLATFORM_HINT:-wayland}"
+export AIBACKMAN_BRIDGE_VISIBLE="${AIBACKMAN_BRIDGE_VISIBLE:-0}"
+
+node scripts/ensure-release.cjs
+export NODE_ENV=production
+exec node_modules/.bin/electron . "$@"

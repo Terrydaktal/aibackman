@@ -94,6 +94,10 @@ Backup accounts are read-only in the viewer. Multiple backups from the same prov
 │   ├── types/                # Renderer and IPC contracts
 │   └── index.css
 ├── scripts/
+│   ├── aibackman                     # Linux launcher installed as a symlink in ~/.local/bin
+│   ├── ensure-release.cjs             # Verify build/dependencies; reuse or rebuild release
+│   ├── build-search.cjs               # Prepare the native search helper before launch
+│   ├── test-release-cache.cjs          # Source/artifact/dependency invalidation and launcher
 │   ├── test-archive-imports.cjs       # Provider/account regression suite
 │   ├── test-pi-backups.cjs            # Pi discovery/import/merge checks with synthetic sessions
 │   ├── test-archive-safety.cjs        # Deletion/overwrite/recovery suite
@@ -282,6 +286,7 @@ chats. The same GUI can be started directly with `npm run aibackdiff`.
 
 ## Commands
 
+- `aibackman`: verify and launch the production application from any directory, reusing an unchanged release build.
 - `npm install`: install JavaScript and Electron dependencies.
 - `npm run electron:dev`: start Vite and the Electron application in development mode.
 - `npm run build`: TypeScript check plus production renderer build into `dist/`.
@@ -304,6 +309,16 @@ chats. The same GUI can be started directly with `npm run aibackdiff`.
 - `npm run aimode:reconcile-takeout -- DATABASE TAKEOUT`: diagnose and optionally reconcile an AI Mode database from Takeout.
 - `npm run electron:release`: build and start the production application.
 - `npm run preview`: serve the built renderer locally.
+
+To install the launcher, run the following from the project root (the destination must be unused):
+
+```bash
+chmod +x scripts/aibackman
+mkdir -p "$HOME/.local/bin"
+ln -s "$PWD/scripts/aibackman" "$HOME/.local/bin/aibackman"
+```
+
+Ensure `~/.local/bin` is on your shell's `PATH`. The launcher resolves its symlink to locate the project. `scripts/ensure-release.cjs` verifies the source, installed dependency identity, build mode, and compiled artifacts against `dist/build-info.json` and `dist/launch-cache.json`. It rebuilds when verification fails and otherwise starts Electron directly. The optional native search helper is prepared before launch, not on the first search. The launcher defaults to `ELECTRON_OZONE_PLATFORM_HINT=wayland` and `AIBACKMAN_BRIDGE_VISIBLE=0`; environment overrides such as `AIBACKMAN_BRIDGE_VISIBLE=1 aibackman` are respected, and arguments are forwarded to Electron. `npm run electron:release` remains an explicit rebuild-and-launch command.
 
 Recommended validation order:
 

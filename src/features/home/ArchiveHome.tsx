@@ -122,7 +122,10 @@ export function ArchiveHome({ onOpenAccount }: ArchiveHomeProps) {
         if (searchTokenRef.current === token) setSearching(false);
       }
     }, 220);
-    return () => window.clearTimeout(timer);
+    return () => {
+      window.clearTimeout(timer);
+      void window.electronAPI.invoke('archive:cancelSearch').catch(() => {});
+    };
   }, [query, searchRole, searchSort]);
 
   const handleQueryChange = (value: string) => {

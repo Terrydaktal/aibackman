@@ -498,7 +498,7 @@ class AccountManager {
     return { success: true, accountCount: accounts.length, results };
   }
 
-  async globalSearch(query, limit = 200, sort = 'relevance', role = 'all') {
+  async globalSearch(query, limit = 200, sort = 'relevance', role = 'all', options = {}) {
     const trimmed = String(query || '').trim();
     if (!trimmed) return { total: 0, total_is_lower_bound: false, results: [] };
     const resultLimit = Math.max(1, Math.min(1000, Number(limit) || 200));
@@ -507,14 +507,22 @@ class AccountManager {
       : 'relevance';
     const normalizedRole = ['all', 'user', 'assistant'].includes(role) ? role : 'all';
     const accounts = this.listAccounts();
-    const searches = await Promise.all(accounts.map(async (account) => {
-      const output = await this.getDatabase(account).searchMessages(
-        trimmed,
-        normalizedSort,
-        resultLimit,
-        normalizedRole
-      );
-      return { account, output };
+    const searches = new Array(accounts.length);
+    let nextIndex = 0;
+    await Promise.all(Array.from({ length: Math.min(4, accounts.length) }, async () => {
+      while (nextIndex < accounts.length) {
+        if (options.signal?.aborted) throw Object.assign(new Error('Search cancelled.'), { name: 'AbortError' });
+        const index = nextIndex++;
+        const account = accounts[index];
+        const output = await this.getDatabase(account).searchMessages(
+          trimmed,
+          normalizedSort,
+          resultLimit,
+          normalizedRole,
+          options
+        );
+        searches[index] = { account, output };
+      }
     }));
     const total = searches.reduce((sum, entry) => sum + Number(entry.output.total || 0), 0);
     const results = [];

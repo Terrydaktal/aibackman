@@ -29,7 +29,11 @@ const MIN_PLAIN_LATEX_COMMANDS = 6;
 const MIN_PLAIN_LATEX_LINES = 8;
 const MAX_CODE_HIGHLIGHT_CHARS = 8000;
 const MAX_CODE_HIGHLIGHT_LINES = 400;
+const previewCache = new Map<string, string>();
+let previewCacheBytes = 0;
 const getMessagePreview = (content: string) => {
+  const cached = previewCache.get(content);
+  if (cached != null) return cached;
   const normalized = content
     .replace(/cite[^]*/g, ' ')
     .replace(/filecite[^]*/g, ' ')
@@ -40,8 +44,18 @@ const getMessagePreview = (content: string) => {
     .replace(/`[^`]*`/g, ' ')
     .replace(/\s+/g, ' ')
     .trim();
-  if (!normalized) return '[empty]';
-  return normalized.length > 120 ? `${normalized.slice(0, 117)}...` : normalized;
+  const preview = !normalized ? '[empty]' : normalized.length > 120 ? `${normalized.slice(0, 117)}...` : normalized;
+  const bytes = (content.length + preview.length) * 2;
+  if (bytes <= 2 * 1024 * 1024) {
+    while (previewCacheBytes + bytes > 2 * 1024 * 1024 || previewCache.size >= 2048) {
+      const key = previewCache.keys().next().value!;
+      previewCacheBytes -= (key.length + previewCache.get(key)!.length) * 2;
+      previewCache.delete(key);
+    }
+    previewCache.set(content, preview);
+    previewCacheBytes += bytes;
+  }
+  return preview;
 };
 
 const isLikelyTerminalTranscript = (content: string): boolean => {
@@ -253,7 +267,7 @@ const matchesSentUserContent = (candidateContent: string, sentContent: string) =
 const summarizeMetadataOnlyStep = (msg: Message) => {
   if (!msg.metadata_json) return '';
   try {
-    const meta = JSON.parse(msg.metadata_json) as Record<string, unknown>;
+    const meta = getMessageMetadata(msg) as Record<string, unknown>;
     const lines: string[] = [];
 
     if (typeof meta.reasoning_title === 'string' && meta.reasoning_title.trim()) {
@@ -286,7 +300,7 @@ const summarizeMetadataOnlyStep = (msg: Message) => {
 const isThinkingArtifactMessage = (msg: Message) => {
   if (!msg.metadata_json) return false;
   try {
-    const metadata = JSON.parse(msg.metadata_json) as Record<string, unknown>;
+    const metadata = getMessageMetadata(msg) as Record<string, unknown>;
     return metadata.is_thinking_preamble_message === true
       || metadata.is_visually_hidden_from_conversation === true;
   } catch {
@@ -356,7 +370,7 @@ const sanitizeEmbeddedUiEntries = (entries: unknown): EmbeddedUiEntry[] => {
 const getEmbeddedUiEntries = (msg: Message): EmbeddedUiEntry[] => {
   if (!msg.metadata_json) return [];
   try {
-    const metadata = JSON.parse(msg.metadata_json) as Record<string, unknown>;
+    const metadata = getMessageMetadata(msg) as Record<string, unknown>;
     return sanitizeEmbeddedUiEntries(metadata.embedded_ui);
   } catch {
     return [];
@@ -379,11 +393,16 @@ const CHATGPT_TOOL_CALL_KEYS = new Set([
   'web',
 ]);
 
+const metadataCache = new WeakMap<Message, { raw: string; value: Record<string, unknown> }>();
 const getMessageMetadata = (msg: Message): Record<string, unknown> => {
+  const cached = metadataCache.get(msg);
+  if (cached && cached.raw === msg.metadata_json) return cached.value;
   if (!msg.metadata_json) return {};
   try {
     const metadata = JSON.parse(msg.metadata_json) as unknown;
-    return metadata && typeof metadata === 'object' ? metadata as Record<string, unknown> : {};
+    const value = metadata && typeof metadata === 'object' ? metadata as Record<string, unknown> : {};
+    metadataCache.set(msg, { raw: msg.metadata_json, value });
+    return value;
   } catch {
     return {};
   }
@@ -464,7 +483,7 @@ const sanitizeClaudeArtifacts = (artifacts: unknown): ClaudeArtifact[] => {
 const getClaudeArtifacts = (msg: Message): ClaudeArtifact[] => {
   if (!msg.metadata_json) return [];
   try {
-    const metadata = JSON.parse(msg.metadata_json) as Record<string, unknown>;
+    const metadata = getMessageMetadata(msg) as Record<string, unknown>;
     if (metadata.source !== 'claude-export') return [];
     return sanitizeClaudeArtifacts(metadata.claude_artifacts);
   } catch {
@@ -475,7 +494,7 @@ const getClaudeArtifacts = (msg: Message): ClaudeArtifact[] => {
 const getChatHubModelLabel = (msg: Message): string => {
   if (!msg.metadata_json) return '';
   try {
-    const metadata = JSON.parse(msg.metadata_json) as Record<string, unknown>;
+    const metadata = getMessageMetadata(msg) as Record<string, unknown>;
     if (typeof metadata.source !== 'string' || !metadata.source.startsWith('chathub-')) return '';
     if (typeof metadata.model_label === 'string' && metadata.model_label.trim()) return metadata.model_label.trim();
     const model = typeof metadata.model === 'string' ? metadata.model.trim() : '';
@@ -523,7 +542,7 @@ const getProviderMessageLabel = (msg: Message, assistantLabel: string): string =
   let metadata: Record<string, unknown> = {};
   if (msg.metadata_json) {
     try {
-      const parsed = JSON.parse(msg.metadata_json);
+      const parsed = getMessageMetadata(msg);
       if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) metadata = parsed as Record<string, unknown>;
     } catch {
       metadata = {};
@@ -555,7 +574,7 @@ const getProviderMessageLabel = (msg: Message, assistantLabel: string): string =
 const getChatGptMessageLabel = (msg: Message): string => {
   if (!msg.metadata_json) return '';
   try {
-    const metadata = JSON.parse(msg.metadata_json) as Record<string, unknown>;
+    const metadata = getMessageMetadata(msg) as Record<string, unknown>;
     if (typeof metadata.source === 'string' && metadata.source.startsWith('chathub-')) return '';
     const rawModel = [metadata.model_slug, metadata.requested_model_slug, metadata.default_model_slug, metadata.model]
       .find((value): value is string => typeof value === 'string' && !!value.trim() && value.trim().toLowerCase() !== 'auto')
@@ -678,7 +697,7 @@ const buildCitationRegistry = (rawMessages: Message[]): Record<string, CitationE
   for (const msg of rawMessages) {
     if (!msg.metadata_json) continue;
     try {
-      const parsed = JSON.parse(msg.metadata_json);
+      const parsed = getMessageMetadata(msg);
       collectFromMetadata(parsed, metadataSeen);
     } catch {
       // Ignore malformed cached metadata.
@@ -1190,7 +1209,7 @@ const ClaudeArtifactList = memo(({ artifacts }: { artifacts: ClaudeArtifact[] })
 const MarkdownMessage = memo(({ content, role, embeddedUi, highlightQuery, highlightCodeBlocks, conversationId, onOpenImage, citationRegistry }: { content: string, role?: Message['role'], embeddedUi?: EmbeddedUiEntry[], highlightQuery?: string, highlightCodeBlocks?: boolean, conversationId?: string, onOpenImage?: (src: string) => void, citationRegistry: Record<string, CitationEntry> }) => {
   const query = highlightQuery || '';
   const rawContent = typeof content === 'string' ? content : String(content || '');
-  const terminalTranscript = role === 'user' && isLikelyTerminalTranscript(rawContent);
+  const terminalTranscript = useMemo(() => role === 'user' && isLikelyTerminalTranscript(rawContent), [role, rawContent]);
   const embeddedUiEntries = useMemo(() => sanitizeEmbeddedUiEntries(embeddedUi), [embeddedUi]);
   const contentWithoutEmbeddedUi = rawContent;
   const rawLineCount = useMemo(() => countLines(contentWithoutEmbeddedUi), [contentWithoutEmbeddedUi]);
@@ -1220,7 +1239,7 @@ const MarkdownMessage = memo(({ content, role, embeddedUi, highlightQuery, highl
   }, [contentWithoutEmbeddedUi]);
   const hasChatImages = useMemo(() => HAS_ARCHIVE_IMAGE_MARKDOWN_PATTERN.test(renderedContent), [renderedContent]);
 
-  const markdownComponents: Components = {
+  const markdownComponents: Components = useMemo(() => ({
     a: ({ href, children, ...props }) => {
       const highlightedChildren = <HighlightText query={effectiveQuery}>{children}</HighlightText>;
       if (typeof href === 'string' && href.startsWith('productref://')) {
@@ -1295,7 +1314,7 @@ const MarkdownMessage = memo(({ content, role, embeddedUi, highlightQuery, highl
         </code>
       );
     },
-  };
+  }), [effectiveQuery, citationRegistry, conversationId, onOpenImage, codeSearchQuery]);
 
   const renderMarkdownChunk = (chunk: string, key: string) => (
     <ReactMarkdown

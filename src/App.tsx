@@ -1,7 +1,8 @@
-import { useEffect, useState } from 'react';
+import { lazy, Suspense, useEffect, useState } from 'react';
 import type { AgentAccount } from './types';
 import { ArchiveHome, type ArchiveNavigationTarget } from './features/home/ArchiveHome';
-import { ChatWorkspace } from './features/chat/ChatWorkspace';
+const loadWorkspace = () => import('./features/chat/ChatWorkspace');
+const ChatWorkspace = lazy(() => loadWorkspace().then((module) => ({ default: module.ChatWorkspace })));
 import './index.css';
 
 const FONT_SIZE_MIN = 8;
@@ -27,20 +28,23 @@ function App() {
   if (route.kind === 'home') {
     return (
       <ArchiveHome
-        onOpenAccount={(account, target) => setRoute({ kind: 'account', account, target })}
+        onOpenAccount={async (account, target) => {
+          await loadWorkspace();
+          setRoute({ kind: 'account', account, target });
+        }}
       />
     );
   }
 
   return (
-    <ChatWorkspace
+    <Suspense fallback={null}><ChatWorkspace
       key={route.account.id}
       account={route.account}
       initialConversationId={route.target?.conversationId}
       initialMessageId={route.target?.messageId}
       initialSearchQuery={route.target?.query}
       onGoHome={() => setRoute({ kind: 'home' })}
-    />
+    /></Suspense>
   );
 }
 

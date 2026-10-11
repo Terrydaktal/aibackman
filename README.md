@@ -59,6 +59,7 @@ Backup accounts are read-only in the viewer. Multiple backups from the same prov
 │   │   ├── backup-parsers/   # One bespoke export/local-backup parser per provider
 │   │   ├── formatters/       # Provider-specific cleanup before universal storage
 │   │   └── shared/           # Provider composition, background archive workers, scraper helpers
+│   ├── resources/           # Byte-bounded caches, async assets, scoped search cancellation
 │   ├── bridges/
 │   │   ├── chatgpt.cjs       # ChatGPT live-site automation and extraction
 │   │   └── ai-mode.cjs       # Google AI Mode live-site automation and extraction

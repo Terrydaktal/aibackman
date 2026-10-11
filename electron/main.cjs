@@ -1,5 +1,7 @@
 const { app, BrowserWindow, ipcMain, protocol, session, clipboard, nativeImage, crashReporter, dialog } = require('electron');
 const fs = require('fs');
+const { ArchiveAssets, coalesceResponseRequests } = require('./resources/assets.cjs');
+const { startSearch, cancelSearch } = require('./resources/search-sessions.cjs');
 const path = require('path');
 const ChatGPTAuth = require('./auth.cjs');
 const ChatDatabase = require('./database.cjs');
@@ -212,6 +214,8 @@ function createWindow() {
 
   // Register custom protocol for images
   // This allows us to fetch images in the main process with full auth
+  const archiveAssets = new ArchiveAssets();
+  const fetchImage = coalesceResponseRequests((fileId, conversationId) => chatgptRuntime.fetchImageResponse(fileId, conversationId));
   protocol.handle('chatgpt-image', async (request) => {
     let requestPath = request.url;
     try {
@@ -230,7 +234,7 @@ function createWindow() {
       // Use the internal fetch with full session/auth
       const parsed = new URL(request.url);
       const conversationId = parsed.searchParams.get('conversation_id');
-      const response = await chatgptRuntime.fetchImageResponse(fileId, conversationId || undefined);
+      const response = await fetchImage(`${fileId}:${conversationId || ''}`, fileId, conversationId || undefined);
       if (!response.ok) {
         const errorText = await response.text().catch(() => '');
         if (![400, 404, 422].includes(response.status)) {
@@ -278,9 +282,9 @@ function createWindow() {
       if (!assetPath.startsWith(`${userDataRoot}${path.sep}`)) {
         return new Response('Archive asset path is outside managed storage', { status: 403 });
       }
-      const stat = fs.lstatSync(assetPath);
+      const stat = await fs.promises.lstat(assetPath);
       if (!stat.isFile() || stat.isSymbolicLink()) return new Response('Archive asset not found', { status: 404 });
-      const body = fs.readFileSync(assetPath);
+      const body = await archiveAssets.read(assetPath, userDataRoot);
       return new Response(body, {
         status: 200,
         headers: {
@@ -545,8 +549,12 @@ function setupIpc() {
     const query = typeof arg1 === 'object' ? arg1?.query : arg1;
     const mode = typeof arg1 === 'object' ? arg1 : arg2;
     const targetDb = getDatabaseForMode(mode);
-    return targetDb.searchMessages(String(query || ''));
+    const search = startSearch(event.sender, 'workspace');
+    try { return await targetDb.searchMessages(String(query || ''), 'relevance', 100, 'all', search); }
+    finally { search.finish(); }
   });
+
+  ipcMain.handle('db:cancelSearch', (event) => cancelSearch(event.sender, 'workspace'));
 
   ipcMain.handle('api:getImageDataUrl', async (event, payload) => {
     try {

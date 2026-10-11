@@ -184,7 +184,7 @@ export function useCacheManagement({ enabled, invoke, refreshRevision }: UseCach
         else if (stage === 'run-complete') setStatus(`Cache run complete: ${processed} synced, ${failed} failed.`);
         else if (stage === 'run-cancelled') setStatus(`Cache run stopped: ${processed} synced, ${failed} failed.`);
       }
-      void refreshCounts();
+      if (!payload || typeof payload !== 'object' || ['chat-success', 'chat-fail', 'run-complete', 'run-cancelled'].includes(String((payload as CacheProgress).stage || ''))) void refreshCounts();
     });
     return typeof unsubscribe === 'function' ? unsubscribe : undefined;
   }, [refreshCounts]);

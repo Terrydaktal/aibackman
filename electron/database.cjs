@@ -1,4 +1,8 @@
 const Database = require('better-sqlite3');
+const { ByteCache } = require('./resources/byte-cache.cjs');
+const { SharedRequests } = require('./resources/shared-requests.cjs');
+const SEARCH_RESULTS_CACHE = new ByteCache(8 * 1024 * 1024, 64);
+const SEARCH_WORKERS = new Set();
 const { createSummaryReader, unixTime } = require('./archive/standard/summaries.cjs');
 const crypto = require('crypto');
 const fs = require('fs');
@@ -195,10 +199,15 @@ class DbSearchWorker {
     this.pending = new Map();
     this.workerInstanceId = `db-search-${process.pid}-${crypto.randomUUID()}`;
     this.resourceId = null;
+    this.activeRequestId = null;
+    this.idleTimer = null;
+    this.lastResolveAt = 0;
   }
 
   ensureStarted() {
-    const binaryPath = this.binaryResolver();
+    const now = Date.now();
+    const binaryPath = this.binaryPath && now - this.lastResolveAt < 1000 ? this.binaryPath : this.binaryResolver();
+    this.lastResolveAt = now;
     const binaryMtimeMs = fs.statSync(binaryPath).mtimeMs;
     if (
       this.child
@@ -210,16 +219,25 @@ class DbSearchWorker {
       return;
     }
 
+    const queued = this.pending;
+    this.pending = new Map();
     this.stop();
+    this.pending = queued;
+    for (const worker of SEARCH_WORKERS) {
+      if (SEARCH_WORKERS.size < 4) break;
+      if (worker.pending.size === 0) worker.stop();
+    }
+    SEARCH_WORKERS.add(this);
     this.workerInstanceId = `db-search-${process.pid}-${crypto.randomUUID()}`;
     this.binaryPath = binaryPath;
     this.binaryMtimeMs = binaryMtimeMs;
-    const binarySha256 = sha256File(binaryPath);
+    const binarySha256 = this.diagnostics?.active ? sha256File(binaryPath) : null;
     this.child = this.spawnImpl(binaryPath, ['serve', '--db-path', this.dbPath], {
       cwd: path.resolve(__dirname, '..'),
       stdio: ['pipe', 'pipe', 'pipe'],
     });
     const child = this.child;
+    const workerInstanceId = this.workerInstanceId;
     this.diagnostics?.record('worker-started', {
       worker: 'db-search',
       worker_instance_id: this.workerInstanceId,
@@ -244,7 +262,7 @@ class DbSearchWorker {
     child.stdin.on('error', (error) => {
       this.diagnostics?.record('worker-stdin-error', {
         worker: 'db-search',
-        worker_instance_id: this.workerInstanceId,
+        worker_instance_id: workerInstanceId,
         error,
       }, { component: 'db-search-worker' });
     });
@@ -262,17 +280,21 @@ class DbSearchWorker {
       const error = new Error(`db-search worker exited (${code ?? signal ?? 'unknown'})`);
       this.diagnostics?.record('worker-exited', {
         worker: 'db-search',
-        worker_instance_id: this.workerInstanceId,
+        worker_instance_id: workerInstanceId,
         code,
         signal,
         pending: this.pending.size,
       }, { component: 'db-search-worker' });
-      for (const { reject, timer, taskId } of this.pending.values()) {
+      if (this.child !== child) return;
+      for (const { reject, timer, taskId, cleanup } of this.pending.values()) {
+        cleanup?.();
         clearTimeout(timer);
         this.diagnostics?.taskEnd(taskId, { error: error.message });
         reject(error);
       }
       this.pending.clear();
+      this.activeRequestId = null;
+      SEARCH_WORKERS.delete(this);
       this.diagnostics?.resourceClose(resourceId, {
         type: 'child-process',
         worker: 'db-search',
@@ -306,7 +328,9 @@ class DbSearchWorker {
 
     const pending = this.pending.get(response.id);
     if (!pending) return;
+    this.activeRequestId = null;
     this.pending.delete(response.id);
+    pending.cleanup?.();
     clearTimeout(pending.timer);
     if (response.ok) {
       this.diagnostics?.taskEnd(pending.taskId, { state: 'completed', request_id: response.id });
@@ -315,10 +339,44 @@ class DbSearchWorker {
       this.diagnostics?.taskEnd(pending.taskId, { error: response.error || 'db-search worker request failed', request_id: response.id });
       pending.reject(new Error(response.error || 'db-search worker request failed'));
     }
+    this.pump();
   }
 
-  search(query, limit = 100, sort = 'relevance', role = 'all') {
-    this.ensureStarted();
+  pump() {
+    clearTimeout(this.idleTimer);
+    if (this.activeRequestId != null) return;
+    const entry = this.pending.entries().next().value;
+    if (!entry) {
+      this.idleTimer = setTimeout(() => this.stop(), 30000);
+      this.idleTimer.unref?.();
+      return;
+    }
+    const [id, request] = entry;
+    try {
+      this.ensureStarted();
+      this.activeRequestId = id;
+      this.child.stdin.write(request.payload + '\n', (error) => {
+        if (!error || !this.pending.has(id)) return;
+        request.cleanup?.();
+        clearTimeout(request.timer);
+        this.pending.delete(id);
+        this.activeRequestId = null;
+        this.diagnostics?.taskEnd(request.taskId, { error: error.message, request_id: id });
+        request.reject(error);
+        this.pump();
+      });
+    } catch (error) {
+      request.cleanup?.();
+      clearTimeout(request.timer);
+      this.pending.delete(id);
+      this.diagnostics?.taskEnd(request.taskId, { error: error.message, request_id: id });
+      request.reject(error);
+      this.pump();
+    }
+  }
+
+  search(query, limit = 100, sort = 'relevance', role = 'all', { signal } = {}) {
+    if (signal?.aborted) return Promise.reject(Object.assign(new Error('Search cancelled.'), { name: 'AbortError' }));
     const id = this.nextRequestId++;
     const normalizedSort = normalizeSearchSort(sort);
     const normalizedRole = normalizeSearchRole(role);
@@ -330,7 +388,7 @@ class DbSearchWorker {
       sort: normalizedSort,
       role: normalizedRole,
     });
-    const taskId = this.diagnostics?.taskStart(`db-search-${id}`, {
+    const taskId = this.diagnostics?.taskStart(`${this.databaseInstanceId || this.workerInstanceId}-search-${id}`, {
       worker: 'db-search',
       request_id: id,
       query_length: String(query || '').length,
@@ -343,26 +401,46 @@ class DbSearchWorker {
       const timer = setTimeout(() => {
         const pending = this.pending.get(id);
         if (!pending) return;
-        this.pending.delete(id);
-        this.diagnostics?.taskEnd(taskId, { error: 'db-search worker request timed out', request_id: id });
-        reject(new Error('db-search worker request timed out'));
+        cancel(new Error('db-search worker request timed out'));
       }, this.requestTimeoutMs);
       timer.unref?.();
-      this.pending.set(id, { resolve, reject, timer, taskId });
-      this.child.stdin.write(`${payload}\n`, (error) => {
-        if (!error) return;
-        this.pending.delete(id);
+      const cancel = (reason) => {
+        const request = this.pending.get(id);
+        if (!request) return;
+        request.cleanup?.();
         clearTimeout(timer);
-        this.diagnostics?.taskEnd(taskId, { error, request_id: id });
-        reject(error);
-      });
+        this.pending.delete(id);
+        reject(reason instanceof Error ? reason : Object.assign(new Error('Search cancelled.'), { name: 'AbortError' }));
+        this.diagnostics?.taskEnd(taskId, reason instanceof Error ? { error: reason.message, request_id: id } : { state: 'cancelled', request_id: id });
+        if (this.activeRequestId === id) {
+          // Only one request is ever sent to this helper. Terminating it cannot
+          // cancel an unrelated caller; unsent requests remain queued for restart.
+          this.activeRequestId = null;
+          const child = this.child;
+          this.child = null;
+          this.readline?.close();
+          this.readline = null;
+          child?.kill();
+          this.diagnostics?.resourceClose(this.resourceId, { reason: 'search-cancelled' });
+          this.resourceId = null;
+        }
+        this.pump();
+      };
+      const cleanup = () => signal?.removeEventListener('abort', cancel);
+      this.pending.set(id, { resolve, reject, timer, taskId, payload, cleanup });
+      signal?.addEventListener('abort', cancel, { once: true });
+      this.pump();
     });
   }
 
   stop() {
+    SEARCH_WORKERS.delete(this);
+    clearTimeout(this.idleTimer);
+    this.activeRequestId = null;
     if (this.readline) this.readline.close();
     if (this.child && !this.child.killed) this.child.kill();
-    for (const { reject, timer, taskId } of this.pending.values()) {
+    for (const { reject, timer, taskId, cleanup } of this.pending.values()) {
+      cleanup?.();
       clearTimeout(timer);
       this.diagnostics?.taskEnd(taskId, { error: 'db-search worker stopped' });
       reject(new Error('db-search worker stopped'));
@@ -392,6 +470,7 @@ class ChatDatabase {
   #statsMutationVersion = -1;
   #statements = new Map();
   #summaries;
+  #searchRequests = new SharedRequests();
 
   constructor(filename = 'chatgpt.db', {
     diagnostics = null,
@@ -1564,6 +1643,7 @@ class ChatDatabase {
   }
 
   close() {
+    this.#searchRequests.clear();
     this.searchWorker.stop();
     this.diagnostics?.resourceClose(this.#diagnosticResourceId, {
       type: 'sqlite-database',
@@ -1629,20 +1709,33 @@ class ChatDatabase {
     });
   }
 
-  async searchMessages(query, sort = 'relevance', limit = 100, role = 'all') {
+  async searchMessages(query, sort = 'relevance', limit = 100, role = 'all', options = {}) {
     const trimmed = String(query || '').trim();
     if (!trimmed) {
       return { total: 0, results: [] };
     }
 
+    const version = `${this.#db.pragma('data_version', { simple: true })}:${this.#mutationVersion}`;
+    const cacheKey = JSON.stringify([this.databaseInstanceId, version, trimmed, sort, limit, role]);
+    if (options.signal?.aborted) throw Object.assign(new Error('Search cancelled.'), { name: 'AbortError' });
+    const cached = SEARCH_RESULTS_CACHE.get(cacheKey);
+    if (cached) return JSON.parse(cached);
     try {
-      return await this.searchWorker.search(
-        trimmed,
-        limit,
-        normalizeSearchSort(sort),
-        normalizeSearchRole(role)
-      );
+      const serialized = await this.#searchRequests.run(cacheKey, async (signal) => {
+        const output = await this.searchWorker.search(
+          trimmed,
+          limit,
+          normalizeSearchSort(sort),
+          normalizeSearchRole(role),
+          { signal }
+        );
+        const serialized = JSON.stringify(output);
+        if (version === `${this.#db.pragma('data_version', { simple: true })}:${this.#mutationVersion}`) SEARCH_RESULTS_CACHE.set(cacheKey, serialized, Buffer.byteLength(serialized));
+        return serialized;
+      }, options.signal);
+      return JSON.parse(serialized);
     } catch (error) {
+      if (error.name === 'AbortError') throw error;
       console.warn('db-search helper failed, falling back to LIKE search:', error);
       const normalizedSort = normalizeSearchSort(sort);
       const normalizedRole = normalizeSearchRole(role);
@@ -1934,3 +2027,4 @@ class ChatDatabase {
 
 module.exports = ChatDatabase;
 module.exports.DbSearchWorker = DbSearchWorker;
+module.exports.ensureDbSearchBinary = ensureDbSearchBinary;

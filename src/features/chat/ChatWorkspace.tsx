@@ -205,6 +205,7 @@ export function ChatWorkspace({
     jumpToRelativeMatch: jumpToRelativeMapMatch,
     mapHighlightQuery,
     mapListRef,
+    mapVirtuosoRef,
     mapMatchCount,
     mapMatchMessageIds,
     mapMatchPosition,
@@ -926,7 +927,7 @@ export function ChatWorkspace({
         await checkAuth();
         const selectedId = initialConversationId || localStorage.getItem(lastConvStorageKey);
         if (selectedId) {
-          await selectConversationRef.current(selectedId, canLiveSync, canLiveSync);
+          await selectConversationRef.current(selectedId, true, canLiveSync);
           restoreInitialTarget(initialMessageId, initialSearchQuery);
         } else if (canSend) {
           invokeMode('api:prewarmConversation', { conversationId: null })
@@ -1238,8 +1239,9 @@ export function ChatWorkspace({
             <div className="content-nav-header">
               <span>Message Map</span>
             </div>
-            <div ref={mapListRef} className="content-nav-list" onMouseDown={(e) => startPanning(e, e.currentTarget as HTMLElement)}>
-              {navigationMessages.map((msg) => (
+            <div ref={mapListRef} className="content-nav-list" onMouseDown={(e) => startPanning(e, e.currentTarget.querySelector<HTMLElement>('[data-virtuoso-scroller]'))}>
+              <Virtuoso ref={mapVirtuosoRef} data={navigationMessages} style={{ height: '100%' }}
+                computeItemKey={(_index, msg) => msg.id} itemContent={(_index, msg) => (
                 <button
                   key={msg.id}
                   data-message-id={msg.id}
@@ -1250,7 +1252,7 @@ export function ChatWorkspace({
                   <span className="content-nav-index">{msg.navIndex}</span>
                   <span className="content-nav-text">{msg.preview}</span>
                 </button>
-              ))}
+              )} />
             </div>
             <div className="content-nav-search">
               <div className="content-nav-search-row">

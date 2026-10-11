@@ -41,9 +41,13 @@ function registerArchiveIpc({
 }) {
   ipcMain.handle('archive:getOverview', async () => accountManager.getArchiveOverviewAsync());
 
-  ipcMain.handle('archive:globalSearch', async (_event, payload) => (
-    accountManager.globalSearch(payload?.query, Number(payload?.limit || 200), payload?.sort, payload?.role)
-  ));
+  const { startSearch, cancelSearch } = require('../resources/search-sessions.cjs');
+  ipcMain.handle('archive:globalSearch', async (event, payload) => {
+    const search = startSearch(event.sender, 'home');
+    try { return await accountManager.globalSearch(payload?.query, Number(payload?.limit || 200), payload?.sort, payload?.role, search); }
+    finally { search.finish(); }
+  });
+  ipcMain.handle('archive:cancelSearch', (event) => cancelSearch(event.sender, 'home'));
 
   ipcMain.handle('archive:exportMarkdown', async (_event, payload) => {
     const accountId = String(payload?.accountId || '').trim();

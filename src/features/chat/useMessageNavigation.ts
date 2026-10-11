@@ -63,6 +63,7 @@ export function useMessageNavigation({
   const mapJumpLockUntilRef = useRef(0);
   const scrollerRef = useRef<HTMLElement | null>(null);
   const mapListRef = useRef<HTMLDivElement | null>(null);
+  const mapVirtuosoRef = useRef<VirtuosoHandle | null>(null);
   const mapOpenRef = useRef(isMessageMapOpen);
   const viewportHighlightRafRef = useRef<number | null>(null);
   const updateViewportRef = useRef<() => void>(() => {});
@@ -217,13 +218,14 @@ export function useMessageNavigation({
     setIsNearBottom(next);
   }, []);
 
+  const navigableIds = useMemo(() => new Set(navigationMessages.map((message) => message.id)), [navigationMessages]);
+  const navigationIndex = useMemo(() => new Map(navigationMessages.map((message, index) => [message.id, index])), [navigationMessages]);
   const updateViewport = useCallback(() => {
     if (!isMessageMapOpen || Date.now() < mapJumpLockUntilRef.current) return;
     const scroller = scrollerRef.current;
     if (!scroller) return;
     const viewport = scroller.getBoundingClientRect();
     const rows = Array.from(scroller.querySelectorAll<HTMLElement>('.message-row[data-message-id]'));
-    const navigableIds = new Set(displayMessages.filter(isNavigableMessage).map((message) => message.id));
     const visibleIds: string[] = [];
 
     for (const row of rows) {
@@ -256,7 +258,7 @@ export function useMessageNavigation({
       });
       return visibleIds;
     });
-  }, [displayMessages, isMessageMapOpen, pushDebug]);
+  }, [navigableIds, isMessageMapOpen, pushDebug]);
 
   const handleMessageScroll = useCallback(() => {
     scheduleViewportUpdate();
@@ -502,19 +504,9 @@ export function useMessageNavigation({
     const mapList = mapListRef.current;
     const anchorId = viewportVisibleMessageIds[0];
     if (!mapList || !anchorId) return;
-    const target = mapList.querySelector<HTMLElement>(`.content-nav-item[data-message-id="${anchorId}"]`);
-    if (!target) return;
-    const padding = 10;
-    const viewTop = mapList.scrollTop + padding;
-    const viewBottom = mapList.scrollTop + mapList.clientHeight - padding;
-    const itemTop = target.offsetTop;
-    const itemBottom = itemTop + target.offsetHeight;
-    if (itemTop < viewTop) {
-      mapList.scrollTop = Math.max(0, itemTop - padding);
-    } else if (itemBottom > viewBottom) {
-      mapList.scrollTop = Math.max(0, itemBottom - mapList.clientHeight + padding);
-    }
-  }, [isMessageMapOpen, viewportVisibleMessageIds]);
+    const index = navigationIndex.get(anchorId);
+    if (index != null) mapVirtuosoRef.current?.scrollIntoView({ index, align: 'start', behavior: 'auto' });
+  }, [isMessageMapOpen, viewportVisibleMessageIds, navigationIndex]);
 
   useEffect(() => {
     const pending = pendingJumpRef.current;
@@ -548,6 +540,7 @@ export function useMessageNavigation({
     jumpToRelativeMatch,
     mapHighlightQuery,
     mapListRef,
+    mapVirtuosoRef,
     mapMatchCount,
     mapMatchMessageIds,
     mapMatchPosition,

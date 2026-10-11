@@ -39,6 +39,7 @@ export function useArchiveSearch({ invoke, onNavigate }: UseArchiveSearchOptions
   const open = useCallback(() => setIsOpen(true), []);
 
   const search = useCallback((nextQuery: string) => {
+    void invoke('db:cancelSearch').catch(() => {});
     setQuery(nextQuery);
     if (debounceRef.current !== null) {
       window.clearTimeout(debounceRef.current);
@@ -80,9 +81,10 @@ export function useArchiveSearch({ invoke, onNavigate }: UseArchiveSearchOptions
   }, [onNavigate, query]);
 
   useEffect(() => () => {
+    void invoke('db:cancelSearch').catch(() => {});
     requestTokenRef.current += 1;
     if (debounceRef.current !== null) window.clearTimeout(debounceRef.current);
-  }, []);
+  }, [invoke]);
 
   return {
     close,

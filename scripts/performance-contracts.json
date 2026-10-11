@@ -1,0 +1,18 @@
+{
+  "schema": "aibackman-performance-contracts-v1",
+  "profiles": ["release-minimal", "release-observable", "diagnostic-build"],
+  "data": "Synthetic fixtures only; never open personal archives or source logs.",
+  "requirements": [
+    {"id":"PERF-STATS", "owner":"archive", "contract":"Persistent summaries exactly match message counts, recency and deletion semantics across restart, rollback and external writers.", "tests":["scripts/test-performance-optimizations.cjs", "scripts/test-archive-safety.cjs"]},
+    {"id":"PERF-LAUNCH", "owner":"launcher", "contract":"Reuse only verified minimal artifacts; rebuild after source, assets, dependency or mode changes; preserve environment and argv.", "tests":["scripts/test-release-cache.cjs"]},
+    {"id":"PERF-MERGE", "owner":"local parsers", "contract":"Session content and source fingerprints commit or roll back together; unchanged sessions stay skipped.", "tests":["scripts/test-archive-imports.cjs", "scripts/test-pi-backups.cjs"]},
+    {"id":"PERF-IMPORT", "owner":"backup parsers", "contract":"Worker imports stage bounded normalized records, perform one additive atomic merge and retain snapshot/audit safeguards.", "tests":["scripts/test-performance-optimizations.cjs", "scripts/test-archive-imports.cjs"]},
+    {"id":"PERF-LIST", "owner":"archive", "contract":"Materialized last-message dates and counts preserve ordering and live bridge precedence.", "tests":["scripts/test-performance-optimizations.cjs", "scripts/test-conversation-ordering.mjs"]},
+    {"id":"PERF-READ", "owner":"archive reader", "contract":"Read messages once; compact IPC retains every alternate branch and the exact current path.", "tests":["scripts/test-performance-optimizations.cjs"]},
+    {"id":"PERF-RENDER", "owner":"viewer", "contract":"Defer heavy chat dependencies and virtualize Message Map without dropping rows, formatting, highlights or navigation.", "tests":["scripts/test-highlight.mjs", "scripts/test-performance-viewer.cjs"], "environment":"isolated Electron/Xvfb; actual Wayland manual check also required"},
+    {"id":"PERF-SEARCH", "owner":"search", "contract":"Cancel superseded work only for its caller; bounded workers/cache preserve rank, date sorting, role filters and exact totals.", "tests":["scripts/test-performance-optimizations.cjs", "scripts/test-archive-imports.cjs", "scripts/test-diagnostics.cjs"]},
+    {"id":"PERF-ASSETS", "owner":"protocols", "contract":"Async local assets and in-flight image dedup retain independent response bodies, access checks and invalidation; caches are byte bounded.", "tests":["scripts/test-performance-optimizations.cjs"]},
+    {"id":"PERF-AUDIT", "owner":"archive safety", "contract":"Stream verification with identical JSON/hash-chain/tamper checks and complete record counts.", "tests":["scripts/test-performance-optimizations.cjs", "scripts/test-archive-safety.cjs"]},
+    {"id":"PERF-DIFF", "owner":"aibackdiff", "contract":"Bound header reads, normalize once and pack traceback while preserving positional changes and add-before-remove LCS ties.", "tests":["tools/aibackdiff/src/main.rs"]}
+  ]
+}

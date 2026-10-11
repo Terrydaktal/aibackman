@@ -244,7 +244,8 @@ async function main() {
       activationTtlMs: 50,
     });
     const ttlPaths = ttlRuntime.start();
-    await waitForSocket(ttlPaths.supervisorSocket);
+    // A 50ms activation may expire before the supervisor binds its socket.
+    // Readiness is verified above for the normal runtime; this case tests expiry.
     await waitFor(() => !ttlRuntime.active, 'Diagnostic activation TTL did not stop the runtime.');
     assert.equal(fs.existsSync(ttlPaths.snapshot), true);
     assert.equal(fs.existsSync(ttlPaths.supervisorToken), false);

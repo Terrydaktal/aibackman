@@ -18,10 +18,17 @@ jobs:
           node-version: 24
           cache: npm
       - run: npm ci
+      - name: Install isolated GUI test dependencies
+        run: sudo apt-get update && sudo apt-get install --no-install-recommends -y xvfb libdbus-1-dev libxkbcommon-dev libfontconfig1-dev
       - run: npm run validate:debuggability
       - run: npm run lint
       - run: npm run test:highlight
       - run: npm run test:diagnostics
       - run: npm run test:archive
+      - run: npm run test:optimizations
       - run: npm run test:debuggability:performance
       - run: npm run build
+      - run: npm run test:viewer
+      - run: npm run build:observable && npm run test:viewer
+      - run: npm run build:debug && npm run test:viewer
+      - run: cargo test --release --manifest-path tools/aibackdiff/Cargo.toml

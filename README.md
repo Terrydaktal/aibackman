@@ -97,7 +97,10 @@ Backup accounts are read-only in the viewer. Multiple backups from the same prov
 │   ├── aibackman                     # Linux launcher installed as a symlink in ~/.local/bin
 │   ├── ensure-release.cjs             # Verify build/dependencies; reuse or rebuild release
 │   ├── build-search.cjs               # Prepare the native search helper before launch
+│   ├── test-performance-optimizations.cjs # Synthetic persistence/atomicity/cancellation checks
+│   ├── test-performance-viewer.cjs     # Built renderer, 10,000 messages, isolated Xvfb
 │   ├── test-release-cache.cjs          # Source/artifact/dependency invalidation and launcher
+│   ├── test-performance-mutations.cjs # Prove regression oracles reject deliberate faults
 │   ├── test-archive-imports.cjs       # Provider/account regression suite
 │   ├── test-pi-backups.cjs            # Pi discovery/import/merge checks with synthetic sessions
 │   ├── test-archive-safety.cjs        # Deletion/overwrite/recovery suite
@@ -297,6 +300,8 @@ chats. The same GUI can be started directly with `npm run aibackdiff`.
 - `npm run test:diagnostics`: test diagnostic mode bounds, redaction, build identity, supervisor control, and shutdown.
 - `npm run test:debuggability:performance`: enforce disabled/activated diagnostic and always-on audit budgets.
 - `npm run test:debuggability`: run the complete debuggability contract, fault-injection, archive-safety, and performance suite.
+- `npm run test:optimizations`: check persistent summaries against the original SQL, atomic streaming imports, worker cancellation, bounded assets, audit integrity, build reuse, and deliberately faulty implementations using synthetic data.
+- `npm run test:viewer`: check the built renderer with 10,000 synthetic messages in a separate Xvfb display; requires `xvfb-run` and does not open personal archives.
 - `npm run validate:debuggability`: strictly validate the repository-local debuggability contract.
 - `npm run diagnose -- capabilities|build-info|snapshot|events`: query the private bounded diagnostic control plane without opening DevTools.
 - `npm run diagnostics:secure`: privatize and prune legacy diagnostic artifacts without touching archives or recovery snapshots.
@@ -326,11 +331,23 @@ Recommended validation order:
 npm run lint
 npm run test:highlight
 npm run test:archive
+npm run test:optimizations
 npm run test:debuggability
-cargo test --manifest-path tools/db-search/Cargo.toml
+cargo test --release --manifest-path tools/db-search/Cargo.toml
 cargo test --release --manifest-path tools/aibackdiff/Cargo.toml
 npm run build
+npm run test:viewer
 ```
+
+### Performance pipeline
+
+Content, revision history, recovery snapshots, and durable audit records remain authoritative. SQLite message triggers mark disposable per-conversation summaries dirty in the same transaction as writes. List/statistics reads refresh only dirty summaries, then reuse them across restarts; external writer commits invalidate in-memory results through SQLite's `data_version`. The first read after upgrading builds summaries once. Statistics for home cards run in a background worker rather than blocking Electron's main thread.
+
+Official backup parsers and local refreshes run outside the main thread (Chromium-based ChatHub extraction still uses Electron). Root JSON arrays stream one conversation at a time; wrapper-format exports retain their provider parser. Normalized conversations are staged in a temporary SQLite database before one guarded, additive archive transaction. Invalid input leaves the archive unchanged, and local content plus its source fingerprint commit together. Temporary staging files are removed after success or failure; they are not backups.
+
+The home page loads the viewer/Markdown bundle only when opening an account. Message Map rows are virtualized; parsed metadata and previews are reused. Conversation IPC sends each message once, with IDs identifying the active branch. Searches cancel superseded requests, share identical in-flight queries without cancelling other callers, bound cross-account concurrency to four, reuse byte-limited results, and retire idle helpers. Archive images use asynchronous reads, byte-limited caches, and deduplicated concurrent requests. Audit verification streams the complete journal without skipping checks. The comparison tool reads only SQLite's header for detection, normalizes matching text once, and packs LCS traceback directions instead of retaining the full score matrix.
+
+The behavior inventory and fixture/environment requirements are in `scripts/performance-contracts.json`. Run the built-viewer check after each of `npm run build`, `npm run build:observable`, and `npm run build:debug` to cover all release profiles. Xvfb exercises the actual built renderer, but does not certify the native Wayland/GPU path.
 
 ## Release Debugging
 

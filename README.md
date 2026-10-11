@@ -313,7 +313,7 @@ npm run test:highlight
 npm run test:archive
 npm run test:debuggability
 cargo test --manifest-path tools/db-search/Cargo.toml
-cargo test --manifest-path tools/aibackdiff/Cargo.toml
+cargo test --release --manifest-path tools/aibackdiff/Cargo.toml
 npm run build
 ```
 

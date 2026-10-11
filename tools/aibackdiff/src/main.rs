@@ -1,6 +1,7 @@
 use std::{
     collections::{HashMap, HashSet},
     env, fs,
+    io::Read,
     path::{Path, PathBuf},
     sync::{
         LazyLock,
@@ -218,7 +219,7 @@ impl AiBackdiffApp {
         }
     }
 
-    fn begin_compare(&mut self) {
+    fn begin_compare(&mut self, ctx: &egui::Context) {
         let baseline_path = self.baseline_path.trim().to_owned();
         let comparison_path = self.comparison_path.trim().to_owned();
         if baseline_path.is_empty() || comparison_path.is_empty() {
@@ -231,14 +232,16 @@ impl AiBackdiffApp {
         self.status = "Loading and comparing sources...".to_owned();
         self.report = None;
         self.selected = None;
+        let ctx = ctx.clone();
         thread::spawn(move || {
             let result = compare_paths(Path::new(&baseline_path), Path::new(&comparison_path))
                 .map_err(|error| format!("{error:#}"));
             let _ = tx.send(CompareFinished { result });
+            ctx.request_repaint();
         });
     }
 
-    fn poll_compare(&mut self, ctx: &egui::Context) {
+    fn poll_compare(&mut self) {
         let Some(rx) = &self.compare_rx else {
             return;
         };
@@ -258,7 +261,7 @@ impl AiBackdiffApp {
                     Err(error) => self.status = error,
                 }
             }
-            Err(mpsc::TryRecvError::Empty) => ctx.request_repaint(),
+            Err(mpsc::TryRecvError::Empty) => {}
             Err(mpsc::TryRecvError::Disconnected) => {
                 self.compare_rx = None;
                 self.status = "The comparison worker stopped unexpectedly.".to_owned();
@@ -325,7 +328,7 @@ impl AiBackdiffApp {
                 .add_enabled(!running, egui::Button::new("Compare sources"))
                 .clicked()
             {
-                self.begin_compare();
+                self.begin_compare(ui.ctx());
             }
             if ui
                 .add_enabled(
@@ -486,7 +489,7 @@ impl AiBackdiffApp {
 
 impl eframe::App for AiBackdiffApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        self.poll_compare(ctx);
+        self.poll_compare();
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.heading("AIBackdiff");
             ui.label("Compare AI archive databases and official backups.");
@@ -681,8 +684,14 @@ fn is_sqlite_file(path: &Path) -> Result<bool> {
     if !path.is_file() {
         return Ok(false);
     }
-    let bytes = fs::read(path).with_context(|| format!("failed to inspect {}", path.display()))?;
-    Ok(bytes.starts_with(b"SQLite format 3\0"))
+    let mut file =
+        fs::File::open(path).with_context(|| format!("failed to inspect {}", path.display()))?;
+    let mut header = [0u8; 16];
+    match file.read_exact(&mut header) {
+        Ok(()) => Ok(&header == b"SQLite format 3\0"),
+        Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => Ok(false),
+        Err(error) => Err(error).with_context(|| format!("failed to inspect {}", path.display())),
+    }
 }
 
 fn load_database(path: &Path) -> Result<Vec<Chat>> {
@@ -907,16 +916,25 @@ fn build_report(
     let mut matched_takeout = HashSet::new();
     let mut matches = Vec::new();
 
-    let mut exact_buckets: HashMap<Vec<(String, String)>, Vec<usize>> = HashMap::new();
-    for (index, chat) in baseline.iter().enumerate() {
+    let baseline_transcripts: Vec<_> = baseline
+        .iter()
+        .map(|chat| comparison_transcript(&chat.messages))
+        .collect();
+    let comparison_transcripts: Vec<_> = comparison
+        .iter()
+        .map(|chat| comparison_transcript(&chat.messages))
+        .collect();
+    let baseline_match: Vec<_> = baseline.iter().map(MatchContent::new).collect();
+    let comparison_match: Vec<_> = comparison.iter().map(MatchContent::new).collect();
+    let mut exact_buckets: HashMap<&[(String, String)], Vec<usize>> = HashMap::new();
+    for (index, transcript) in baseline_transcripts.iter().enumerate() {
         exact_buckets
-            .entry(comparison_transcript(&chat.messages))
+            .entry(transcript.as_slice())
             .or_default()
             .push(index);
     }
-    for (takeout_index, chat) in comparison.iter().enumerate() {
-        let transcript = comparison_transcript(&chat.messages);
-        let Some(candidates) = exact_buckets.get(&transcript) else {
+    for (takeout_index, transcript) in comparison_transcripts.iter().enumerate() {
+        let Some(candidates) = exact_buckets.get(transcript.as_slice()) else {
             continue;
         };
         let Some(&database_index) = candidates.iter().find(|index| !matched_db.contains(*index))
@@ -937,7 +955,12 @@ fn build_report(
             if matched_takeout.contains(&takeout_index) {
                 continue;
             }
-            if let Some(score) = match_score(database_chat, takeout_chat) {
+            if let Some(score) = match_score(
+                database_chat,
+                takeout_chat,
+                &baseline_match[database_index],
+                &comparison_match[takeout_index],
+            ) {
                 candidates.push((
                     score,
                     (database_chat.created_at - takeout_chat.created_at).abs() as i64,
@@ -1074,12 +1097,32 @@ fn build_report(
     }
 }
 
-fn match_score(database: &Chat, takeout: &Chat) -> Option<i32> {
+struct MatchContent {
+    user: String,
+    assistant: String,
+    user_nonempty: bool,
+    assistant_nonempty: bool,
+}
+impl MatchContent {
+    fn new(chat: &Chat) -> Self {
+        let user = first_role(chat, "user");
+        let assistant = first_role(chat, "assistant");
+        Self {
+            user: comparison_content(user),
+            assistant: comparison_content(assistant),
+            user_nonempty: !user.is_empty(),
+            assistant_nonempty: !assistant.is_empty(),
+        }
+    }
+}
+fn match_score(
+    database: &Chat,
+    takeout: &Chat,
+    left: &MatchContent,
+    right: &MatchContent,
+) -> Option<i32> {
     let same_title = database.title.eq_ignore_ascii_case(&takeout.title);
-    let database_user = first_role(database, "user");
-    let takeout_user = first_role(takeout, "user");
-    let same_user = !database_user.is_empty()
-        && comparison_content(database_user) == comparison_content(takeout_user);
+    let same_user = left.user_nonempty && left.user == right.user;
     let delta = (database.created_at - takeout.created_at).abs();
     if !(same_user || same_title && delta <= 604_800.0) {
         return None;
@@ -1092,11 +1135,7 @@ fn match_score(database: &Chat, takeout: &Chat) -> Option<i32> {
     if same_user {
         score += 35;
     }
-    let database_assistant = first_role(database, "assistant");
-    let takeout_assistant = first_role(takeout, "assistant");
-    if !database_assistant.is_empty()
-        && comparison_content(database_assistant) == comparison_content(takeout_assistant)
-    {
+    if left.assistant_nonempty && left.assistant == right.assistant {
         score += 10;
     }
     if database.messages.len() == takeout.messages.len() {
@@ -1168,31 +1207,45 @@ fn message_diff(
         return (Vec::new(), Vec::new(), modified);
     }
 
-    let rows = database.len() + 1;
-    let columns = takeout.len() + 1;
-    let mut lcs = vec![0usize; rows * columns];
+    // Two score rows plus a packed two-bit traceback preserve the original
+    // add-before-remove tie rule without an n*m usize matrix or repeated text normalization.
+    let left = comparison_transcript(database);
+    let right = comparison_transcript(takeout);
+    let columns = takeout.len();
+    let cells = database
+        .len()
+        .checked_mul(columns)
+        .expect("diff dimensions overflow");
+    let mut directions = vec![0u8; cells.div_ceil(4)];
+    let mut below = vec![0usize; columns + 1];
+    let mut current = vec![0usize; columns + 1];
     for database_index in (0..database.len()).rev() {
-        for takeout_index in (0..takeout.len()).rev() {
-            let cell = database_index * columns + takeout_index;
-            lcs[cell] = if messages_equal(&database[database_index], &takeout[takeout_index]) {
-                1 + lcs[(database_index + 1) * columns + takeout_index + 1]
+        current[columns] = 0;
+        for takeout_index in (0..columns).rev() {
+            let (score, direction) = if left[database_index] == right[takeout_index] {
+                (1 + below[takeout_index + 1], 0u8)
+            } else if current[takeout_index + 1] >= below[takeout_index] {
+                (current[takeout_index + 1], 1u8)
             } else {
-                lcs[(database_index + 1) * columns + takeout_index]
-                    .max(lcs[database_index * columns + takeout_index + 1])
+                (below[takeout_index], 2u8)
             };
+            current[takeout_index] = score;
+            let cell = database_index * columns + takeout_index;
+            directions[cell / 4] |= direction << ((cell % 4) * 2);
         }
+        std::mem::swap(&mut below, &mut current);
     }
 
     let mut added = Vec::new();
     let mut removed = Vec::new();
     let (mut database_index, mut takeout_index) = (0, 0);
     while database_index < database.len() && takeout_index < takeout.len() {
-        if messages_equal(&database[database_index], &takeout[takeout_index]) {
+        let cell = database_index * columns + takeout_index;
+        let direction = (directions[cell / 4] >> ((cell % 4) * 2)) & 3;
+        if direction == 0 {
             database_index += 1;
             takeout_index += 1;
-        } else if lcs[database_index * columns + takeout_index + 1]
-            >= lcs[(database_index + 1) * columns + takeout_index]
-        {
+        } else if direction == 1 {
             added.push(to_message_change(takeout_index, &takeout[takeout_index]));
             takeout_index += 1;
         } else {
@@ -1262,6 +1315,88 @@ mod tests {
             role: role.to_owned(),
             content: content.to_owned(),
         }
+    }
+
+    #[test]
+    fn packed_diff_preserves_reference_alignment() {
+        // The deliberately simple full-matrix oracle is test-only. Repeated
+        // symbols exercise ambiguous optimal alignments and add-before-remove ties.
+        let mut seed = 0x12345678u32;
+        let mut next = || {
+            seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+            seed
+        };
+        for case in 0..2000 {
+            let n = (next() % 15) as usize;
+            let m = (next() % 15) as usize;
+            if n == m {
+                continue;
+            }
+            let left: Vec<_> = (0..n)
+                .map(|_| message("user", &["a", "b", " c "][next() as usize % 3]))
+                .collect();
+            let right: Vec<_> = (0..m)
+                .map(|_| message("user", &["a", "b", "c"][next() as usize % 3]))
+                .collect();
+            let mut scores = vec![vec![0usize; m + 1]; n + 1];
+            for i in (0..n).rev() {
+                for j in (0..m).rev() {
+                    scores[i][j] = if left[i].content.trim() == right[j].content.trim() {
+                        1 + scores[i + 1][j + 1]
+                    } else {
+                        scores[i + 1][j].max(scores[i][j + 1])
+                    };
+                }
+            }
+            let (mut i, mut j) = (0, 0);
+            let (mut added, mut removed) = (Vec::new(), Vec::new());
+            while i < n && j < m {
+                if left[i].content.trim() == right[j].content.trim() {
+                    i += 1;
+                    j += 1;
+                } else if scores[i][j + 1] >= scores[i + 1][j] {
+                    added.push(j + 1);
+                    j += 1;
+                } else {
+                    removed.push(i + 1);
+                    i += 1;
+                }
+            }
+            added.extend(j + 1..=m);
+            removed.extend(i + 1..=n);
+            let (actual_added, actual_removed, modified) = message_diff(&left, &right);
+            assert_eq!(
+                actual_added
+                    .iter()
+                    .map(|message| message.position)
+                    .collect::<Vec<_>>(),
+                added,
+                "case {case}"
+            );
+            assert_eq!(
+                actual_removed
+                    .iter()
+                    .map(|message| message.position)
+                    .collect::<Vec<_>>(),
+                removed,
+                "case {case}"
+            );
+            assert!(modified.is_empty());
+        }
+    }
+
+    #[test]
+    fn sqlite_probe_accepts_header_and_short_files() {
+        use std::io::Write;
+        let file_path =
+            env::temp_dir().join(format!("aibackdiff-header-{}.db", std::process::id()));
+        let mut file = fs::File::create(&file_path).unwrap();
+        file.write_all(b"SQLite format 3\0").unwrap();
+        file.set_len(2 * 1024 * 1024 * 1024).unwrap();
+        assert!(is_sqlite_file(&file_path).unwrap());
+        file.set_len(5).unwrap();
+        assert!(!is_sqlite_file(&file_path).unwrap());
+        fs::remove_file(file_path).unwrap();
     }
 
     #[test]
@@ -1367,7 +1502,15 @@ mod tests {
             created_at: 700_000.0,
             messages: vec![message("user", "different")],
         };
-        assert_eq!(match_score(&database, &takeout), None);
+        assert_eq!(
+            match_score(
+                &database,
+                &takeout,
+                &MatchContent::new(&database),
+                &MatchContent::new(&takeout)
+            ),
+            None
+        );
     }
 
     #[test]

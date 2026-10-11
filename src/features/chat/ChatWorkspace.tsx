@@ -376,7 +376,12 @@ export function ChatWorkspace({
   }, [hasMoreConvs, invokeMode, isLoadingMoreConvs]);
 
   const loadConversationState = useCallback(async (conversationId: string) => {
-    return invokeMode('db:getConversationState', { conversationId });
+    const state = await invokeMode('db:getConversationState', { conversationId });
+    if (Array.isArray(state?.currentMessageIds)) {
+      const byId = new Map<string, Message>((state.allMessages || []).map((message: Message) => [message.id, message]));
+      state.currentMessages = state.currentMessageIds.map((id: string) => byId.get(id)).filter(Boolean);
+    }
+    return state;
   }, [invokeMode]);
 
   const handleSwitchBranch = useCallback((parentId: string, childId: string) => {

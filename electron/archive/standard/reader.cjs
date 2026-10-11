@@ -26,16 +26,24 @@ function isVisibleArchiveMessage(message) {
     && !isHiddenArchiveMessage(message);
 }
 
+function currentMessagesFromRows(conversation, allMessages) {
+  if (!conversation?.current_node_id) return allMessages;
+  const byId = new Map(allMessages.map((message) => [message.id, message]));
+  const path = [];
+  const seen = new Set();
+  let message = byId.get(conversation.current_node_id);
+  while (message && !seen.has(message.id)) {
+    seen.add(message.id);
+    path.push(message);
+    message = byId.get(message.parent_id);
+  }
+  return path.length ? path.reverse() : allMessages;
+}
+
 function getLinearMessages(db, conversationId) {
   const conversation = db.getConversation(conversationId);
   const allMessages = db.getMessages(conversationId);
-  if (!conversation?.current_node_id) return allMessages;
-
-  const currentPath = db.getLinearPath(conversation.current_node_id);
-  // A conversation can legitimately contain alternate branches and hidden
-  // tool nodes. The parent chain is the authoritative site order; falling
-  // back to every stored row makes those branches look randomly interleaved.
-  return currentPath.length > 0 ? currentPath : allMessages;
+  return currentMessagesFromRows(conversation, allMessages);
 }
 
 function readConversations(db) {
@@ -50,14 +58,15 @@ function readMessages(db, conversationId, { currentPath = true } = {}) {
   return currentPath ? getLinearMessages(db, conversationId) : db.getMessages(conversationId);
 }
 
-function readConversationState(db, conversationId) {
+function readConversationState(db, conversationId, { compact = false } = {}) {
   const conversation = readConversation(db, conversationId);
   const allMessages = readMessages(db, conversationId, { currentPath: false });
+  const currentMessages = currentMessagesFromRows(conversation, allMessages);
   return {
     conversation,
     currentNodeId: conversation?.current_node_id || null,
     allMessages,
-    currentMessages: getLinearMessages(db, conversationId),
+    ...(compact ? { currentMessageIds: currentMessages.map((message) => message.id) } : { currentMessages }),
   };
 }
 

@@ -47,6 +47,7 @@ Backup accounts are read-only in the viewer. Multiple backups from the same prov
 │   │   │   ├── index.cjs     # Universal archive read/write facade
 │   │   │   ├── writer.cjs    # Non-destructive standard records -> SQLite merge
 │   │   │   ├── reader.cjs    # Standard SQLite -> conversations/messages/state
+│   │   │   ├── summaries.cjs # Persistent exact counts/recency, transactional invalidation
 │   │   │   └── markdown.cjs  # Full current-path conversation -> Markdown export
 │   │   └── safety/
 │   │       ├── schema.cjs    # Delete guards, immutable audit, row recovery

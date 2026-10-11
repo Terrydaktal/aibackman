@@ -2,7 +2,45 @@ const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
 const Database = require('better-sqlite3');
+const { StringDecoder } = require('string_decoder');
 const VERIFIED_JOURNAL_STATES = new Map();
+
+function* journalLines(filePath) {
+  const descriptor = fs.openSync(filePath, 'r');
+  const buffer = Buffer.allocUnsafe(64 * 1024);
+  const decoder = new StringDecoder('utf8');
+  let remainder = '';
+  let pending = null;
+  let whitespaceLines = 0;
+  function* accept(line) {
+    if (!line) return;
+    if (!line.trim()) {
+      if (pending != null) whitespaceLines += 1;
+      return;
+    }
+    if (pending != null) {
+      yield pending;
+      for (let i = 0; i < whitespaceLines; i += 1) yield ' ';
+    } else line = line.trimStart();
+    pending = line;
+    whitespaceLines = 0;
+  }
+  try {
+    let bytes;
+    while ((bytes = fs.readSync(descriptor, buffer, 0, buffer.length, null)) > 0) {
+      remainder += decoder.write(buffer.subarray(0, bytes));
+      let start = 0;
+      let end;
+      while ((end = remainder.indexOf('\n', start)) >= 0) {
+        yield* accept(remainder.slice(start, end));
+        start = end + 1;
+      }
+      remainder = remainder.slice(start);
+    }
+    yield* accept(remainder + decoder.end());
+    if (pending != null) yield pending.trimEnd();
+  } finally { fs.closeSync(descriptor); }
+}
 
 function archiveRootForDatabase(dbPath) {
   const parent = path.dirname(path.resolve(dbPath));
@@ -187,15 +225,19 @@ class DurableAuditJournal {
 
   verifyIntegrity() {
     if (!fs.existsSync(this.filePath)) return { valid: true, records: 0, legacyRecords: 0 };
-    const lines = fs.readFileSync(this.filePath, 'utf8').trim().split('\n').filter(Boolean);
     let previousHash = null;
     let legacyRecords = 0;
-    for (const line of lines) {
+    let records = 0;
+    let invalid = null;
+    for (const line of journalLines(this.filePath)) {
+      records += 1;
+      if (invalid != null) continue;
       let record;
       try {
         record = JSON.parse(line);
       } catch {
-        return { valid: false, records: lines.length, legacyRecords, first_invalid_sequence: 'invalid-json' };
+        invalid = 'invalid-json';
+        continue;
       }
       if (!record.integrity?.hash) {
         legacyRecords += 1;
@@ -207,11 +249,12 @@ class DurableAuditJournal {
         .update(`${previousHash || ''}\0${JSON.stringify(payload)}`)
         .digest('hex');
       if (integrity.previous_hash !== previousHash || integrity.hash !== expected) {
-        return { valid: false, records: lines.length, legacyRecords, first_invalid_sequence: record.sequence };
+        invalid = record.sequence ?? 'unknown';
+        continue;
       }
       previousHash = integrity.hash;
     }
-    return { valid: true, records: lines.length, legacyRecords };
+    return { valid: invalid == null, records, legacyRecords, ...(invalid == null ? {} : { first_invalid_sequence: invalid }) };
   }
 }
 

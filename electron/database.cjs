@@ -1,4 +1,5 @@
 const Database = require('better-sqlite3');
+const { createSummaryReader, unixTime } = require('./archive/standard/summaries.cjs');
 const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
@@ -389,6 +390,8 @@ class ChatDatabase {
   #statsCache = null;
   #statsDataVersion = null;
   #statsMutationVersion = -1;
+  #statements = new Map();
+  #summaries;
 
   constructor(filename = 'chatgpt.db', {
     diagnostics = null,
@@ -488,6 +491,7 @@ class ChatDatabase {
     this.storeInstanceId = storedIdentity.store_instance_id;
     this.storeGeneration = storedIdentity.store_generation;
     this.repairStartupMetadata();
+    this.#summaries = createSummaryReader(this.#db);
     this.#diagnosticResourceId = this.diagnostics?.resourceOpen(null, {
       type: 'sqlite-database',
       account_id: this.accountId,
@@ -505,6 +509,16 @@ class ChatDatabase {
     if (previousSchemaVersion < ARCHIVE_SAFETY_SCHEMA_VERSION) {
       this.#db.pragma(`user_version = ${ARCHIVE_SAFETY_SCHEMA_VERSION}`);
     }
+  }
+
+  prepare(sql) {
+    let statement = this.#statements.get(sql);
+    if (!statement) {
+      statement = this.#db.prepare(sql);
+      if (this.#statements.size >= 128) this.#statements.delete(this.#statements.keys().next().value);
+      this.#statements.set(sql, statement);
+    }
+    return statement;
   }
 
   get dbPath() {
@@ -993,31 +1007,14 @@ class ChatDatabase {
   }
 
   getConversations() {
-    return this.#db.prepare(`
-      WITH message_recency AS (
-        SELECT
-          conversation_id,
-          MAX(
-            CASE
-              WHEN typeof(created_at) IN ('integer', 'real') THEN CAST(created_at AS REAL)
-              WHEN created_at IS NULL THEN NULL
-              WHEN instr(CAST(created_at AS TEXT), '-') = 0
-                AND instr(CAST(created_at AS TEXT), 'T') = 0
-                AND instr(CAST(created_at AS TEXT), ':') = 0
-              THEN CAST(created_at AS REAL)
-              ELSE (julianday(created_at) - 2440587.5) * 86400.0
-            END
-          ) AS last_message_at,
-          COUNT(*) AS message_count
-        FROM messages
-        GROUP BY conversation_id
-      )
+    this.#summaries.flush();
+    return this.prepare(`
       SELECT
         conversations.*,
         message_recency.last_message_at,
         COALESCE(message_recency.message_count, 0) AS message_count
       FROM conversations
-      LEFT JOIN message_recency ON message_recency.conversation_id = conversations.id
+      LEFT JOIN derived_conversation_summaries AS message_recency ON message_recency.conversation_id = conversations.id
       ORDER BY
         COALESCE(
           message_recency.last_message_at,
@@ -1045,11 +1042,11 @@ class ChatDatabase {
   }
 
   getConversation(id) {
-    return this.#db.prepare('SELECT * FROM conversations WHERE id = ?').get(id);
+    return this.prepare('SELECT * FROM conversations WHERE id = ?').get(id);
   }
 
   getMessages(conversationId) {
-    return this.#db.prepare('SELECT * FROM messages WHERE conversation_id = ? ORDER BY created_at ASC, id ASC').all(conversationId);
+    return this.prepare('SELECT * FROM messages WHERE conversation_id = ? ORDER BY created_at ASC, id ASC').all(conversationId);
   }
 
   getMessage(id) {
@@ -1124,7 +1121,7 @@ class ChatDatabase {
       entityType: 'conversation',
       entityId: conv.id,
     }, () => {
-      const stmt = this.#db.prepare(`
+      const stmt = this.prepare(`
         INSERT INTO conversations (id, title, created_at, updated_at, last_synced_updated_at, current_node_id, cache_format_version, is_deleted_on_web)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(id) DO UPDATE SET
@@ -1135,6 +1132,13 @@ class ChatDatabase {
           current_node_id = COALESCE(excluded.current_node_id, conversations.current_node_id),
           cache_format_version = COALESCE(excluded.cache_format_version, conversations.cache_format_version),
           is_deleted_on_web = excluded.is_deleted_on_web
+        WHERE conversations.title IS NOT COALESCE(NULLIF(excluded.title, ''), conversations.title)
+          OR conversations.created_at IS NOT COALESCE(excluded.created_at, conversations.created_at)
+          OR conversations.updated_at IS NOT COALESCE(excluded.updated_at, conversations.updated_at)
+          OR conversations.last_synced_updated_at IS NOT COALESCE(excluded.last_synced_updated_at, conversations.last_synced_updated_at)
+          OR conversations.current_node_id IS NOT COALESCE(excluded.current_node_id, conversations.current_node_id)
+          OR conversations.cache_format_version IS NOT COALESCE(excluded.cache_format_version, conversations.cache_format_version)
+          OR conversations.is_deleted_on_web IS NOT excluded.is_deleted_on_web
       `);
       return stmt.run(
         conv.id,
@@ -1265,97 +1269,22 @@ class ChatDatabase {
     ) {
       return { ...this.#statsCache };
     }
-    const row = this.#db.prepare(`
-      WITH eligible_messages AS (
-        SELECT
-          m.conversation_id,
-          m.role,
-          m.created_at,
-          CASE
-            WHEN typeof(m.created_at) IN ('integer', 'real') THEN CAST(m.created_at AS REAL)
-            WHEN m.created_at IS NULL THEN NULL
-            WHEN instr(CAST(m.created_at AS TEXT), '-') = 0
-              AND instr(CAST(m.created_at AS TEXT), 'T') = 0
-              AND instr(CAST(m.created_at AS TEXT), ':') = 0
-            THEN CAST(m.created_at AS REAL)
-            ELSE (julianday(m.created_at) - 2440587.5) * 86400.0
-          END AS created_at_unix,
-          m.id,
-          COALESCE(json_extract(m.metadata_json, '$.source'), '') AS source,
-          COALESCE(json_extract(m.metadata_json, '$.phase'), '') AS phase
-        FROM messages AS m
-        JOIN conversations AS c ON c.id = m.conversation_id
-        WHERE IFNULL(c.is_deleted_on_web, 0) = 0
-          AND m.role IN ('user', 'assistant')
-          AND trim(COALESCE(m.content, '')) <> ''
-          AND COALESCE(json_extract(m.metadata_json, '$.is_thinking_preamble_message'), 0) != 1
-          AND COALESCE(json_extract(m.metadata_json, '$.is_visually_hidden_from_conversation'), 0) != 1
-      ),
-      ordered_messages AS (
-        SELECT
-          eligible_messages.*,
-          LAG(role) OVER (
-            PARTITION BY conversation_id
-            ORDER BY created_at, id
-          ) AS previous_role
-        FROM eligible_messages
-      ),
-      codex_runs AS (
-        SELECT
-          ordered_messages.*,
-          SUM(
-            CASE
-              WHEN role = 'assistant'
-                AND source IN ('codex-local', 'gemini-cli-local')
-                AND COALESCE(previous_role, '') != 'assistant'
-              THEN 1
-              ELSE 0
-            END
-          ) OVER (
-            PARTITION BY conversation_id
-            ORDER BY created_at, id
-            ROWS UNBOUNDED PRECEDING
-          ) AS assistant_run
-        FROM ordered_messages
-      ),
-      codex_responses AS (
-        SELECT conversation_id, assistant_run
-        FROM codex_runs
-        WHERE role = 'assistant' AND source IN ('codex-local', 'gemini-cli-local')
-        GROUP BY conversation_id, assistant_run
-        HAVING MAX(CASE WHEN phase != 'commentary' THEN 1 ELSE 0 END) = 1
-      )
+    this.#summaries.flush();
+    const row = this.prepare(`
       SELECT
         (SELECT COUNT(*) FROM conversations WHERE IFNULL(is_deleted_on_web, 0) = 0) AS conversation_count,
-        -- Keep internal/tool rows and Codex commentary fragments available for
-        -- rendering, but do not present them as separate archive messages. A
-        -- local agent response may contain several consecutive stream events,
-        -- so count that run once.
-        (
-          SELECT COUNT(*)
-          FROM eligible_messages
-          WHERE NOT (
-            role = 'assistant'
-            AND source IN ('codex-local', 'gemini-cli-local')
-          )
-        ) + (SELECT COUNT(*) FROM codex_responses) AS message_count,
-        (SELECT COUNT(DISTINCT conversation_id) FROM messages) AS cached_count,
-        (SELECT MAX(created_at_unix) FROM eligible_messages) AS latest_message_at,
-        (
-          SELECT MAX(
-            CASE
-              WHEN typeof(updated_at) IN ('integer', 'real') THEN CAST(updated_at AS REAL)
-              WHEN updated_at IS NULL THEN NULL
-              WHEN instr(CAST(updated_at AS TEXT), '-') = 0
-                AND instr(CAST(updated_at AS TEXT), 'T') = 0
-                AND instr(CAST(updated_at AS TEXT), ':') = 0
-              THEN CAST(updated_at AS REAL)
-              ELSE (julianday(updated_at) - 2440587.5) * 86400.0
-            END
-          )
-          FROM conversations
-        ) AS latest_updated_at
+        (SELECT COALESCE(SUM(s.display_count), 0) FROM derived_conversation_summaries s
+          JOIN conversations c ON c.id = s.conversation_id WHERE IFNULL(c.is_deleted_on_web, 0) = 0) AS message_count,
+        (SELECT COUNT(*) FROM derived_conversation_summaries WHERE message_count > 0) AS cached_count,
+        (SELECT MAX(s.latest_visible_at) FROM derived_conversation_summaries s
+          JOIN conversations c ON c.id = s.conversation_id WHERE IFNULL(c.is_deleted_on_web, 0) = 0) AS latest_message_at,
+        (SELECT MAX(${unixTime('updated_at')}) FROM conversations) AS latest_updated_at,
+        (SELECT COALESCE(SUM(s.invalid_metadata_count), 0) FROM derived_conversation_summaries s
+          JOIN conversations c ON c.id = s.conversation_id) AS invalid_metadata_count
     `).get();
+    // Preserve the old statistics error for corrupt metadata, while list
+    // queries (which never parsed metadata) remain available for recovery.
+    if (row.invalid_metadata_count > 0) this.prepare("SELECT json_extract('invalid', '$.source')").get();
     const stats = {
       conversationCount: Number(row?.conversation_count || 0),
       messageCount: Number(row?.message_count || 0),
@@ -1652,7 +1581,7 @@ class ChatDatabase {
       entityType: 'message',
       entityId: msg.id,
     }, () => {
-      const stmt = this.#db.prepare(`
+      const stmt = this.prepare(`
       INSERT INTO messages (id, conversation_id, role, content, metadata_json, created_at, parent_id)
       VALUES (?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(id) DO UPDATE SET
@@ -1682,6 +1611,11 @@ class ChatDatabase {
         metadata_json = COALESCE(excluded.metadata_json, messages.metadata_json),
         created_at = COALESCE(excluded.created_at, messages.created_at),
         parent_id = COALESCE(excluded.parent_id, messages.parent_id)
+      WHERE messages.role IS NOT COALESCE(NULLIF(excluded.role, ''), messages.role)
+        OR messages.content IS NOT excluded.content
+        OR messages.metadata_json IS NOT COALESCE(excluded.metadata_json, messages.metadata_json)
+        OR messages.created_at IS NOT COALESCE(excluded.created_at, messages.created_at)
+        OR messages.parent_id IS NOT COALESCE(excluded.parent_id, messages.parent_id)
     `);
       return stmt.run(
         msg.id,

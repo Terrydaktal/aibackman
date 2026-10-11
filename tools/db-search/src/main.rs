@@ -432,7 +432,7 @@ fn fetch_search_rows(
         role_predicate = role.sql_predicate()
     );
 
-    let mut stmt = conn.prepare(&sql)?;
+    let mut stmt = conn.prepare_cached(&sql)?;
     stmt.query_map(params![match_query, fetch_limit], |sql_row| {
         let row = SearchRow {
             id: sql_row.get(0)?,
@@ -485,7 +485,7 @@ fn lower_bound_search_count(
     );
     let probe_limit = (lower_bound + 1) as i64;
     let count = conn
-        .prepare(&sql)?
+        .prepare_cached(&sql)?
         .query_map(params![match_query, probe_limit], |_| Ok(()))?
         .count();
     Ok((count.min(lower_bound), count > lower_bound))

@@ -501,7 +501,7 @@ function setupIpc() {
     const mode = typeof arg1 === 'object' ? arg1 : arg2;
     if (!conversationId) throw new Error('Missing conversationId');
     const targetDb = getDatabaseForMode(mode);
-    return readConversationState(targetDb, conversationId);
+    return readConversationState(targetDb, conversationId, { compact: true });
   });
 
   ipcMain.handle('api:prewarmConversation', async (event, payload) => {

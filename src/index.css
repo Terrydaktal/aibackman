@@ -1025,6 +1025,23 @@ body {
   z-index: 10;
 }
 
+.archive-export-status {
+  position: absolute;
+  top: 10px;
+  left: 20px;
+  max-width: min(70%, 640px);
+  padding: 5px 9px;
+  border: 1px solid rgba(16, 163, 127, 0.45);
+  border-radius: 5px;
+  background: rgba(16, 163, 127, 0.12);
+  color: #b8f3df;
+  font-size: 0.75em;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  z-index: 10;
+}
+
 .sync-btn-sidebar {
   background: transparent;
   border: none;

@@ -3,4 +3,5 @@
 module.exports = {
   ...require('./reader.cjs'),
   ...require('./writer.cjs'),
+  ...require('./markdown.cjs'),
 };

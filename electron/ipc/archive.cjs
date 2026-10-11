@@ -1,7 +1,14 @@
 const fs = require('fs');
 const path = require('path');
 const { spawn } = require('child_process');
-const { readConversations } = require('../archive/standard/index.cjs');
+const {
+  formatConversationMarkdown,
+  isVisibleArchiveMessage,
+  readConversation,
+  readConversations,
+  readMessages,
+  safeMarkdownFilename,
+} = require('../archive/standard/index.cjs');
 
 let comparatorProcess = null;
 
@@ -37,6 +44,43 @@ function registerArchiveIpc({
   ipcMain.handle('archive:globalSearch', async (_event, payload) => (
     accountManager.globalSearch(payload?.query, Number(payload?.limit || 200), payload?.sort, payload?.role)
   ));
+
+  ipcMain.handle('archive:exportMarkdown', async (_event, payload) => {
+    const accountId = String(payload?.accountId || '').trim();
+    const conversationId = String(payload?.conversationId || '').trim();
+    if (!accountId) throw new Error('Missing archive account id.');
+    if (!conversationId) throw new Error('Missing conversation id.');
+
+    const account = accountManager.getAccount(accountId);
+    if (!account) throw new Error('Unknown archive account.');
+    const database = accountManager.getDatabase(account);
+    const conversation = readConversation(database, conversationId);
+    if (!conversation) throw new Error('Conversation not found in archive.');
+
+    const messages = readMessages(database, conversationId)
+      .filter(isVisibleArchiveMessage);
+    const markdown = formatConversationMarkdown(conversation, messages, {
+      accountLabel: account.label,
+      agentName: account.agentName,
+    });
+    const result = await dialog.showSaveDialog(getMainWindow(), {
+      title: `Export ${conversation.title || 'chat'} as Markdown`,
+      defaultPath: path.join(app.getPath('downloads'), safeMarkdownFilename(conversation.title)),
+      filters: [
+        { name: 'Markdown', extensions: ['md'] },
+        { name: 'All files', extensions: ['*'] },
+      ],
+    });
+    if (result.canceled || !result.filePath) {
+      return { canceled: true, messageCount: messages.length };
+    }
+
+    const outputPath = result.filePath.toLowerCase().endsWith('.md')
+      ? result.filePath
+      : `${result.filePath}.md`;
+    await fs.promises.writeFile(outputPath, markdown, 'utf8');
+    return { canceled: false, path: outputPath, messageCount: messages.length };
+  });
 
   ipcMain.handle('archive:createAccount', async (_event, payload) => (
     accountManager.createAccount(payload || {})

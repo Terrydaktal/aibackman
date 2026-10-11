@@ -21,8 +21,13 @@ const { fileFingerprint } = require('../electron/agents/utils.cjs');
 const { formatChatGptContent } = require('../electron/providers/formatters/chatgpt.cjs');
 const {
   getLinearMessages,
+  isVisibleArchiveMessage,
   readConversationState,
 } = require('../electron/archive/standard/reader.cjs');
+const {
+  formatConversationMarkdown,
+  safeMarkdownFilename,
+} = require('../electron/archive/standard/markdown.cjs');
 const { writeConversationIndex } = require('../electron/archive/standard/writer.cjs');
 const { STANDARD_CACHE_FORMAT_VERSION } = require('../electron/archive/standard/cacheVersion.cjs');
 const {
@@ -51,6 +56,23 @@ async function main() {
       formatChatGptContent('Evidence fileciteturn50file2L172-L219 and fileciteturn50file3.'),
       'Evidence [1 · L172-L219](citation://turn50file2) and [2](citation://turn50file3).'
     );
+    const exportedMarkdown = formatConversationMarkdown(
+      { title: 'Markdown export test', created_at: 100, updated_at: 102 },
+      [
+        { role: 'user', content: 'Export this conversation', created_at: 100 },
+        {
+          role: 'assistant',
+          content: 'The answer is preserved.',
+          created_at: 101,
+          metadata_json: JSON.stringify({ model_slug: 'gpt-5-6-thinking', thinking_effort: 'max' }),
+        },
+      ],
+      { accountLabel: '9lewis9@gmail.com', agentName: 'ChatGPT' }
+    );
+    assert.match(exportedMarkdown, /## You — 1970-01-01T00:01:40\.000Z/);
+    assert.match(exportedMarkdown, /GPT-5\.6 Thinking · Thinking effort: xhigh/);
+    assert.equal(safeMarkdownFilename('A / B: test'), 'A - B- test.md');
+    assert.equal(isVisibleArchiveMessage({ role: 'tool', content: 'internal output' }), false);
     const chatgptRuntimeInstance = chatgptRuntime({
       app: { getAppMetrics: () => [] },
       BrowserWindow: class {},

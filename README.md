@@ -42,7 +42,8 @@ Backup accounts are read-only in the viewer. Multiple backups from the same prov
 │   │   ├── standard/
 │   │   │   ├── index.cjs     # Universal archive read/write facade
 │   │   │   ├── writer.cjs    # Non-destructive standard records -> SQLite merge
-│   │   │   └── reader.cjs    # Standard SQLite -> conversations/messages/state
+│   │   │   ├── reader.cjs    # Standard SQLite -> conversations/messages/state
+│   │   │   └── markdown.cjs  # Full current-path conversation -> Markdown export
 │   │   └── safety/
 │   │       ├── schema.cjs    # Delete guards, immutable audit, row recovery
 │   │       └── journal.cjs   # Durable JSONL journal, DB snapshots, quarantine
@@ -112,9 +113,10 @@ Dependencies point inward in this order:
 6. `archive/safety/*` guards destructive SQL, versions overwritten rows, snapshots bulk operations, and records durable audit events below every provider.
 7. `archive/standard/reader.cjs` is the only standard database read/state path used to return conversations and messages to the application.
 8. `src/archive/standard/UniversalArchivePresenter.tsx` is the shared renderer for every provider; it consumes the same universal conversation/message format and can clean legacy records at display time.
-9. `accounts/manager.cjs` resolves accounts, opens databases lazily, invokes parser plugins, and combines global-search results.
-10. `bridges/*`, `conversations/*`, and `services/*` own live-site automation, source-specific branch safeguards, and cache workflows behind narrow interfaces.
-11. `ipc/archive.cjs` exposes account operations without knowing provider formats, while `main.cjs` composes Electron windows, authentication, account services, and live-provider runtimes.
+9. `archive/standard/markdown.cjs` exports the authoritative current conversation path as portable Markdown, including dates, available model/effort metadata, and stored rich-result text.
+10. `accounts/manager.cjs` resolves accounts, opens databases lazily, invokes parser plugins, and combines global-search results.
+11. `bridges/*`, `conversations/*`, and `services/*` own live-site automation, source-specific branch safeguards, and cache workflows behind narrow interfaces.
+12. `ipc/archive.cjs` exposes account operations without knowing provider formats, while `main.cjs` composes Electron windows, authentication, account services, and live-provider runtimes.
 
 The provider registry pairs each provider implementation with its scraper and backup parser:
 
@@ -236,6 +238,10 @@ Codex reads all system sessions and routes them by the account IDs found in sess
 4. Results can show all messages, user messages only, or assistant messages only.
 5. Relevance is the default order; results can also be ordered by message date, oldest or newest first.
 6. Selecting a result opens the correct account, chat, message, and highlight query.
+
+### Markdown export
+
+Open any chat and use the download button in the workspace footer, or right-click a chat in the sidebar and choose `Export Markdown`. The export is written through the Electron save dialog and contains the archive's complete current conversation path, visible user and assistant messages, message dates, available model/thinking metadata, and stored rich-result text.
 
 ### Live synchronization
 

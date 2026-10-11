@@ -93,6 +93,8 @@ export function ChatWorkspace({
   const [inputValue, setInputValue] = useState('');
   const [isSending, setIsSending] = useState(false);
   const [sendError, setSendError] = useState<string | null>(null);
+  const [isExporting, setIsExporting] = useState(false);
+  const [exportStatus, setExportStatus] = useState<string | null>(null);
   const [isReauthenticating, setIsReauthenticating] = useState(false);
   const [bridgeComposerStatus, setBridgeComposerStatus] = useState<BridgeComposerStatus | null>(null);
 
@@ -127,6 +129,7 @@ export function ChatWorkspace({
   const panRaf = useRef<number | null>(null);
   const panScrollTargetRef = useRef<HTMLElement | null>(null);
   const conversationsScrollerRef = useRef<HTMLElement | null>(null);
+  const conversationListVirtuosoRef = useRef<VirtuosoHandle>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const suppressMiddlePasteRef = useRef(false);
   const suppressMiddlePasteUntilRef = useRef(0);
@@ -430,6 +433,7 @@ export function ChatWorkspace({
 
     setRestoreVirtuosoState(virtuosoStateByConversationRef.current[id] || null);
     clearVisibleMessages();
+    setExportStatus(null);
     setActiveConvId(id);
     activeConvIdRef.current = id;
     const localState = await loadConversationState(id);
@@ -515,10 +519,17 @@ export function ChatWorkspace({
   useEffect(() => {
     selectConversationRef.current = selectConversation;
   }, [selectConversation]);
+  const revealConversationInSidebar = useCallback((conversationId: string) => {
+    const index = orderedConversations.findIndex((conversation) => conversation.id === conversationId);
+    if (index < 0) return;
+    window.requestAnimationFrame(() => {
+      conversationListVirtuosoRef.current?.scrollToIndex({ index, align: 'center', behavior: 'auto' });
+    });
+  }, [orderedConversations]);
   const handleArchiveSearchNavigation = useCallback((result: { id: string; conversation_id: string }, query: string) => {
     jumpToMessageInCurrentChat(result.id, { highlightQuery: query, occurrence: 0 });
-    void selectConversation(result.conversation_id);
-  }, [jumpToMessageInCurrentChat, selectConversation]);
+    void selectConversation(result.conversation_id).finally(() => revealConversationInSidebar(result.conversation_id));
+  }, [jumpToMessageInCurrentChat, revealConversationInSidebar, selectConversation]);
   const {
     close: closeSearch,
     isOpen: showSearch,
@@ -749,6 +760,22 @@ export function ChatWorkspace({
     }
   };
 
+  const handleExportMarkdown = useCallback(async (conversationId = activeConvIdRef.current) => {
+    if (!conversationId || isExporting) return;
+    setIsExporting(true);
+    setExportStatus(null);
+    try {
+      const result = await invokeMode('archive:exportMarkdown', { conversationId });
+      if (result?.canceled) return;
+      setExportStatus(`Exported ${result?.messageCount || 0} messages to ${result?.path || 'a Markdown file'}.`);
+    } catch (error) {
+      console.error('Failed to export Markdown', error);
+      setExportStatus(`Export failed: ${formatSendError(error)}`);
+    } finally {
+      setIsExporting(false);
+    }
+  }, [invokeMode, isExporting]);
+
   const handleAudit = async () => {
     if (!canCacheAll) return;
     setIsSyncing(true);
@@ -909,6 +936,11 @@ export function ChatWorkspace({
   }, [canLiveSync, canSend, checkAuth, initialConversationId, initialMessageId, initialSearchQuery, invokeMode, lastConvStorageKey, restoreInitialTarget]);
 
   useEffect(() => {
+    if (!initialConversationId || !isSidebarOpen) return;
+    revealConversationInSidebar(initialConversationId);
+  }, [initialConversationId, isSidebarOpen, revealConversationInSidebar]);
+
+  useEffect(() => {
     const handleGlobalPaste = (e: ClipboardEvent) => {
       const items = e.clipboardData?.items;
       if (items) {
@@ -1000,6 +1032,7 @@ export function ChatWorkspace({
           </div>
           <div className="conversations-list" onMouseDown={(e) => startPanning(e, conversationsScrollerRef.current || (e.currentTarget as HTMLElement))}>
             <Virtuoso
+              ref={conversationListVirtuosoRef}
               data={orderedConversations}
               endReached={loadMoreConversations}
               scrollerRef={handleConversationsScrollerRef}
@@ -1098,6 +1131,15 @@ export function ChatWorkspace({
                 <svg viewBox="0 0 24 24" fill="currentColor" width="16" height="16"><path d="M17.65 6.35C16.2 4.9 14.21 4 12 4c-4.42 0-7.99 3.58-7.99 8s3.57 8 7.99 8c3.73 0 6.84-2.55 7.73-6h-2.08c-.82 2.33-3.04 4-5.65 4-3.31 0-6-2.69-6-6s2.69-6 6-6c1.66 0 3.14.69 4.22 1.78L13 11h7V4l-2.35 2.35z"/></svg>
               </button>
               <button
+                className="sync-btn-sidebar"
+                onClick={() => void handleExportMarkdown()}
+                disabled={!activeConvId || isExporting}
+                title="Export this entire chat as Markdown"
+                aria-label="Export this entire chat as Markdown"
+              >
+                <svg viewBox="0 0 24 24" fill="currentColor" width="16" height="16" aria-hidden="true"><path d="M19 9h-4V3H9v6H5l7 7 7-7zM5 18v2h14v-2H5z"/></svg>
+              </button>
+              <button
                 className="workspace-home-btn"
                 onClick={onGoHome}
                 title="Return to the start menu"
@@ -1137,6 +1179,7 @@ export function ChatWorkspace({
         <div className="chat-body">
           <div className="chat-pane">
             {isSyncing && <div className="sync-indicator">Syncing...</div>}
+            {exportStatus && <div className="archive-export-status" role="status">{exportStatus}</div>}
             <div className="messages-container" onMouseDown={(e) => startPanning(e, scrollerRef.current)}>
               <Virtuoso key={activeConvId || '__new_chat__'} ref={virtuosoRef} scrollerRef={handleMessageScrollerRef} data={displayMessagesForView} initialTopMostItemIndex={displayMessagesForView.length > 0 ? displayMessagesForView.length - 1 : 0} restoreStateFrom={restoreVirtuosoState || undefined} followOutput={false} defaultItemHeight={180} increaseViewportBy={{ top: mapSearchNeedle ? 420 : 1200, bottom: mapSearchNeedle ? 240 : 400 }} overscan={mapSearchNeedle ? { main: 260, reverse: 320 } : { main: 1000, reverse: 1400 }} isScrolling={(isScrolling) => { if (isScrolling) scheduleViewportHighlightUpdate(); else updateViewportNavHighlight(); }} rangeChanged={handleMessageRangeChanged}
                 itemContent={(_index, msg) => {
@@ -1470,6 +1513,17 @@ export function ChatWorkspace({
           style={{ left: conversationContextMenu.x, top: conversationContextMenu.y }}
           onContextMenu={(e) => e.preventDefault()}
         >
+          <button
+            className="conversation-context-menu-item"
+            onClick={() => {
+              const { conversationId } = conversationContextMenu;
+              setConversationContextMenu(null);
+              void handleExportMarkdown(conversationId);
+            }}
+            disabled={isExporting}
+          >
+            Export Markdown
+          </button>
           <button
             className="conversation-context-menu-item"
             onClick={() => handleDeleteConversation(conversationContextMenu.conversationId)}

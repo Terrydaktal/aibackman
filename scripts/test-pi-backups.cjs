@@ -191,7 +191,7 @@ async function main() {
     fs.writeFileSync(badFile, '{"SYNTHETIC_PRIVATE_MARKER":');
     await assert.rejects(pi.importBackup({ db, inputPath: badFile }), (error) => !error.message.includes('SYNTHETIC_PRIVATE_MARKER'));
     await assert.rejects(manager.importBackup(account.id, badFile), (error) =>
-      !error.message.includes('SYNTHETIC_PRIVATE_MARKER'));
+      !error.message.includes('SYNTHETIC_PRIVATE_MARKER') && !!error.preImportSnapshotPath && fs.existsSync(error.preImportSnapshotPath));
     assert.ok(db.getAuditTrail(50).length > 0);
     console.log('Pi discovery, parser, refresh worker, merge safety, and account integration checks passed (synthetic data only).');
   } finally {

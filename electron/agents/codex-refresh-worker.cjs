@@ -47,6 +47,7 @@ async function run() {
     } else {
       throw new Error(`Unknown Codex refresh worker mode: ${workerData?.mode || 'missing'}.`);
     }
+    for (const db of databases) db.getStats();
     flushProgress();
     parentPort.postMessage({ type: 'result', result });
   } finally {

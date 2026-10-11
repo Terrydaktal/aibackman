@@ -3,6 +3,7 @@ const fs = require('fs');
 const path = require('path');
 const AccountCatalog = require('./catalog.cjs');
 const ChatDatabase = require('../database.cjs');
+const { runArchiveWorker } = require('../providers/shared/archive-worker.cjs');
 const { getAgentPlugin, listAgentPlugins } = require('../agents/registry.cjs');
 const { stableId } = require('../agents/utils.cjs');
 const {
@@ -28,6 +29,8 @@ class AccountManager {
     this.legacyDatabases = legacyDatabases;
     this.legacyIdentities = legacyIdentities;
     this.diagnostics = diagnostics;
+    this.overviewRevision = 0;
+    this.overviewPending = null;
     this.migrateLegacyDatabasePaths();
   }
 
@@ -222,8 +225,23 @@ class AccountManager {
     return this.catalog.listAccounts().map((row) => this.parseRow(row)).filter(Boolean);
   }
 
-  getArchiveOverview() {
-    const accounts = this.listAccounts().map((account) => {
+  async getArchiveOverviewAsync() {
+    this.overviewRevision += 1;
+    if (this.overviewPending) return this.overviewPending;
+    const pending = (async () => {
+      let revision, accounts;
+      do {
+        revision = this.overviewRevision;
+        accounts = await runArchiveWorker({ operation: 'overview', accounts: this.listAccounts() }, null, this.diagnostics);
+      } while (revision !== this.overviewRevision);
+      return this.getArchiveOverview(accounts);
+    })();
+    this.overviewPending = pending;
+    try { return await pending; } finally { if (this.overviewPending === pending) this.overviewPending = null; }
+  }
+
+  getArchiveOverview(precomputedAccounts = null) {
+    const accounts = precomputedAccounts || this.listAccounts().map((account) => {
       const database = this.getDatabase(account);
       return {
         ...account,
@@ -323,6 +341,7 @@ class AccountManager {
     }
     const db = this.getDatabase(account);
     const operationId = crypto.randomUUID();
+    db.searchWorker.stop();
     this.auditJournal.append({
       action: 'backup-import-started',
       operation_id: operationId,
@@ -333,7 +352,6 @@ class AccountManager {
     });
     let snapshot = null;
     try {
-      snapshot = db.createRecoverySnapshot('before-official-backup-import', { operationId });
       const result = await backupParser.importBackup({
         db,
         inputPath,
@@ -341,7 +359,9 @@ class AccountManager {
         // nested Takeout folder, so absence is never evidence for deletion.
         replaceExisting: false,
         sourceConfig: account.sourceConfig,
+        snapshotOperationId: operationId,
       });
+      snapshot = result.preImportSnapshotPath ? { snapshot_database: result.preImportSnapshotPath } : null;
       this.catalog.upsertAccount({
         ...account,
         sourceConfig: { ...account.sourceConfig, lastImportPath: result.sourcePath || inputPath },
@@ -375,6 +395,7 @@ class AccountManager {
         preImportSnapshotPath: snapshot?.snapshot_database || null,
       };
     } catch (error) {
+      if (error.preImportSnapshotPath) snapshot = { snapshot_database: error.preImportSnapshotPath };
       try {
         this.auditJournal.append({
           action: 'backup-import-failed',
@@ -401,12 +422,13 @@ class AccountManager {
     if (typeof backupParser?.refreshLocal !== 'function') {
       throw new Error(`${plugin?.name || account.agentId} is not a local session source.`);
     }
-    if (plugin.capabilities?.sharedLocalSource && typeof plugin.refreshAllLocal === 'function') {
+    if (plugin.capabilities?.sharedLocalSource && typeof backupParser.refreshAllLocal === 'function') {
       const accounts = this.listAccounts().filter((candidate) => (
         candidate.agentId === account.agentId && candidate.capabilities.localBackup
       ));
-      const batch = await plugin.refreshAllLocal({
+      const batch = await backupParser.refreshAllLocal({
         accounts,
+        diagnostics: this.diagnostics,
         getDatabase: (candidate) => this.getDatabase(candidate),
         onProgress,
       });
@@ -444,6 +466,7 @@ class AccountManager {
       if (typeof backupParser?.refreshAllLocal === 'function') {
         const batch = await backupParser.refreshAllLocal({
           accounts: agentAccounts,
+          diagnostics: this.diagnostics,
           getDatabase: (account) => this.getDatabase(account),
           onProgress,
         });

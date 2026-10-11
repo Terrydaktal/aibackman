@@ -48,6 +48,7 @@ Backup accounts are read-only in the viewer. Multiple backups from the same prov
 │   │   │   ├── writer.cjs    # Non-destructive standard records -> SQLite merge
 │   │   │   ├── reader.cjs    # Standard SQLite -> conversations/messages/state
 │   │   │   ├── summaries.cjs # Persistent exact counts/recency, transactional invalidation
+│   │   │   ├── staging.cjs   # Iterator -> temporary SQLite -> one atomic archive merge
 │   │   │   └── markdown.cjs  # Full current-path conversation -> Markdown export
 │   │   └── safety/
 │   │       ├── schema.cjs    # Delete guards, immutable audit, row recovery
@@ -57,7 +58,7 @@ Backup accounts are read-only in the viewer. Multiple backups from the same prov
 │   │   ├── scrapers/         # One bespoke live-site scraper per provider
 │   │   ├── backup-parsers/   # One bespoke export/local-backup parser per provider
 │   │   ├── formatters/       # Provider-specific cleanup before universal storage
-│   │   └── shared/           # Provider composition and unsupported-scraper helpers
+│   │   └── shared/           # Provider composition, background archive workers, scraper helpers
 │   ├── bridges/
 │   │   ├── chatgpt.cjs       # ChatGPT live-site automation and extraction
 │   │   └── ai-mode.cjs       # Google AI Mode live-site automation and extraction

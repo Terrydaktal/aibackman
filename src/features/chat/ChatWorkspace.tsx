@@ -581,14 +581,14 @@ export function ChatWorkspace({
       try {
         await invokeMode('archive:refreshLocal');
         await loadConversations();
-        await selectConversation(conversationId, false, false, false);
+        await selectConversation(conversationId, true, false, false);
       } finally {
         setIsSyncing(false);
       }
       return;
     }
     await refreshConversationList(true);
-    await selectConversation(conversationId, canLiveSync, canLiveSync, isLiveChatGPT);
+    await selectConversation(conversationId, true, canLiveSync, isLiveChatGPT);
     await updateCacheDiagnostics();
   }, [canLiveSync, canRefreshLocal, invokeMode, isLiveChatGPT, loadConversations, refreshConversationList, selectConversation, updateCacheDiagnostics]);
 

@@ -1,3 +1,4 @@
+const { stageConversations } = require('./staging.cjs');
 const STANDARD_ROLES = new Set(['user', 'assistant', 'tool', 'system']);
 const { STANDARD_CACHE_FORMAT_VERSION } = require('./cacheVersion.cjs');
 
@@ -173,55 +174,57 @@ function writeNormalizedArchive({
   replaceExisting = false,
   sourcePath,
   sourceItems,
+  emptyError,
   ...extra
 }) {
-  const normalized = conversations
-    .map((conversation, index) => normalizeConversation(conversation, index))
-    .filter(Boolean);
-  const safety = db.runArchiveOperation({
-    type: 'merge-normalized-archive',
-    actor: 'official-backup-parser',
-    reason: 'Merge an imported archive without deleting records absent from this backup.',
-    details: {
-      incomingConversations: normalized.length,
-      incomingMessages: normalized.reduce((total, conversation) => total + conversation.messages.length, 0),
-      replacementRequested: !!replaceExisting,
-      sourcePath: sourcePath || null,
-    },
-  }, () => {
-    if (replaceExisting) {
-      db.recordSafetyEvent('destructive-archive-replacement-blocked', 'database', db.dbPath, {
-        incomingConversations: normalized.length,
+  const normalized = stageConversations(conversations, normalizeConversation);
+  try {
+    if (emptyError && normalized.count === 0) throw new Error(emptyError);
+    const safety = db.runArchiveOperation({
+      type: 'merge-normalized-archive',
+      actor: 'official-backup-parser',
+      reason: 'Merge an imported archive without deleting records absent from this backup.',
+      details: {
+        incomingConversations: normalized.count,
+        incomingMessages: normalized.messages,
+        replacementRequested: !!replaceExisting,
         sourcePath: sourcePath || null,
-      });
-    }
-    for (const conversation of normalized) {
-      db.upsertConversation({
-        id: conversation.id,
-        title: conversation.title,
-        created_at: conversation.created_at,
-        updated_at: conversation.updated_at,
-        last_synced_updated_at: conversation.last_synced_updated_at,
-        current_node_id: conversation.current_node_id,
-        cache_format_version: conversation.cache_format_version,
-        is_deleted_on_web: conversation.is_deleted_on_web,
-      });
-      for (const message of conversation.messages) db.upsertMessage(message);
-    }
-    return {
-      replacementPrevented: !!replaceExisting,
-      mergePolicy: 'preserve-existing',
-    };
-  });
+      },
+    }, () => {
+      if (replaceExisting) {
+        db.recordSafetyEvent('destructive-archive-replacement-blocked', 'database', db.dbPath, {
+          incomingConversations: normalized.count,
+          sourcePath: sourcePath || null,
+        });
+      }
+      for (const conversation of normalized) {
+        db.upsertConversation({
+          id: conversation.id,
+          title: conversation.title,
+          created_at: conversation.created_at,
+          updated_at: conversation.updated_at,
+          last_synced_updated_at: conversation.last_synced_updated_at,
+          current_node_id: conversation.current_node_id,
+          cache_format_version: conversation.cache_format_version,
+          is_deleted_on_web: conversation.is_deleted_on_web,
+        });
+        for (const message of conversation.messages) db.upsertMessage(message);
+      }
+      return {
+        replacementPrevented: !!replaceExisting,
+        mergePolicy: 'preserve-existing',
+      };
+    });
 
-  return {
-    ...extra,
-    ...(sourcePath ? { sourcePath } : {}),
-    sourceItems: sourceItems == null ? normalized.length : sourceItems,
-    importedConversations: normalized.length,
-    importedMessages: normalized.reduce((total, conversation) => total + conversation.messages.length, 0),
-    ...safety,
-  };
+    return {
+      ...extra,
+      ...(sourcePath ? { sourcePath } : {}),
+      sourceItems: sourceItems == null ? normalized.count : (typeof sourceItems === 'function' ? sourceItems() : sourceItems),
+      importedConversations: normalized.count,
+      importedMessages: normalized.messages,
+      ...safety,
+    };
+  } finally { normalized.close(); }
 }
 
 module.exports = {

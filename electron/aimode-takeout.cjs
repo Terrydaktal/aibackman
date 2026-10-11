@@ -3,6 +3,7 @@ const crypto = require('crypto');
 const path = require('path');
 const { attachmentMarkdown } = require('./agents/utils.cjs');
 const { writeNormalizedArchive } = require('./archive/standard/index.cjs');
+const { readJsonCollection } = require('./agents/json-collection.cjs');
 
 function decodeHtmlEntities(text) {
   if (!text) return '';
@@ -210,16 +211,20 @@ function parseAiModeTakeout(inputPath, options = {}) {
 }
 
 function importAiModeTakeout(dbInstance, inputPath, options = {}) {
-  const parsed = parseAiModeTakeout(inputPath, options);
-  if (parsed.conversations.length === 0) {
-    throw new Error('Google Takeout contained no importable conversations for this provider.');
+  const entries = readJsonCollection(inputPath, { message: 'AI Mode takeout file must be a JSON array.' });
+  function* conversations() {
+    for (const entry of entries) {
+      const record = buildTakeoutConversationRecord(entry, Date.now(), options);
+      if (record) yield record;
+    }
   }
   return writeNormalizedArchive({
     db: dbInstance,
-    conversations: parsed.conversations,
+    conversations: conversations(),
     replaceExisting: options.replaceExisting !== false,
     sourcePath: inputPath,
-    sourceItems: parsed.sourceItems,
+    sourceItems: () => entries.length,
+    emptyError: 'Google Takeout contained no importable conversations for this provider.',
   });
 }
 

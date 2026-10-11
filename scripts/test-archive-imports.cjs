@@ -39,6 +39,19 @@ function createDatabase(root, name) {
   return new ChatDatabase(path.join(root, `${name}.db`));
 }
 
+async function assertAtomicFingerprint(db, refresh) {
+  const before = db.getArchiveCounts();
+  const sourceWrite = db.upsertSourceItem;
+  const conversationWrite = db.upsertConversation;
+  let contentWrites = 0;
+  db.upsertConversation = function (...args) { contentWrites += 1; return conversationWrite.apply(this, args); };
+  db.upsertSourceItem = () => { throw new Error('Injected fingerprint failure'); };
+  try { await assert.rejects(refresh, /Injected fingerprint failure/); }
+  finally { db.upsertSourceItem = sourceWrite; db.upsertConversation = conversationWrite; }
+  assert.ok(contentWrites > 0, 'Failure must occur after attempting a content write.');
+  assert.deepEqual(db.getArchiveCounts(), before, 'Content and fingerprint must roll back together.');
+}
+
 async function main() {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'chatgpt-archive-tests-'));
   const databases = [];
@@ -641,6 +654,11 @@ async function main() {
       databases.push(database);
       return [account.id, database];
     }));
+    const geminiAtomicDb = createDatabase(root, 'gemini-atomic');
+    databases.push(geminiAtomicDb);
+    await assertAtomicFingerprint(geminiAtomicDb, () => geminiCli.refreshAllLocal({
+      accounts: [discoveredGeminiAccounts[0]], getDatabase: () => geminiAtomicDb,
+    }));
     const firstLocalGeminiRefresh = await geminiCli.refreshAllLocal({
       accounts: discoveredGeminiAccounts,
       getDatabase: (account) => localGeminiDatabases.get(account.id),
@@ -710,6 +728,14 @@ async function main() {
     ].map((entry) => JSON.stringify(entry)).join('\n'));
     const codexDb = createDatabase(root, 'codex');
     databases.push(codexDb);
+    const codexAtomicRoot = path.join(root, 'codex-atomic-sessions');
+    fs.mkdirSync(codexAtomicRoot);
+    fs.copyFileSync(codexSessionPath, path.join(codexAtomicRoot, 'rollout.jsonl'));
+    const codexAtomicDb = createDatabase(root, 'codex-atomic');
+    databases.push(codexAtomicDb);
+    await assertAtomicFingerprint(codexAtomicDb, () => codex.refreshLocalDirect({
+      db: codexAtomicDb, sourceConfig: { sessionsRoot: codexAtomicRoot, remoteAccountId: 'account-one' },
+    }));
     const codexResult = await codex.refreshLocal({
       db: codexDb,
       sourceConfig: { sessionsRoot, remoteAccountId: 'account-one' },
@@ -771,6 +797,11 @@ async function main() {
     ].map((entry) => JSON.stringify(entry)).join('\n'));
     const antigravityDb = createDatabase(root, 'antigravity');
     databases.push(antigravityDb);
+    const antigravityAtomicDb = createDatabase(root, 'antigravity-atomic');
+    databases.push(antigravityAtomicDb);
+    await assertAtomicFingerprint(antigravityAtomicDb, () => antigravity.refreshLocal({
+      db: antigravityAtomicDb, sourceConfig: { root: antigravityRoot },
+    }));
     const antigravityResult = await antigravity.refreshLocal({ db: antigravityDb, sourceConfig: { root: antigravityRoot } });
     assert.equal(antigravityResult.importedConversations, 1);
     assert.equal(antigravityDb.getStats().messageCount, 2);

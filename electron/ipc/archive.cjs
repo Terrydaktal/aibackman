@@ -39,7 +39,7 @@ function registerArchiveIpc({
   getDatabase,
   notifyArchiveChanged = () => {},
 }) {
-  ipcMain.handle('archive:getOverview', async () => accountManager.getArchiveOverview());
+  ipcMain.handle('archive:getOverview', async () => accountManager.getArchiveOverviewAsync());
 
   ipcMain.handle('archive:globalSearch', async (_event, payload) => (
     accountManager.globalSearch(payload?.query, Number(payload?.limit || 200), payload?.sort, payload?.role)

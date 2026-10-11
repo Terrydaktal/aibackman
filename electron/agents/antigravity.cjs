@@ -154,29 +154,31 @@ async function refreshLocal({ db, sourceConfig = {}, onProgress }) {
     }
     const parsed = await parseTranscript(transcriptPath, conversationId);
     parseErrors += parsed.parseErrors;
-    if (parsed.messages.length > 0) {
-      const summary = metadata[conversationId]?.summary || {};
-      const firstUser = parsed.messages.find((message) => message.role === 'user');
-      const createdAt = parsed.messages[0].created_at;
-      const updatedAt = asUnixSeconds(summary.UpdatedAt, parsed.messages.at(-1).created_at);
-      writeNormalizedConversation(db, {
-        id: conversationId,
-        title: compactTitle(summary.Title || summary.Preview || firstUser?.content, 'Antigravity session'),
-        created_at: createdAt,
-        updated_at: updatedAt,
-        last_synced_updated_at: updatedAt,
-        current_node_id: parsed.messages.at(-1).id,
-        is_deleted_on_web: 0,
-        messages: parsed.messages,
-      }, { replaceMessages: true });
-      importedConversations += 1;
-      importedMessages += parsed.messages.length;
-    }
-    db.upsertSourceItem({
-      sourceKey,
-      sourcePath: transcriptPath,
-      fingerprint,
-      metadata: { routingVersion: ANTIGRAVITY_ROUTING_VERSION },
+    db.runArchiveOperation({ type: 'merge-local-session', actor: 'antigravity-local', reason: 'Commit session and fingerprint together.' }, () => {
+      if (parsed.messages.length > 0) {
+        const summary = metadata[conversationId]?.summary || {};
+        const firstUser = parsed.messages.find((message) => message.role === 'user');
+        const createdAt = parsed.messages[0].created_at;
+        const updatedAt = asUnixSeconds(summary.UpdatedAt, parsed.messages.at(-1).created_at);
+        writeNormalizedConversation(db, {
+          id: conversationId,
+          title: compactTitle(summary.Title || summary.Preview || firstUser?.content, 'Antigravity session'),
+          created_at: createdAt,
+          updated_at: updatedAt,
+          last_synced_updated_at: updatedAt,
+          current_node_id: parsed.messages.at(-1).id,
+          is_deleted_on_web: 0,
+          messages: parsed.messages,
+        }, { replaceMessages: true });
+        importedConversations += 1;
+        importedMessages += parsed.messages.length;
+      }
+      db.upsertSourceItem({
+        sourceKey,
+        sourcePath: transcriptPath,
+        fingerprint,
+        metadata: { routingVersion: ANTIGRAVITY_ROUTING_VERSION },
+      });
     });
     onProgress?.({ current: index + 1, total: conversationIds.length, conversationId });
   }

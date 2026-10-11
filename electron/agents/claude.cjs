@@ -1,3 +1,4 @@
+const { readJsonCollection } = require('./json-collection.cjs');
 const path = require('path');
 const {
   asUnixSeconds,
@@ -127,78 +128,78 @@ function importBackup({ db, inputPath, replaceExisting = false }) {
   const materialized = materializeBackupPath(inputPath);
   try {
     const sourceFile = findNamedFile(materialized.path, ['conversations.json']);
-    const parsed = parseJsonFile(sourceFile);
-    if (!Array.isArray(parsed)) throw new Error('Claude conversations.json must contain an array of conversations.');
+    const parsed = readJsonCollection(sourceFile, { message: 'Claude conversations.json must contain an array of conversations.' });
     const sourceRoot = path.dirname(sourceFile);
     const assetStore = createAssetStore(db, 'claude');
-    const normalizedConversations = [];
+    function* normalizedConversations() {
 
-    for (const rawConversation of parsed) {
-        const conversationId = String(rawConversation?.uuid || '').trim();
-        if (!conversationId) continue;
-        const rawMessages = Array.isArray(rawConversation?.chat_messages) ? rawConversation.chat_messages : [];
-        const messages = [];
-        let previousMessageId = null;
+      for (const rawConversation of parsed) {
+          const conversationId = String(rawConversation?.uuid || '').trim();
+          if (!conversationId) continue;
+          const rawMessages = Array.isArray(rawConversation?.chat_messages) ? rawConversation.chat_messages : [];
+          const messages = [];
+          let previousMessageId = null;
 
-        rawMessages.forEach((rawMessage, index) => {
-          const sender = String(rawMessage?.sender || '').toLowerCase();
-          const role = sender === 'human' ? 'user' : sender === 'assistant' ? 'assistant' : null;
-          if (!role) return;
-          const attachments = collectAttachments(rawMessage, sourceRoot, assetStore);
-          const links = attachmentMarkdown(attachments);
-          const extracted = attachments
-            .map((attachment) => attachment.extractedContent ? `Attachment ${attachment.name}:\n${attachment.extractedContent}` : '')
-            .filter(Boolean);
-          const formatted = formatClaudeMessage(rawMessage);
-          const content = [formatted.content, ...links, ...extracted].filter(Boolean).join('\n\n').trim();
-          if (!content) return;
-          const model = messageModel(rawMessage);
-          const effort = messageEffort(rawMessage);
-          const messageId = String(rawMessage?.uuid || '').trim() || stableId('claude-msg', `${conversationId}|${index}|${content}`);
-          const createdAt = asUnixSeconds(rawMessage?.created_at, asUnixSeconds(rawConversation?.created_at));
-          const metadata = {
-            source: 'claude-export',
-            sender,
-            block_types: formatted.blockTypes,
-            ...(model ? { model } : {}),
-            ...(effort ? { thinking_effort: effort } : {}),
-            ...(formatted.artifacts.length > 0 ? { claude_artifacts: formatted.artifacts } : {}),
-            ...(formatted.toolUses.length > 0 ? { claude_tool_uses: formatted.toolUses } : {}),
-            ...(formatted.thinking.length > 0 ? { claude_thinking: formatted.thinking } : {}),
-            ...(attachments.length > 0 ? { attachments } : {}),
-          };
-          messages.push({
-            id: messageId,
-            conversation_id: conversationId,
-            role,
-            content,
-            metadata_json: JSON.stringify(metadata),
-            created_at: createdAt,
-            parent_id: previousMessageId,
+          rawMessages.forEach((rawMessage, index) => {
+            const sender = String(rawMessage?.sender || '').toLowerCase();
+            const role = sender === 'human' ? 'user' : sender === 'assistant' ? 'assistant' : null;
+            if (!role) return;
+            const attachments = collectAttachments(rawMessage, sourceRoot, assetStore);
+            const links = attachmentMarkdown(attachments);
+            const extracted = attachments
+              .map((attachment) => attachment.extractedContent ? `Attachment ${attachment.name}:\n${attachment.extractedContent}` : '')
+              .filter(Boolean);
+            const formatted = formatClaudeMessage(rawMessage);
+            const content = [formatted.content, ...links, ...extracted].filter(Boolean).join('\n\n').trim();
+            if (!content) return;
+            const model = messageModel(rawMessage);
+            const effort = messageEffort(rawMessage);
+            const messageId = String(rawMessage?.uuid || '').trim() || stableId('claude-msg', `${conversationId}|${index}|${content}`);
+            const createdAt = asUnixSeconds(rawMessage?.created_at, asUnixSeconds(rawConversation?.created_at));
+            const metadata = {
+              source: 'claude-export',
+              sender,
+              block_types: formatted.blockTypes,
+              ...(model ? { model } : {}),
+              ...(effort ? { thinking_effort: effort } : {}),
+              ...(formatted.artifacts.length > 0 ? { claude_artifacts: formatted.artifacts } : {}),
+              ...(formatted.toolUses.length > 0 ? { claude_tool_uses: formatted.toolUses } : {}),
+              ...(formatted.thinking.length > 0 ? { claude_thinking: formatted.thinking } : {}),
+              ...(attachments.length > 0 ? { attachments } : {}),
+            };
+            messages.push({
+              id: messageId,
+              conversation_id: conversationId,
+              role,
+              content,
+              metadata_json: JSON.stringify(metadata),
+              created_at: createdAt,
+              parent_id: previousMessageId,
+            });
+            previousMessageId = messageId;
           });
-          previousMessageId = messageId;
-        });
 
-        const createdAt = asUnixSeconds(rawConversation?.created_at);
-        const updatedAt = asUnixSeconds(rawConversation?.updated_at, createdAt);
-        normalizedConversations.push({
-          id: conversationId,
-          title: compactTitle(rawConversation?.name || rawConversation?.summary, 'Claude chat'),
-          created_at: createdAt,
-          updated_at: updatedAt,
-          last_synced_updated_at: updatedAt,
-          current_node_id: messages.at(-1)?.id || null,
-          is_deleted_on_web: 0,
-          messages,
-        });
+          const createdAt = asUnixSeconds(rawConversation?.created_at);
+          const updatedAt = asUnixSeconds(rawConversation?.updated_at, createdAt);
+          yield {
+            id: conversationId,
+            title: compactTitle(rawConversation?.name || rawConversation?.summary, 'Claude chat'),
+            created_at: createdAt,
+            updated_at: updatedAt,
+            last_synced_updated_at: updatedAt,
+            current_node_id: messages.at(-1)?.id || null,
+            is_deleted_on_web: 0,
+            messages,
+          };
+      }
     }
 
     return writeNormalizedArchive({
       db,
-      conversations: normalizedConversations,
+      conversations: normalizedConversations(),
       replaceExisting,
       sourcePath: inputPath,
-      sourceItems: parsed.length,
+      sourceItems: () => parsed.length,
     });
   } finally {
     materialized.cleanup();

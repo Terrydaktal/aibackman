@@ -1,7 +1,7 @@
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
-const { Worker } = require('worker_threads');
+const { Worker, isMainThread } = require('worker_threads');
 const { compactTitle, fileFingerprint, parseJsonFile, stableId } = require('./utils.cjs');
 const { writeNormalizedConversation } = require('../archive/standard/index.cjs');
 
@@ -55,6 +55,7 @@ class CodexSessionParserClient {
 }
 
 function createLazySessionParser() {
+  if (!isMainThread) return { parse: require('./codex-session-parser.cjs').parseSession, close: async () => {} };
   let client = null;
   return {
     parse(filePath) {
@@ -213,24 +214,26 @@ async function refreshLocalDirect({ db, sourceConfig = {}, onProgress }) {
         ? sessionAccountIds.has(targetAccountId)
         : sessionAccountIds.size === 0;
       const shouldImport = belongsToTarget && !session.isSubagent && session.visible.length > 0;
-      if (shouldImport) {
-        const messageCount = importSession(db, session);
-        importedConversations += 1;
-        importedMessages += messageCount;
-      }
-      db.upsertSourceItem({
-        sourceKey,
-        sourcePath: filePath,
-        fingerprint,
-        metadata: {
-          accountId: session.accountId,
-          accountIds: session.accountIds,
-          imported: shouldImport,
-          isSubagent: session.isSubagent,
-          parentSessionId: session.parentSessionId,
-          sessionId: session.sessionId,
-          routingVersion: CODEX_ROUTING_VERSION,
-        },
+      db.runArchiveOperation({ type: 'merge-local-session', actor: 'codex-local', reason: 'Commit session and fingerprint together.' }, () => {
+        if (shouldImport) {
+          const messageCount = importSession(db, session);
+          importedConversations += 1;
+          importedMessages += messageCount;
+        }
+        db.upsertSourceItem({
+          sourceKey,
+          sourcePath: filePath,
+          fingerprint,
+          metadata: {
+            accountId: session.accountId,
+            accountIds: session.accountIds,
+            imported: shouldImport,
+            isSubagent: session.isSubagent,
+            parentSessionId: session.parentSessionId,
+            sessionId: session.sessionId,
+            routingVersion: CODEX_ROUTING_VERSION,
+          },
+        });
       });
       onProgress?.({ current: index + 1, total: files.length, filePath });
     }
@@ -310,26 +313,28 @@ async function refreshAllLocalDirect({ accounts, getDatabase, onProgress }) {
           const shouldImport = belongsToTarget && !session.isSubagent && session.visible.length > 0;
           if (belongsToTarget) targetResult.parseErrors += session.parseErrors;
           targetResult.sourceItems += 1;
-          if (!sourceState.get(account.id).current && shouldImport) {
-            targetResult.importedMessages += importSession(targetDb, session);
-            targetResult.importedConversations += 1;
-          } else if (sourceState.get(account.id).current && belongsToTarget) {
-            targetResult.skippedFiles += 1;
-          }
-          targetDb.upsertSourceItem({
-            sourceKey,
-            sourcePath: filePath,
-            fingerprint,
-            metadata: {
-              accountId: session.accountId,
-              accountIds: session.accountIds,
-              imported: shouldImport,
-              processed: true,
-              isSubagent: session.isSubagent,
-              parentSessionId: session.parentSessionId,
-              sessionId: session.sessionId,
-              routingVersion: CODEX_ROUTING_VERSION,
-            },
+          targetDb.runArchiveOperation({ type: 'merge-local-session', actor: 'codex-local', reason: 'Commit routed session and fingerprint together.' }, () => {
+            if (!sourceState.get(account.id).current && shouldImport) {
+              targetResult.importedMessages += importSession(targetDb, session);
+              targetResult.importedConversations += 1;
+            } else if (sourceState.get(account.id).current && belongsToTarget) {
+              targetResult.skippedFiles += 1;
+            }
+            targetDb.upsertSourceItem({
+              sourceKey,
+              sourcePath: filePath,
+              fingerprint,
+              metadata: {
+                accountId: session.accountId,
+                accountIds: session.accountIds,
+                imported: shouldImport,
+                processed: true,
+                isSubagent: session.isSubagent,
+                parentSessionId: session.parentSessionId,
+                sessionId: session.sessionId,
+                routingVersion: CODEX_ROUTING_VERSION,
+              },
+            });
           });
         }
         onProgress?.({
@@ -368,7 +373,7 @@ async function refreshAllLocal({ accounts, getDatabase, onProgress }) {
     mode: 'all',
     accounts: accounts.map((account) => ({
       account,
-      dbPath: getDatabase(account).path,
+      dbPath: account.dbPath || getDatabase(account).path,
     })),
   }, onProgress);
 }

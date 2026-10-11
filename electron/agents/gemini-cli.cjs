@@ -283,16 +283,14 @@ async function refreshAllLocal({ accounts, getDatabase, onProgress }) {
 
       for (const account of rootAccounts) results.get(account.id).sourceItems += 1;
       let imported = ownerState.metadata.imported === true;
+      let pendingConversation = null;
       if (ownerCurrent) {
         results.get(owner.id).skippedFiles += 1;
       } else {
         const parsed = await parseSessionGroup(group);
         results.get(owner.id).parseErrors += parsed.parseErrors;
         if (parsed.messages.length > 0) {
-          writeNormalizedConversation(getDatabase(owner), {
-            ...parsed.conversation,
-            messages: parsed.messages,
-          }, { replaceMessages: true });
+          pendingConversation = { ...parsed.conversation, messages: parsed.messages };
           results.get(owner.id).importedConversations += 1;
           results.get(owner.id).importedMessages += parsed.messages.length;
           imported = true;
@@ -300,16 +298,20 @@ async function refreshAllLocal({ accounts, getDatabase, onProgress }) {
       }
 
       for (const account of rootAccounts) {
-        getDatabase(account).upsertSourceItem({
-          sourceKey,
-          sourcePath: group.files.at(-1)?.filePath || root,
-          fingerprint: group.fingerprint,
-          metadata: {
-            owner: account.id === owner.id,
-            imported: account.id === owner.id && imported,
-            routingVersion: LOCAL_ROUTING_VERSION,
-            fileCount: group.files.length,
-          },
+        const db = getDatabase(account);
+        db.runArchiveOperation({ type: 'merge-local-session', actor: 'gemini-cli-local', reason: 'Commit session and fingerprint together.' }, () => {
+          if (account.id === owner.id && pendingConversation) writeNormalizedConversation(db, pendingConversation, { replaceMessages: true });
+          db.upsertSourceItem({
+            sourceKey,
+            sourcePath: group.files.at(-1)?.filePath || root,
+            fingerprint: group.fingerprint,
+            metadata: {
+              owner: account.id === owner.id,
+              imported: account.id === owner.id && imported,
+              routingVersion: LOCAL_ROUTING_VERSION,
+              fileCount: group.files.length,
+            },
+          });
         });
       }
       onProgress?.({

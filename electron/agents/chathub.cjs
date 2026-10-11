@@ -25,21 +25,36 @@ function findChromiumIndexedDbRoot(rootPath) {
   return indexedDbRoot;
 }
 
-function readChromiumIndexedDbRecords(indexedDbRoot) {
+async function readChromiumIndexedDbRecords(indexedDbRoot) {
+  const { isMainThread, parentPort } = require('worker_threads');
+  if (!isMainThread) return new Promise((resolve, reject) => {
+    const receive = (message) => {
+      if (message.type !== 'chromium-result') return;
+      parentPort.off('message', receive);
+      if (message.error) reject(new Error(message.error)); else resolve(message.records);
+    };
+    parentPort.on('message', receive);
+    parentPort.postMessage({ type: 'chromium-read', path: indexedDbRoot });
+  });
   const { BrowserWindow, session } = require('electron');
   if (typeof BrowserWindow !== 'function' || !session?.fromPath) {
     throw new Error('ChatHub imports require the Electron runtime.');
   }
 
-  const storageRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'ai-chathub-reader-'));
-  fs.cpSync(indexedDbRoot, path.join(storageRoot, 'IndexedDB'), { recursive: true });
+  const storageRoot = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'ai-chathub-reader-'));
+  try { await fs.promises.cp(indexedDbRoot, path.join(storageRoot, 'IndexedDB'), { recursive: true }); }
+  catch (error) { await fs.promises.rm(storageRoot, { recursive: true, force: true }); throw error; }
   const chathubSession = session.fromPath(storageRoot);
   let window = null;
 
-  const withTimeout = (promise, label, timeoutMs = 45_000) => Promise.race([
-    promise,
-    new Promise((_, reject) => setTimeout(() => reject(new Error(`ChatHub ${label} timed out.`)), timeoutMs)),
-  ]);
+  const withTimeout = async (promise, label, timeoutMs = 45_000) => {
+    let timer;
+    try {
+      return await Promise.race([promise, new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error(`ChatHub ${label} timed out.`)), timeoutMs);
+      })]);
+    } finally { clearTimeout(timer); }
+  };
 
   const readScript = `
     (async () => {
@@ -80,7 +95,7 @@ function readChromiumIndexedDbRecords(indexedDbRoot) {
       if (window && !window.isDestroyed()) window.destroy();
       try { await chathubSession.flushStorageData(); } catch {}
       try { await chathubSession.clearStorageData(); } catch {}
-      fs.rmSync(storageRoot, { recursive: true, force: true });
+      await fs.promises.rm(storageRoot, { recursive: true, force: true });
     }
   })();
 }
@@ -207,56 +222,57 @@ async function importBackup({ db, inputPath, replaceExisting = false }) {
     const conversations = normalizeRecords(backup.records, backup.kind);
     if (conversations.length === 0) throw new Error('No ChatHub conversations were found in the IndexedDB backup.');
 
-    const normalizedConversations = [];
-    for (const conversation of conversations) {
-        const rawMessages = conversation.messages
-          .map((message, index) => ({ message, index, content: messageToContent(message) }))
-          .filter((entry) => entry.content)
-          .sort((left, right) => asUnixSeconds(left.message?.createdAt, left.index) - asUnixSeconds(right.message?.createdAt, right.index));
-        const messages = [];
-        let previousMessageId = null;
-        for (const { message, index, content } of rawMessages) {
-          const messageId = stableId('chathub-msg', `${conversation.model}|${conversation.id}|${message?.id || index}`);
-          const createdAt = asUnixSeconds(message?.createdAt, asUnixSeconds(conversation.createdAt));
-          const metadata = {
-            source: `chathub-${conversation.sourceKind || backup.kind}-indexeddb`,
-            model: conversation.model,
-            model_label: modelLabel(conversation.model),
-            author: String(message?.author || message?.role || ''),
-            source_message_id: String(message?.id || ''),
-            part_types: asArray(message?.parts).map((part) => part?.type).filter(Boolean),
-            ...(asArray(message?.files).length > 0 ? { attachments: message.files } : {}),
-          };
-          messages.push({
-            id: messageId,
-            conversation_id: conversation.id,
-            role: messageRole(message),
-            content,
-            metadata_json: JSON.stringify(metadata),
-            created_at: createdAt,
-            parent_id: previousMessageId,
-          });
-          previousMessageId = messageId;
-        }
+    function* normalizedConversations() {
+      for (const conversation of conversations) {
+          const rawMessages = conversation.messages
+            .map((message, index) => ({ message, index, content: messageToContent(message) }))
+            .filter((entry) => entry.content)
+            .sort((left, right) => asUnixSeconds(left.message?.createdAt, left.index) - asUnixSeconds(right.message?.createdAt, right.index));
+          const messages = [];
+          let previousMessageId = null;
+          for (const { message, index, content } of rawMessages) {
+            const messageId = stableId('chathub-msg', `${conversation.model}|${conversation.id}|${message?.id || index}`);
+            const createdAt = asUnixSeconds(message?.createdAt, asUnixSeconds(conversation.createdAt));
+            const metadata = {
+              source: `chathub-${conversation.sourceKind || backup.kind}-indexeddb`,
+              model: conversation.model,
+              model_label: modelLabel(conversation.model),
+              author: String(message?.author || message?.role || ''),
+              source_message_id: String(message?.id || ''),
+              part_types: asArray(message?.parts).map((part) => part?.type).filter(Boolean),
+              ...(asArray(message?.files).length > 0 ? { attachments: message.files } : {}),
+            };
+            messages.push({
+              id: messageId,
+              conversation_id: conversation.id,
+              role: messageRole(message),
+              content,
+              metadata_json: JSON.stringify(metadata),
+              created_at: createdAt,
+              parent_id: previousMessageId,
+            });
+            previousMessageId = messageId;
+          }
 
-        const firstUserMessage = messages.find((message) => message.role === 'user');
-        const createdAt = asUnixSeconds(conversation.createdAt, messages[0]?.created_at);
-        const updatedAt = asUnixSeconds(conversation.updatedAt, messages.at(-1)?.created_at || createdAt);
-        normalizedConversations.push({
-          id: conversation.id,
-          title: compactTitle(firstUserMessage?.content, `${modelLabel(conversation.model)} chat`),
-          created_at: createdAt,
-          updated_at: updatedAt,
-          last_synced_updated_at: updatedAt,
-          current_node_id: messages.at(-1)?.id || null,
-          is_deleted_on_web: 0,
-          messages,
-        });
+          const firstUserMessage = messages.find((message) => message.role === 'user');
+          const createdAt = asUnixSeconds(conversation.createdAt, messages[0]?.created_at);
+          const updatedAt = asUnixSeconds(conversation.updatedAt, messages.at(-1)?.created_at || createdAt);
+          yield {
+            id: conversation.id,
+            title: compactTitle(firstUserMessage?.content, `${modelLabel(conversation.model)} chat`),
+            created_at: createdAt,
+            updated_at: updatedAt,
+            last_synced_updated_at: updatedAt,
+            current_node_id: messages.at(-1)?.id || null,
+            is_deleted_on_web: 0,
+            messages,
+          };
+      }
     }
 
     return writeNormalizedArchive({
       db,
-      conversations: normalizedConversations,
+      conversations: normalizedConversations(),
       replaceExisting,
       sourcePath: inputPath,
       sourceItems: conversations.length,
@@ -276,4 +292,5 @@ module.exports = {
   importBackup,
   modelLabel,
   normalizeRecords,
+  readChromiumIndexedDbRecords,
 };

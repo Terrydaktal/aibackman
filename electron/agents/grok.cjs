@@ -102,106 +102,107 @@ function importBackup({ db, inputPath, replaceExisting = false }) {
       : [];
     const assetSourceById = new Map(assetFiles.map((file) => [path.basename(path.dirname(file)), file]));
     const assetStore = createAssetStore(db, 'grok');
-    const normalizedConversations = [];
+    function* normalizedConversations() {
 
-    for (const item of parsed.conversations) {
-        const conversation = item?.conversation;
-        const conversationId = String(conversation?.id || '').trim();
-        if (!conversationId) continue;
-        const conversationCreatedAt = asUnixSeconds(conversation?.create_time);
-        const rawResponses = Array.isArray(item?.responses) ? item.responses : [];
-        const records = [];
+      for (const item of parsed.conversations) {
+          const conversation = item?.conversation;
+          const conversationId = String(conversation?.id || '').trim();
+          if (!conversationId) continue;
+          const conversationCreatedAt = asUnixSeconds(conversation?.create_time);
+          const rawResponses = Array.isArray(item?.responses) ? item.responses : [];
+          const records = [];
 
-        rawResponses.forEach((wrapper, index) => {
-          const response = wrapper?.response;
-          const role = responseSender(response);
-          if (!role) return;
-          const responseId = String(response?._id || '').trim() || stableId('grok-response', `${conversationId}|${index}`);
-          const createdAt = asUnixSeconds(response?.create_time, conversationCreatedAt) + index * 0.0001;
-          const attachments = [];
-          for (const assetId of attachmentIds(response, conversation, index === 0)) {
-            const source = assetSourceById.get(assetId);
-            if (!source) continue;
-            const extension = assetExtension(source);
-            const copied = assetStore.add(source, assetId, `${assetId}${extension}`);
-            if (copied) attachments.push({ ...copied, name: assetId + extension });
-          }
-          const links = attachmentMarkdown(attachments);
-          const baseContent = String(response?.message || '').trim();
-          const thinking = role === 'assistant' ? String(response?.thinking_trace || '').trim() : '';
-          const model = responseModel(response);
-          const effort = responseEffort(response);
-          let parentId = null;
-          if (thinking) {
-            const thinkingId = `${responseId}-thinking`;
-            records.push({
-              id: thinkingId,
-              conversation_id: conversationId,
-              role: 'assistant',
-              content: thinking,
-              metadata_json: JSON.stringify({
-                source: 'grok-export',
-                ...(model ? { model } : {}),
-                ...(effort ? { thinking_effort: effort } : {}),
-                phase: 'thinking',
-                is_thinking_preamble_message: true,
-              }),
-              created_at: createdAt - 0.00001,
-              parent_id: null,
-              responseId,
-              parentResponseId: response?.parent_response_id ? String(response.parent_response_id) : null,
-            });
-            parentId = thinkingId;
-          }
-          const content = [baseContent, ...links].filter(Boolean).join('\n\n').trim();
-          if (!content && !parentId) return;
-          if (content) {
-            records.push({
-              id: responseId,
-              conversation_id: conversationId,
-              role,
-              content,
-              metadata_json: JSON.stringify({
-                source: 'grok-export',
-                ...(model ? { model } : {}),
-                ...(effort ? { thinking_effort: effort } : {}),
-                ...(attachments.length > 0 ? { attachments } : {}),
-                ...(response?.web_search_results ? { web_search_results: response.web_search_results } : {}),
-              }),
-              created_at: createdAt,
-              parent_id: parentId,
-              responseId,
-              parentResponseId: response?.parent_response_id ? String(response.parent_response_id) : null,
-            });
-          }
-        });
+          rawResponses.forEach((wrapper, index) => {
+            const response = wrapper?.response;
+            const role = responseSender(response);
+            if (!role) return;
+            const responseId = String(response?._id || '').trim() || stableId('grok-response', `${conversationId}|${index}`);
+            const createdAt = asUnixSeconds(response?.create_time, conversationCreatedAt) + index * 0.0001;
+            const attachments = [];
+            for (const assetId of attachmentIds(response, conversation, index === 0)) {
+              const source = assetSourceById.get(assetId);
+              if (!source) continue;
+              const extension = assetExtension(source);
+              const copied = assetStore.add(source, assetId, `${assetId}${extension}`);
+              if (copied) attachments.push({ ...copied, name: assetId + extension });
+            }
+            const links = attachmentMarkdown(attachments);
+            const baseContent = String(response?.message || '').trim();
+            const thinking = role === 'assistant' ? String(response?.thinking_trace || '').trim() : '';
+            const model = responseModel(response);
+            const effort = responseEffort(response);
+            let parentId = null;
+            if (thinking) {
+              const thinkingId = `${responseId}-thinking`;
+              records.push({
+                id: thinkingId,
+                conversation_id: conversationId,
+                role: 'assistant',
+                content: thinking,
+                metadata_json: JSON.stringify({
+                  source: 'grok-export',
+                  ...(model ? { model } : {}),
+                  ...(effort ? { thinking_effort: effort } : {}),
+                  phase: 'thinking',
+                  is_thinking_preamble_message: true,
+                }),
+                created_at: createdAt - 0.00001,
+                parent_id: null,
+                responseId,
+                parentResponseId: response?.parent_response_id ? String(response.parent_response_id) : null,
+              });
+              parentId = thinkingId;
+            }
+            const content = [baseContent, ...links].filter(Boolean).join('\n\n').trim();
+            if (!content && !parentId) return;
+            if (content) {
+              records.push({
+                id: responseId,
+                conversation_id: conversationId,
+                role,
+                content,
+                metadata_json: JSON.stringify({
+                  source: 'grok-export',
+                  ...(model ? { model } : {}),
+                  ...(effort ? { thinking_effort: effort } : {}),
+                  ...(attachments.length > 0 ? { attachments } : {}),
+                  ...(response?.web_search_results ? { web_search_results: response.web_search_results } : {}),
+                }),
+                created_at: createdAt,
+                parent_id: parentId,
+                responseId,
+                parentResponseId: response?.parent_response_id ? String(response.parent_response_id) : null,
+              });
+            }
+          });
 
-        const lastMessageByResponse = new Map();
-        for (const message of records) lastMessageByResponse.set(message.responseId, message.id);
-        for (const message of records) {
-          if (!message.parent_id && message.parentResponseId) {
-            message.parent_id = lastMessageByResponse.get(message.parentResponseId) || null;
+          const lastMessageByResponse = new Map();
+          for (const message of records) lastMessageByResponse.set(message.responseId, message.id);
+          for (const message of records) {
+            if (!message.parent_id && message.parentResponseId) {
+              message.parent_id = lastMessageByResponse.get(message.parentResponseId) || null;
+            }
+            delete message.responseId;
+            delete message.parentResponseId;
           }
-          delete message.responseId;
-          delete message.parentResponseId;
-        }
-        const createdAt = conversationCreatedAt;
-        const updatedAt = asUnixSeconds(conversation?.modify_time, createdAt);
-        normalizedConversations.push({
-          id: conversationId,
-          title: compactTitle(conversation?.title || conversation?.summary, 'Grok chat'),
-          created_at: createdAt,
-          updated_at: updatedAt,
-          last_synced_updated_at: updatedAt,
-          current_node_id: records.at(-1)?.id || null,
-          is_deleted_on_web: 0,
-          messages: records,
-        });
+          const createdAt = conversationCreatedAt;
+          const updatedAt = asUnixSeconds(conversation?.modify_time, createdAt);
+          yield {
+            id: conversationId,
+            title: compactTitle(conversation?.title || conversation?.summary, 'Grok chat'),
+            created_at: createdAt,
+            updated_at: updatedAt,
+            last_synced_updated_at: updatedAt,
+            current_node_id: records.at(-1)?.id || null,
+            is_deleted_on_web: 0,
+            messages: records,
+          };
+      }
     }
 
     return writeNormalizedArchive({
       db,
-      conversations: normalizedConversations,
+      conversations: normalizedConversations(),
       replaceExisting,
       sourcePath: inputPath,
       sourceItems: parsed.conversations.length,
